@@ -168,7 +168,6 @@ jobs:
           revision_suffix="${GITHUB_SHA:0:8}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           include_exception_details=false
           [[ "$DEPLOY_ENVIRONMENT" == "dev" ]] && include_exception_details=true
-          [[ -n "$WORKER_CONTAINER_APP_NAME" ]]
 
           az containerapp ingress update \
             --name "$CONTAINER_APP_NAME" \
@@ -185,12 +184,15 @@ jobs:
             --set-env-vars "Diagnostics__IncludeExceptionDetails=$include_exception_details" \
             --output none
 
-          az containerapp update \
-            --name "$WORKER_CONTAINER_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$worker_image_ref" \
-            --revision-suffix "$revision_suffix" \
-            --output none
+          worker_revision="not-configured"
+          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
+            az containerapp update \
+              --name "$WORKER_CONTAINER_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --image "$worker_image_ref" \
+              --revision-suffix "$revision_suffix" \
+              --output none
+          fi
 
           allow_insecure=$(az containerapp show \
             --name "$CONTAINER_APP_NAME" \
@@ -209,11 +211,13 @@ jobs:
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.latestRevisionName \
             --output tsv)
-          worker_revision=$(az containerapp show \
-            --name "$WORKER_CONTAINER_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --query properties.latestRevisionName \
-            --output tsv)
+          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
+            worker_revision=$(az containerapp show \
+              --name "$WORKER_CONTAINER_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query properties.latestRevisionName \
+              --output tsv)
+          fi
 
           for attempt in {1..20}; do
             health=$(az containerapp revision show \
@@ -228,18 +232,20 @@ jobs:
             sleep 15
           done
 
-          for attempt in {1..20}; do
-            worker_state=$(az containerapp revision show \
-              --name "$WORKER_CONTAINER_APP_NAME" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --revision "$worker_revision" \
-              --query properties.runningState \
-              --output tsv)
-            [[ "$worker_state" == "Running" ]] && break
-            [[ "$worker_state" == "Failed" || "$worker_state" == "Degraded" ]] && exit 1
-            [[ "$attempt" == "20" ]] && exit 1
-            sleep 15
-          done
+          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
+            for attempt in {1..20}; do
+              worker_state=$(az containerapp revision show \
+                --name "$WORKER_CONTAINER_APP_NAME" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --revision "$worker_revision" \
+                --query properties.runningState \
+                --output tsv)
+              [[ "$worker_state" == "Running" ]] && break
+              [[ "$worker_state" == "Failed" || "$worker_state" == "Degraded" ]] && exit 1
+              [[ "$attempt" == "20" ]] && exit 1
+              sleep 15
+            done
+          fi
 
           {
             echo "### Core API deployment"
