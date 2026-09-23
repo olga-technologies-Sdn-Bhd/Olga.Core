@@ -12,14 +12,15 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 - Connection request, acceptance, canonical connection, conversation creation, and blocking.
 - Idempotent client message IDs and server message ordering.
 - Notification preferences, privacy-request initiation, and authorization-filtered sync changes.
-- Transactional outbox records for cross-domain and NLP-related integration events.
+- Transactional outbox records published as versioned Service Bus envelopes by the Core worker.
+- Consumption of `NlpMatchRequestCompleted.v1` into authorization-scoped sync projections and policy-resolved match notifications.
 - Transactional integration events that allow NLP to refresh its read-only eligibility projections without proxying NLP requests through Core.
 - EF Core InMemory local development and PostgreSQL configuration through `ConnectionStrings__PostgreSql`.
 - Anonymous MVP access for all API operations, with an optional member selector header.
 
 ## What is intentionally not implemented yet
 
-This foundation is not the full product backlog. CIAM lifecycle integration, permissions, private file lifecycle, message receipts, notification delivery, privacy task orchestration, retention execution, moderation/admin APIs, database migrations, Service Bus publishing, OpenTelemetry, and production deployment assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
+This foundation is not the full product backlog. CIAM registration/provisioning, fine-grained permissions, private file lifecycle, provider notification delivery, privacy task orchestration, retention execution, moderation/admin APIs, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
 
 ## Run locally
 
@@ -29,7 +30,7 @@ dotnet test Olga.Core.slnx
 dotnet run --project src/Olga.Core.Api
 ```
 
-All endpoints are anonymous for the initial MVP. Member-scoped endpoints use the optional `X-Member-Id` header to select a member and otherwise fall back to `Mvp__DefaultMemberId` (`A123` by default). Local development seeds members `A123`, `B456`, `D111` plus `event-001`. Do not treat this member selector as authentication; restore a verified identity provider before exposing member data beyond the MVP environment.
+All endpoints are anonymous for the initial MVP. Member-scoped endpoints use the optional `X-Member-Id` header to select a member and otherwise fall back to `Mvp__DefaultMemberId` (`A123` by default). Local development seeds members `A123`, `B456`, `D111` plus `event-001`. Do not treat this member selector as authentication or expose this deployment to public or sensitive member data.
 
 The identity lifecycle owns `iam.member`. A client must never invent a member ID: registration creates the `iam.member` row first, and then `GET` or `PATCH /v1/me/profile` idempotently provisions its private `DRAFT` profile. An unknown identity receives `MEMBER_NOT_REGISTERED` instead of a database error. The first profile update activates the draft. Draft profiles are neither visible through member lookup nor eligible to initiate connections. Profile provisioning does not run on unrelated member-scoped operations and never reactivates a suspended, anonymized, or deleted profile.
 
@@ -39,7 +40,7 @@ Swagger displays each applicable header on the operation that consumes it:
 
 | Header | Applies to | Client behavior |
 | --- | --- | --- |
-| `X-Member-Id` | Member-scoped operations | Optional only because the MVP falls back to `Mvp__DefaultMemberId`; maximum 64 characters. The ID must already exist in `iam.member`. Replace this header with a validated JWT identity before production use. |
+| `X-Member-Id` | Member-scoped operations | Optional MVP member selector; defaults to `Mvp__DefaultMemberId` and is limited to 64 characters. The ID must already exist in `iam.member`. |
 | `Idempotency-Key` | Every `POST`, `PUT`, `PATCH`, and `DELETE` under `/v1` | Required, maximum 128 characters. Generate a UUID for each new logical action and reuse that same value for retries of that action. Never reuse it with a different payload. |
 | `If-Match` | `PATCH /v1/me/profile` | Send the ETag returned by `GET /v1/me/profile`. It may be omitted only while completing the initial empty draft. |
 

@@ -45,10 +45,10 @@ The canonical NLP repository is `D:\OLGA\Projects\Olga.Nlp\olga-nlp-api`. The ol
 
 ### Priority 0 security and correctness
 
-1. Configure and verify the Core API's OIDC/JWT bearer validation in each environment, and add equivalent real validation to the NLP API. A static service token is not a replacement for workload identity.
+1. If the open MVP posture is later retired, configure and verify OIDC/JWT bearer validation in each environment for both APIs. A static service token is not a replacement for workload identity.
 2. Implement application permission resolution and object-level authorization tests for member, admin, moderator, and NLP evaluator roles.
 3. Create version-controlled PostgreSQL migrations for the full approved schemas, read-only NLP projections, grants, constraints, identity columns, the shared `row_version` increment trigger, and seed data. The code mappings alone are not a database delivery artifact.
-4. Make outbox publishing real: publish to Service Bus with duplicate detection, mark `PublishedAt` only after acknowledgement, use bounded retry/backoff, and alert on dead letters. The Core worker currently logs pending events only.
+4. Provision and operate the Service Bus integration topic/subscriptions used by the Core worker, including duplicate detection, subscription filters, dead-letter alerts, and operator recovery for exhausted database outbox publishes.
 5. Replace NLP's `AzureEmbeddingProvider` placeholder and validate model identity, dimensions, timeout, retry, content handling, and managed-identity authentication.
 
 ### Priority 1 MVP capability gaps

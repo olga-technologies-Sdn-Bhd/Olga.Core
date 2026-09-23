@@ -15,7 +15,7 @@ The Core API does not own NLP intents, embeddings, model versions, ranking confi
 | `Olga.Core.Application` | Use cases and invariant enforcement. Produces sync changes and outbox events in the same unit of work as business changes. | Domain, Contracts |
 | `Olga.Core.Infrastructure` | EF Core/Npgsql unit of work, PostgreSQL schema mapping, indexes, and local seed data. | Application, Domain |
 | `Olga.Core.Api` | Minimal API endpoints, correlation/error handling, identity extraction, OpenAPI, health, and readiness. | Application, Contracts, Infrastructure |
-| `Olga.Core.Worker` | Background outbox polling seam. Transport publishing and delivery confirmation remain to be implemented. | Infrastructure |
+| `Olga.Core.Worker` | Publishes transactional outbox events to Service Bus and consumes NLP completion events into Core-owned notification and sync projections. | Infrastructure |
 | `Olga.Core.Tests` | Boundary and invariant tests for ETag updates, consent-gated Live Mode, connection/chat creation, idempotent messages, and blocking. | Application, Infrastructure |
 
 Dependencies point inward. Domain and Contracts never reference EF Core or ASP.NET. Application depends on the `ICoreStore` abstraction; Infrastructure implements it.
@@ -122,7 +122,8 @@ Core does not proxy client requests to NLP and does not expose internal NLP proj
 ## Security invariants
 
 - No client connects directly to Azure Database for PostgreSQL, Blob Storage, or messaging infrastructure.
-- During the initial MVP, member context comes from optional `X-Member-Id` and otherwise uses `Mvp__DefaultMemberId`; it is not an authenticated identity and must be replaced by a validated JWT identity before production use.
+- During the initial MVP, member context comes from optional `X-Member-Id` and otherwise uses `Mvp__DefaultMemberId`; it is not an authenticated identity and must not be exposed to public or sensitive member data.
+- The worker uses managed identity for Service Bus access; the HTTP API intentionally has no caller authentication in this open MVP configuration.
 - Identity registration owns and creates `iam.member`. Profile onboarding never creates an identity row. `GET` or `PATCH /v1/me/profile` idempotently provisions a private `DRAFT` profile only after its parent member exists; an unknown identity fails with `MEMBER_NOT_REGISTERED`. PostgreSQL uses `ON CONFLICT DO NOTHING` so concurrent onboarding requests converge on one row. Drafts cannot be discovered or initiate connections. Existing lifecycle states are never overwritten or reactivated by profile updates, and only profile completion promotes a draft to `ACTIVE`.
 - Every `/v1` mutation requires a client-generated `Idempotency-Key`; retries of one logical action reuse the key. Concurrency-controlled updates use the last returned ETag in `If-Match`. Swagger documents these headers on applicable operations.
 - Consent and authorization fail closed.
