@@ -48,7 +48,7 @@ The UI or other calling client generates `Idempotency-Key`; identity/onboarding 
 
 ## Endpoint groups
 
-- Profile and consent: `GET/PATCH /v1/me/profile`, `GET /v1/members/{memberId}`, `POST /v1/me/consents`
+- Member, profile, and consent: `POST /v1/members`, `GET/PATCH /v1/me/profile`, `GET /v1/members/{memberId}`, `POST /v1/me/consents`
 - Events: `GET /v1/events`, `POST /v1/events/{id}/register`, `POST/DELETE /v1/events/{id}/live-mode`, `POST /v1/events/{id}/presence`
 - Social: `POST/PATCH /v1/connection-requests`, `GET /v1/connections`, `POST /v1/members/block`
 - Chat: `GET/POST /v1/conversations/{id}/messages`

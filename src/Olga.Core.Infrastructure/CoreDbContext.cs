@@ -54,6 +54,23 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
     Task ICoreStore.SaveAsync(CancellationToken ct) => SaveChangesAsync(ct);
 
+    async Task ICoreStore.CreateMemberAsync(string memberId, string communityId, CancellationToken ct)
+    {
+        if (!Database.IsRelational()) return;
+
+        await using var command = CreateCommand("""
+            INSERT INTO iam.member (member_id, community_id, status, verified_at)
+            VALUES (@member_id, @community_id, 'ACTIVE', @verified_at)
+            ON CONFLICT (member_id) DO NOTHING
+            """);
+        AddVarchar(command, "member_id", memberId, 64);
+        AddVarchar(command, "community_id", communityId, 64);
+        AddTimestamp(command, "verified_at", DateTimeOffset.UtcNow);
+        var close = await OpenIfNeededAsync(ct);
+        try { await command.ExecuteNonQueryAsync(ct); }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
     async Task ICoreStore.EnsureMemberAsync(string memberId, CancellationToken ct)
     {
         if (!Database.IsRelational())

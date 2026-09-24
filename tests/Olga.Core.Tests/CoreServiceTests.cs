@@ -9,6 +9,19 @@ namespace Olga.Core.Tests;
 public sealed class CoreServiceTests
 {
     [Fact]
+    public async Task Member_registration_is_idempotent_for_the_same_key()
+    {
+        await using var db = Db();
+        var service = Service(db);
+
+        var first = await service.RegisterMemberAsync("olga", "register-1", default);
+        var replay = await service.RegisterMemberAsync("olga", "register-1", default);
+
+        Assert.Equal(first.MemberId, replay.MemberId);
+        Assert.StartsWith("mem_", first.MemberId);
+    }
+
+    [Fact]
     public async Task First_member_request_provisions_private_draft_idempotently()
     {
         await using var db = Db();

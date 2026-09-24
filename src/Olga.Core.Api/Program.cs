@@ -16,6 +16,7 @@ const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
+var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
 builder.Services.AddOpenApi(options =>
 {
@@ -94,6 +95,11 @@ app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.
 
 var v1 = app.MapGroup("/v1");
 var memberV1 = app.MapGroup("/v1").WithMetadata(new MemberContextMetadata());
+v1.MapPost("/members", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.RegisterMemberAsync(defaultCommunityId, Idempotency(c), ct);
+    return Results.Created("/v1/me/profile", value);
+});
 var profileV1 = memberV1.MapGroup("/me/profile");
 profileV1.AddEndpointFilter(async (invocationContext, next) =>
 {

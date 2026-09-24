@@ -6,6 +6,7 @@ public sealed record ApiError(
     string CorrelationId,
     IReadOnlyDictionary<string, string[]>? FieldErrors = null,
     string? StackTrace = null);
+public sealed record MemberRegistrationResponse(string MemberId);
 public sealed record ProfileResponse(string MemberId, string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);

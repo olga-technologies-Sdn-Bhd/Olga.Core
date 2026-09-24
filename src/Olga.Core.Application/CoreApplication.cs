@@ -24,6 +24,7 @@ public interface ICoreStore
     IQueryable<NotificationPreference> NotificationPreferences { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
+    Task CreateMemberAsync(string memberId, string communityId, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
     void Remove<T>(T entity) where T : class;
@@ -35,6 +36,7 @@ public interface ICoreStore
 
 public interface ICoreService
 {
+    Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, string idempotencyKey, CancellationToken ct);
     Task ProvisionMemberAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
@@ -60,6 +62,16 @@ public interface ICoreService
 public sealed class CoreService(ICoreStore store) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    public async Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(communityId) || communityId.Length > 64) throw new DomainException("COMMUNITY_ID_INVALID");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        var memberHash = Hash("iam.register_member", communityId, idempotencyKey);
+        var memberId = $"mem_{memberHash[..32]}";
+        await store.CreateMemberAsync(memberId, communityId, ct);
+        return new MemberRegistrationResponse(memberId);
+    }
 
     public Task ProvisionMemberAsync(string memberId, CancellationToken ct)
     {

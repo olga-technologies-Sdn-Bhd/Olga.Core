@@ -30,6 +30,10 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
     {
         using var document = await GetDocumentAsync();
 
+        var memberRegistration = Operation(document, "/v1/members", "post");
+        AssertHeader(memberRegistration, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(memberRegistration, "X-Member-Id");
+
         var memberLookup = Operation(document, "/v1/members/{memberId}", "get");
         AssertHeader(memberLookup, "X-Member-Id", required: false, maxLength: 64);
         AssertNoHeader(memberLookup, "Idempotency-Key");
