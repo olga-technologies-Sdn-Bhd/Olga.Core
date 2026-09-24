@@ -8,7 +8,7 @@ namespace Olga.Core.Tests;
 
 public sealed class CoreServiceTests
 {
-    private static readonly AesGcmIdentityProtector IdentityProtector = new(Enumerable.Repeat((byte)7, 32).ToArray());
+    private static readonly AesIdentityProtector IdentityProtector = new(Enumerable.Repeat((byte)7, 32).ToArray());
 
     [Fact]
     public async Task Member_registration_is_idempotent_for_the_same_key()
