@@ -24,7 +24,7 @@ public interface ICoreStore
     IQueryable<NotificationPreference> NotificationPreferences { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
-    Task CreateMemberAsync(string memberId, string communityId, CancellationToken ct);
+    Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
     void Remove<T>(T entity) where T : class;
@@ -36,7 +36,7 @@ public interface ICoreStore
 
 public interface ICoreService
 {
-    Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, string idempotencyKey, CancellationToken ct);
+    Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task ProvisionMemberAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
@@ -59,18 +59,60 @@ public interface ICoreService
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
 }
 
-public sealed class CoreService(ICoreStore store) : ICoreService
+public sealed record ProtectedIdentity(string Provider, string SubjectHash, byte[] SubjectCiphertext, string DisplayHint, bool IsPrimary, bool IsVerified);
+public sealed record NewMemberRegistration(
+    string MemberId,
+    string CommunityId,
+    string Locale,
+    string DisplayName,
+    string? Headline,
+    string? ProfessionalSummary,
+    string? RoleCategory,
+    string Visibility,
+    decimal CompletenessScore,
+    IReadOnlyList<ProtectedIdentity> Identities);
+
+public interface IIdentityProtector
+{
+    ProtectedIdentity ProtectEmail(string memberId, string value, bool isPrimary);
+    ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
+    string Unprotect(string memberId, string provider, byte[] ciphertext);
+}
+
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
-    public async Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, string idempotencyKey, CancellationToken ct)
+    public async Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(communityId) || communityId.Length > 64) throw new DomainException("COMMUNITY_ID_INVALID");
         if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (string.IsNullOrWhiteSpace(request.DisplayName) || request.DisplayName.Length > 150) throw new DomainException("PROFILE_INVALID");
+        if (request.Headline?.Length > 240 || request.ProfessionalSummary?.Length > 2000 || request.RoleCategory?.Length > 64) throw new DomainException("PROFILE_INVALID");
+        if (request.Visibility is not ("PUBLIC" or "MEMBERS" or "CONNECTED" or "HIDDEN")) throw new DomainException("PROFILE_VISIBILITY_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Locale) || request.Locale.Length > 16) throw new DomainException("MEMBER_LOCALE_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Email) && string.IsNullOrWhiteSpace(request.Phone)) throw new DomainException("MEMBER_IDENTITY_REQUIRED");
+
         var memberHash = Hash("iam.register_member", communityId, idempotencyKey);
         var memberId = $"mem_{memberHash[..32]}";
-        await store.CreateMemberAsync(memberId, communityId, ct);
-        return new MemberRegistrationResponse(memberId);
+        var identities = new List<ProtectedIdentity>(2);
+        if (!string.IsNullOrWhiteSpace(request.Email)) identities.Add(identityProtector.ProtectEmail(memberId, request.Email, true));
+        if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0));
+
+        var member = new NewMemberRegistration(
+            memberId,
+            communityId,
+            request.Locale.Trim(),
+            request.DisplayName.Trim(),
+            request.Headline?.Trim(),
+            request.ProfessionalSummary?.Trim(),
+            request.RoleCategory?.Trim(),
+            request.Visibility,
+            new[] { request.DisplayName, request.Headline, request.ProfessionalSummary, request.RoleCategory }.Count(value => !string.IsNullOrWhiteSpace(value)) * 25m,
+            identities);
+        await store.CreateMemberAsync(member, ct);
+        return new MemberRegistrationResponse(memberId, identities.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
+            identities.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint, "DRAFT", "\"1\"");
     }
 
     public Task ProvisionMemberAsync(string memberId, CancellationToken ct)

@@ -54,20 +54,88 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
     Task ICoreStore.SaveAsync(CancellationToken ct) => SaveChangesAsync(ct);
 
-    async Task ICoreStore.CreateMemberAsync(string memberId, string communityId, CancellationToken ct)
+    async Task ICoreStore.CreateMemberAsync(NewMemberRegistration member, CancellationToken ct)
     {
-        if (!Database.IsRelational()) return;
+        if (!Database.IsRelational())
+        {
+            if (await MemberProfiles.AnyAsync(x => x.MemberId == member.MemberId, ct)) return;
+            MemberProfiles.Add(new MemberProfile
+            {
+                MemberId = member.MemberId,
+                DisplayName = member.DisplayName,
+                Headline = member.Headline,
+                Biography = member.ProfessionalSummary,
+                Sector = member.RoleCategory,
+                Visibility = member.Visibility,
+                CompletenessScore = member.CompletenessScore,
+                Status = "DRAFT"
+            });
+            await SaveChangesAsync(ct);
+            return;
+        }
 
-        await using var command = CreateCommand("""
-            INSERT INTO iam.member (member_id, community_id, status, verified_at)
-            VALUES (@member_id, @community_id, 'ACTIVE', @verified_at)
-            ON CONFLICT (member_id) DO NOTHING
-            """);
-        AddVarchar(command, "member_id", memberId, 64);
-        AddVarchar(command, "community_id", communityId, 64);
-        AddTimestamp(command, "verified_at", DateTimeOffset.UtcNow);
+        var connection = (NpgsqlConnection)Database.GetDbConnection();
         var close = await OpenIfNeededAsync(ct);
-        try { await command.ExecuteNonQueryAsync(ct); }
+        try
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using (var audit = CreateCommand("SELECT ops.set_audit_context(@actor_id)", transaction))
+            {
+                AddVarchar(audit, "actor_id", member.MemberId, 64);
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+
+            await using var account = CreateCommand("""
+                INSERT INTO iam.member(member_id, community_id, status, locale, verified_at)
+                VALUES (@member_id, @community_id, 'ACTIVE', @locale,
+                        CASE WHEN @has_verified_identity THEN CURRENT_TIMESTAMP ELSE NULL END)
+                ON CONFLICT (member_id) DO NOTHING
+                """, transaction);
+            AddVarchar(account, "member_id", member.MemberId, 64);
+            AddVarchar(account, "community_id", member.CommunityId, 64);
+            AddVarchar(account, "locale", member.Locale, 16);
+            account.Parameters.Add(new NpgsqlParameter("has_verified_identity", NpgsqlDbType.Boolean) { Value = member.Identities.Any(x => x.IsVerified) });
+            if (await account.ExecuteNonQueryAsync(ct) == 0)
+            {
+                await transaction.CommitAsync(ct);
+                return;
+            }
+
+            foreach (var identity in member.Identities)
+            {
+                await using var identityCommand = CreateCommand("""
+                    INSERT INTO iam.member_identity(member_id, provider, provider_subject_hash, provider_subject_ciphertext, display_hint, is_primary, status, verified_at)
+                    VALUES (@member_id, @provider, @subject_hash, @subject_ciphertext, @display_hint, @is_primary, 'ACTIVE',
+                            CASE WHEN @is_verified THEN CURRENT_TIMESTAMP ELSE NULL END)
+                    """, transaction);
+                AddVarchar(identityCommand, "member_id", member.MemberId, 64);
+                AddVarchar(identityCommand, "provider", identity.Provider, 32);
+                AddChar(identityCommand, "subject_hash", identity.SubjectHash);
+                identityCommand.Parameters.Add(new NpgsqlParameter("subject_ciphertext", NpgsqlDbType.Bytea) { Value = identity.SubjectCiphertext });
+                AddVarchar(identityCommand, "display_hint", identity.DisplayHint, 80);
+                identityCommand.Parameters.Add(new NpgsqlParameter("is_primary", NpgsqlDbType.Boolean) { Value = identity.IsPrimary });
+                identityCommand.Parameters.Add(new NpgsqlParameter("is_verified", NpgsqlDbType.Boolean) { Value = identity.IsVerified });
+                await identityCommand.ExecuteNonQueryAsync(ct);
+            }
+
+            await using var profile = CreateCommand("""
+                INSERT INTO core.member_profile(member_id, display_name, headline, professional_summary, role_category, profile_status, visibility, completeness_score)
+                VALUES (@member_id, @display_name, @headline, @professional_summary, @role_category, 'DRAFT', @visibility, @completeness_score)
+                """, transaction);
+            AddVarchar(profile, "member_id", member.MemberId, 64);
+            AddVarchar(profile, "display_name", member.DisplayName, 150);
+            AddNullableVarchar(profile, "headline", member.Headline, 240);
+            AddNullableText(profile, "professional_summary", member.ProfessionalSummary);
+            AddNullableVarchar(profile, "role_category", member.RoleCategory, 64);
+            AddVarchar(profile, "visibility", member.Visibility, 20);
+            profile.Parameters.Add(new NpgsqlParameter("completeness_score", NpgsqlDbType.Numeric) { Value = member.CompletenessScore });
+            await profile.ExecuteNonQueryAsync(ct);
+            await transaction.CommitAsync(ct);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation && ex.ConstraintName == "ux_member_identity_provider_subject_hash")
+        {
+            throw new DomainException("MEMBER_IDENTITY_ALREADY_REGISTERED", 409);
+        }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
@@ -158,9 +226,11 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
-    private NpgsqlCommand CreateCommand(string sql) => new(sql, (NpgsqlConnection)Database.GetDbConnection());
+    private NpgsqlCommand CreateCommand(string sql, NpgsqlTransaction? transaction = null) => new(sql, (NpgsqlConnection)Database.GetDbConnection(), transaction);
     private async Task<bool> OpenIfNeededAsync(CancellationToken ct) { var close = Database.GetDbConnection().State != ConnectionState.Open; if (close) await Database.OpenConnectionAsync(ct); return close; }
     private static void AddVarchar(NpgsqlCommand command, string name, string value, int size) => command.Parameters.Add(new NpgsqlParameter(name, NpgsqlDbType.Varchar) { Size = size, Value = value });
+    private static void AddNullableVarchar(NpgsqlCommand command, string name, string? value, int size) => command.Parameters.Add(new NpgsqlParameter(name, NpgsqlDbType.Varchar) { Size = size, Value = value is null ? DBNull.Value : value });
+    private static void AddNullableText(NpgsqlCommand command, string name, string? value) => command.Parameters.Add(new NpgsqlParameter(name, NpgsqlDbType.Text) { Value = value is null ? DBNull.Value : value });
     private static void AddChar(NpgsqlCommand command, string name, string value) => command.Parameters.Add(new NpgsqlParameter(name, NpgsqlDbType.Char) { Size = 64, Value = value });
     private static void AddTimestamp(NpgsqlCommand command, string name, DateTimeOffset value) => command.Parameters.Add(new NpgsqlParameter(name, NpgsqlDbType.TimestampTz) { Value = value.ToUniversalTime() });
     private static string? GetNullableString(DbDataReader reader, string name) { var i = reader.GetOrdinal(name); return reader.IsDBNull(i) ? null : reader.GetString(i); }

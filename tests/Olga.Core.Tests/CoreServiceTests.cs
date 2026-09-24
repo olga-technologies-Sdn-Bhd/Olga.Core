@@ -8,17 +8,35 @@ namespace Olga.Core.Tests;
 
 public sealed class CoreServiceTests
 {
+    private static readonly AesGcmIdentityProtector IdentityProtector = new(Enumerable.Repeat((byte)7, 32).ToArray());
+
     [Fact]
     public async Task Member_registration_is_idempotent_for_the_same_key()
     {
         await using var db = Db();
         var service = Service(db);
+        var request = new MemberCreateRequest("New member", "Member@Example.com", "+919876543210");
 
-        var first = await service.RegisterMemberAsync("olga", "register-1", default);
-        var replay = await service.RegisterMemberAsync("olga", "register-1", default);
+        var first = await service.RegisterMemberAsync("olga", request, "register-1", default);
+        var replay = await service.RegisterMemberAsync("olga", request, "register-1", default);
 
         Assert.Equal(first.MemberId, replay.MemberId);
         Assert.StartsWith("mem_", first.MemberId);
+        Assert.Equal("m***@example.com", first.EmailHint);
+        Assert.Equal("DRAFT", first.ProfileStatus);
+        Assert.Single(db.MemberProfiles);
+    }
+
+    [Fact]
+    public void Member_identity_is_encrypted_and_can_be_decrypted_with_the_master_key()
+    {
+        var identity = IdentityProtector.ProtectEmail("member-1", "Member@Example.com", true);
+
+        Assert.Equal("member@example.com", IdentityProtector.Unprotect("member-1", "EMAIL", identity.SubjectCiphertext));
+        Assert.Equal(-1, identity.SubjectCiphertext.AsSpan().IndexOf(System.Text.Encoding.UTF8.GetBytes("member@example.com")));
+        Assert.Equal(64, identity.SubjectHash.Length);
+        Assert.True(identity.IsVerified);
+        Assert.False(IdentityProtector.ProtectPhone("member-1", "+919876543210", false).IsVerified);
     }
 
     [Fact]
@@ -176,7 +194,7 @@ public sealed class CoreServiceTests
     }
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
-    private static CoreService Service(CoreDbContext db) => new(db);
+    private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

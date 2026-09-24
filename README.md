@@ -6,6 +6,7 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 
 ## What is implemented
 
+- Atomic member registration with encrypted email/phone identities and a private draft profile.
 - Profile reads and optimistic-concurrency updates with ETags.
 - Append-only consent decisions, including immediate Live Mode revocation.
 - Event listing, registration, bounded Live Mode, and expiring coarse presence.
@@ -20,7 +21,7 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 
 ## What is intentionally not implemented yet
 
-This foundation is not the full product backlog. CIAM registration/provisioning, fine-grained permissions, private file lifecycle, provider notification delivery, privacy task orchestration, retention execution, moderation/admin APIs, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
+This foundation is not the full product backlog. Entra token validation and external-identity linking, fine-grained permissions, private file lifecycle, provider notification delivery, privacy task orchestration, retention execution, moderation/admin APIs, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
 
 ## Run locally
 
@@ -32,7 +33,89 @@ dotnet run --project src/Olga.Core.Api
 
 All endpoints are anonymous for the initial MVP. Member-scoped endpoints use the optional `X-Member-Id` header to select a member and otherwise fall back to `Mvp__DefaultMemberId` (`A123` by default). Local development seeds members `A123`, `B456`, `D111` plus `event-001`. Do not treat this member selector as authentication or expose this deployment to public or sensitive member data.
 
-The identity lifecycle owns `iam.member`. A client must never invent a member ID: registration creates the `iam.member` row first, and then `GET` or `PATCH /v1/me/profile` idempotently provisions its private `DRAFT` profile. An unknown identity receives `MEMBER_NOT_REGISTERED` instead of a database error. The first profile update activates the draft. Draft profiles are neither visible through member lookup nor eligible to initiate connections. Profile provisioning does not run on unrelated member-scoped operations and never reactivates a suspended, anonymized, or deleted profile.
+## Member creation and onboarding
+
+The client calls member registration only after the upstream email OTP step succeeds. The client generates an `Idempotency-Key`; Core generates the stable member ID.
+
+### 1. Create the member
+
+Call `POST /v1/members` without `X-Member-Id`:
+
+```http
+POST /v1/members
+Idempotency-Key: 70587dbd-b341-4345-9e18-241e0af50c61
+Content-Type: application/json
+```
+
+```json
+{
+  "display_name": "New Member",
+  "email": "member@example.com",
+  "phone": "+919876543210",
+  "headline": "Software Engineer",
+  "professional_summary": "Building professional connections",
+  "role_category": "ENGINEERING",
+  "locale": "en-IN",
+  "visibility": "MEMBERS"
+}
+```
+
+At least one of `email` or `phone` is required. Phone numbers must already use E.164 format. Registration atomically creates:
+
+- `iam.member` with an API-generated `member_id` and `ACTIVE` account status.
+- One `iam.member_identity` row per supplied contact.
+- `core.member_profile` with `DRAFT` profile status.
+
+Email is treated as verified by the completed upstream OTP step, so both the email identity and member receive the database transaction timestamp in `verified_at`. Phone is stored with `verified_at = NULL` until phone verification is implemented.
+
+Email and phone are normalized, protected with AES-256-GCM, and stored in `provider_subject_ciphertext`. A keyed HMAC is stored in `provider_subject_hash` for equality lookup and uniqueness. Plaintext contact values are not stored or returned. The registration response exposes only masked hints:
+
+```json
+{
+  "member_id": "mem_033ed47ab6da5f5ed7c51647fdcde24b",
+  "email_hint": "m***@example.com",
+  "phone_hint": "*********3210",
+  "profile_status": "DRAFT",
+  "etag": "\"1\""
+}
+```
+
+Reuse the same `Idempotency-Key` only when retrying the identical registration request. Never reuse it with different member details.
+
+### 2. Read the draft profile
+
+Call `GET /v1/me/profile` with the returned member ID in `X-Member-Id`. This reads the existing draft; it does not create another member. It does not include email or phone, and no current endpoint returns decrypted contact values.
+
+### 3. Complete the profile
+
+Call `PATCH /v1/me/profile` with:
+
+- `X-Member-Id`: the returned member ID.
+- A new `Idempotency-Key`.
+- `If-Match`: the ETag returned by registration or the latest profile read.
+
+A successful update changes the profile from `DRAFT` to `ACTIVE`. Draft profiles are not visible through member lookup and cannot initiate connections. An unknown `X-Member-Id` returns `MEMBER_NOT_REGISTERED`; profile endpoints never create `iam.member`.
+
+### 4. Continue product onboarding
+
+After profile activation, the client can use the following operations:
+
+| Operation | Purpose and prerequisite |
+| --- | --- |
+| `POST /v1/me/consents` | Record a decision against an active consent-policy version. |
+| `GET /v1/events` | List published or active events. No member header is required. |
+| `POST /v1/events/{eventId}/register` | Register the selected member for an event. |
+| `POST /v1/events/{eventId}/live-mode` | Start Live Mode after event registration and Live Mode consent. |
+| `POST /v1/connection-requests` | Create a request from an active, visible profile. |
+| `GET /v1/connections` | List the selected member's active connections. |
+| `GET/POST /v1/conversations/{conversationId}/messages` | Read or send messages after an active connection creates the conversation. |
+| `GET /v1/sync/changes` | Read authorization-scoped mobile changes using the opaque cursor. |
+
+## Identity protection configuration
+
+PostgreSQL deployments must provide `IdentityProtection__MasterKeyBase64` as a Key Vault-backed secret containing exactly 32 cryptographically random bytes encoded as Base64. Core derives separate encryption and lookup keys from this one master secret. Local in-memory development generates an ephemeral key automatically.
+
+Do not commit the master key, print it in logs, or rotate/delete it without a migration that re-encrypts existing identity rows. Losing the key makes existing ciphertext unrecoverable.
 
 ## MVP request headers
 

@@ -48,6 +48,10 @@ var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
 if (local) builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseInMemoryDatabase("olga-core-local"));
 else builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection!));
+var identityMasterKey = local
+    ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
+    : ReadIdentityMasterKey(builder.Configuration);
+builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
 builder.Services.AddScoped<ICoreService, CoreService>();
 
@@ -95,9 +99,10 @@ app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.
 
 var v1 = app.MapGroup("/v1");
 var memberV1 = app.MapGroup("/v1").WithMetadata(new MemberContextMetadata());
-v1.MapPost("/members", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreService s, CancellationToken ct) =>
 {
-    var value = await s.RegisterMemberAsync(defaultCommunityId, Idempotency(c), ct);
+    var value = await s.RegisterMemberAsync(defaultCommunityId, body, Idempotency(c), ct);
+    c.Response.Headers.ETag = value.ETag;
     return Results.Created("/v1/me/profile", value);
 });
 var profileV1 = memberV1.MapGroup("/me/profile");
@@ -186,6 +191,18 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         _ => "The request is invalid or cannot be completed in its current state."
     };
     await context.Response.WriteAsJsonAsync(new ApiError(code, message, context.TraceIdentifier, StackTrace: includeStackTrace ? exception?.ToString() : null));
+}
+
+static byte[] ReadIdentityMasterKey(IConfiguration configuration)
+{
+    var encoded = configuration["IdentityProtection:MasterKeyBase64"];
+    try
+    {
+        var key = Convert.FromBase64String(encoded ?? "");
+        if (key.Length == 32) return key;
+    }
+    catch (FormatException) { }
+    throw new InvalidOperationException("IdentityProtection__MasterKeyBase64 must contain a Base64-encoded 32-byte key.");
 }
 
 public partial class Program { }
