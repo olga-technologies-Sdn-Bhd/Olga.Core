@@ -169,13 +169,6 @@ jobs:
           include_exception_details=false
           [[ "$DEPLOY_ENVIRONMENT" == "dev" ]] && include_exception_details=true
 
-          az containerapp ingress update \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --target-port 8080 \
-            --allow-insecure false \
-            --output none
-
           az containerapp update \
             --name "$CONTAINER_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -193,18 +186,6 @@ jobs:
               --revision-suffix "$revision_suffix" \
               --output none
           fi
-
-          allow_insecure=$(az containerapp show \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --query properties.configuration.ingress.allowInsecure \
-            --output tsv)
-          target_port=$(az containerapp show \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --query properties.configuration.ingress.targetPort \
-            --output tsv)
-          [[ "$allow_insecure" == "false" && "$target_port" == "8080" ]]
 
           revision=$(az containerapp show \
             --name "$CONTAINER_APP_NAME" \
