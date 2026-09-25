@@ -193,7 +193,20 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<IReadOnlyList<EventResponse>> GetEventsAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        IReadOnlyList<EventResponse> result = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).Select(Map).ToArray();
+        var events = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).ToArray();
+        var eventIds = events.Select(x => x.EventId).ToArray();
+        var now = DateTimeOffset.UtcNow;
+
+        var liveCounts = store.LiveSessions
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE" && x.ActiveUntil > now)
+            .Select(x => x.EventId)
+            .ToList()
+            .GroupBy(id => id)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        IReadOnlyList<EventResponse> result = events
+            .Select(x => Map(x, liveCounts.GetValueOrDefault(x.EventId, 0)))
+            .ToArray();
         return Task.FromResult(result);
     }
 
@@ -414,7 +427,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled);
+    private static EventResponse Map(EventRecord x, int liveCount) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, liveCount);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);
