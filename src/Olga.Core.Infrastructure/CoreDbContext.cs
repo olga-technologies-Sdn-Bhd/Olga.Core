@@ -17,6 +17,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
     public DbSet<MemberConsent> MemberConsents => Set<MemberConsent>();
     public DbSet<EventRecord> EventRecords => Set<EventRecord>();
+    public DbSet<Venue> Venues => Set<Venue>();
     public DbSet<EventRegistration> EventRegistrations => Set<EventRegistration>();
     public DbSet<LiveModeSession> LiveModeSessions => Set<LiveModeSession>();
     public DbSet<EventPresence> EventPresences => Set<EventPresence>();
@@ -36,6 +37,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
     IQueryable<MemberConsent> ICoreStore.Consents => MemberConsents;
     IQueryable<EventRecord> ICoreStore.Events => EventRecords;
+    IQueryable<Venue> ICoreStore.Venues => Venues;
     IQueryable<EventRegistration> ICoreStore.Registrations => EventRegistrations;
     IQueryable<LiveModeSession> ICoreStore.LiveSessions => LiveModeSessions;
     IQueryable<EventPresence> ICoreStore.Presence => EventPresences;
@@ -251,7 +253,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });
-        model.Entity<EventRecord>(e => { e.ToTable("event", "event"); e.HasKey(x => x.EventId); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(250); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.CommunityId, x.Status, x.StartsAt }); });
+        model.Entity<EventRecord>(e => { e.ToTable("event", "event"); e.HasKey(x => x.EventId); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(250); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.CommunityId, x.Status, x.StartsAt }); });
+        model.Entity<Venue>(e => { e.ToTable("venue", "event"); e.HasKey(x => x.VenueId); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(200); e.Property(x => x.City).HasMaxLength(120); e.Property(x => x.CountryCode).HasMaxLength(2); });
         model.Entity<EventRegistration>(e => { e.ToTable("event_registration", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_registration_id").UseIdentityByDefaultColumn(); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId }).IsUnique(); });
         model.Entity<LiveModeSession>(e => { e.ToTable("live_mode_session", "event"); e.HasKey(x => x.SessionId); e.Property(x => x.SessionId).HasColumnName("live_session_id").HasMaxLength(64); e.Property(x => x.StartedAt).HasColumnName("activated_at"); e.Property(x => x.RevokedAt).HasColumnName("disabled_at"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId, x.Status }); });
         model.Entity<EventPresence>(e => { e.ToTable("event_presence", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("presence_id").UseIdentityByDefaultColumn(); e.Property(x => x.SessionId).HasColumnName("live_session_id").HasMaxLength(64); e.Property(x => x.CoarseCell).HasMaxLength(32); e.HasIndex(x => new { x.SessionId, x.ExpiresAt }); });
