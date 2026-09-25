@@ -59,6 +59,45 @@ public sealed class AdminEventServiceTests
         Assert.Equal("EVENT_NOT_EDITABLE", edit.Code);
     }
 
+    [Fact]
+    public async Task Attendees_list_registrations_with_profile_and_live_state()
+    {
+        await using var db = Db();
+        var admin = new AdminEventService(db);
+        var evt = await admin.CreateEventAsync("olga", new("Meetup", DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(1), Publish: true), "create-3", default);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "Asha", Headline = "Engineer" });
+        db.EventRegistrations.AddRange(new EventRegistration { EventId = evt.EventId, MemberId = "A" }, new EventRegistration { EventId = evt.EventId, MemberId = "B" });
+        db.LiveModeSessions.Add(new LiveModeSession { EventId = evt.EventId, MemberId = "A", ActiveUntil = DateTimeOffset.UtcNow.AddHours(1) });
+        await db.SaveChangesAsync();
+
+        var attendees = await admin.GetAttendeesAsync(evt.EventId, default);
+        var missing = await Assert.ThrowsAsync<DomainException>(() => admin.GetAttendeesAsync("missing", default));
+
+        var asha = attendees.Single(x => x.MemberId == "A");
+        var unknown = attendees.Single(x => x.MemberId == "B");
+        Assert.Equal(("Asha", "Engineer", true), (asha.DisplayName, asha.Headline, asha.IsLive));
+        Assert.Equal(("B", false), (unknown.DisplayName, unknown.IsLive));
+        Assert.Equal(404, missing.StatusCode);
+    }
+
+    [Fact]
+    public async Task Venue_create_is_idempotent_and_validates_country_and_timezone()
+    {
+        await using var db = Db();
+        var admin = new AdminEventService(db);
+
+        var created = await admin.CreateVenueAsync(new(" Hall ", "my", "UTC"), "venue-2", default);
+        var replay = await admin.CreateVenueAsync(new("Other", "in", "UTC"), "venue-2", default);
+        var country = await Assert.ThrowsAsync<DomainException>(() => admin.CreateVenueAsync(new("Hall", "MYS", "UTC"), "venue-3", default));
+        var timezone = await Assert.ThrowsAsync<DomainException>(() => admin.CreateVenueAsync(new("Hall", "MY", "Mars/Base"), "venue-4", default));
+
+        Assert.Equal(("Hall", "MY"), (created.Name, created.CountryCode));
+        Assert.Equal(created.VenueId, replay.VenueId);
+        Assert.Single(await admin.GetVenuesAsync(default));
+        Assert.Equal("VENUE_COUNTRY_INVALID", country.Code);
+        Assert.Equal("VENUE_TIMEZONE_INVALID", timezone.Code);
+    }
+
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Core(CoreDbContext db) => new(db, new AesIdentityProtector(new byte[32]));
 }

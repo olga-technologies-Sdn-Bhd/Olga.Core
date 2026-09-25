@@ -58,6 +58,44 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
     }
 
     [Fact]
+    public async Task Every_operation_has_a_unique_name_a_meaningful_tag_and_a_documented_success_response()
+    {
+        using var document = await GetDocumentAsync();
+
+        var operationIds = new List<string>();
+        foreach (var path in document.RootElement.GetProperty("paths").EnumerateObject())
+        foreach (var operation in path.Value.EnumerateObject())
+        {
+            var label = $"{operation.Name.ToUpperInvariant()} {path.Name}";
+            Assert.True(operation.Value.TryGetProperty("operationId", out var operationId), $"{label} has no operation name.");
+            operationIds.Add(operationId.GetString()!);
+
+            var tag = Assert.Single(operation.Value.GetProperty("tags").EnumerateArray()).GetString();
+            Assert.NotEqual("Olga.Core.Api", tag);
+
+            var success = operation.Value.GetProperty("responses").EnumerateObject().Where(response => response.Name.StartsWith('2')).ToArray();
+            Assert.NotEmpty(success);
+            foreach (var response in success.Where(response => response.Name is "200" or "201" && path.Name != "/ready"))
+                Assert.True(response.Value.TryGetProperty("content", out _), $"{label} {response.Name} has no response schema.");
+        }
+
+        Assert.Equal(operationIds.Count, operationIds.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public async Task Event_list_response_schema_exposes_venue_and_attendance_counts()
+    {
+        using var document = await GetDocumentAsync();
+
+        var properties = document.RootElement.GetProperty("components").GetProperty("schemas")
+            .GetProperty("EventResponse").GetProperty("properties");
+
+        Assert.True(properties.TryGetProperty("venue", out _));
+        Assert.True(properties.TryGetProperty("attendee_count", out _));
+        Assert.True(properties.TryGetProperty("live_count", out _));
+    }
+
+    [Fact]
     public async Task Member_lookup_does_not_create_a_profile_for_the_caller()
     {
         var callerId = $"lookup-{Guid.NewGuid():N}";
