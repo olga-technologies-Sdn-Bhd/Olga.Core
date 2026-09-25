@@ -193,6 +193,59 @@ public sealed class CoreServiceTests
         Assert.Equal("live_session_id", live.FindProperty(nameof(LiveModeSession.SessionId))!.GetColumnName());
     }
 
+    [Fact]
+    public async Task Events_list_includes_venue_name_and_attendee_count()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        await db.SaveChangesAsync();
+        db.Venues.Add(new Venue { VenueId = "V", Name = "Grand Hyatt KL", City = "Kuala Lumpur", CountryCode = "MY" });
+        db.EventRecords.Single(x => x.EventId == "E").VenueId = "V";
+        db.EventRegistrations.AddRange(
+            new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" },
+            new EventRegistration { EventId = "E", MemberId = "B", Status = "CHECKED_IN" });
+        await db.SaveChangesAsync();
+
+        var events = await service.GetEventsAsync(default);
+        var result = Assert.Single(events);
+
+        Assert.Equal("Grand Hyatt KL", result.Venue);
+        Assert.Equal(2, result.AttendeeCount);
+    }
+
+    [Fact]
+    public async Task Events_list_excludes_cancelled_registrations_from_attendee_count()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        db.EventRegistrations.AddRange(
+            new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" },
+            new EventRegistration { EventId = "E", MemberId = "B", Status = "CANCELLED" });
+        await db.SaveChangesAsync();
+
+        var events = await service.GetEventsAsync(default);
+        var result = Assert.Single(events);
+
+        Assert.Equal(1, result.AttendeeCount);
+    }
+
+    [Fact]
+    public async Task Events_list_reports_no_venue_when_event_has_none_assigned()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        await db.SaveChangesAsync();
+
+        var events = await service.GetEventsAsync(default);
+        var result = Assert.Single(events);
+
+        Assert.Null(result.Venue);
+        Assert.Equal(0, result.AttendeeCount);
+    }
+
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
     private static void SeedMembersAndEvent(CoreDbContext db)
