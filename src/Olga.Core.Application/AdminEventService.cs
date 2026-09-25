@@ -12,6 +12,7 @@ public interface IAdminEventService
     Task<AdminEventResponse> UpdateEventAsync(string eventId, AdminEventUpdateRequest request, CancellationToken ct);
     Task<AdminEventResponse> PublishEventAsync(string eventId, CancellationToken ct);
     Task<AdminEventResponse> CancelEventAsync(string eventId, CancellationToken ct);
+    Task<IReadOnlyList<AdminAttendeeResponse>> GetAttendeesAsync(string eventId, CancellationToken ct);
     Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct);
     Task<AdminVenueResponse> CreateVenueAsync(AdminVenueCreateRequest request, string idempotencyKey, CancellationToken ct);
 }
@@ -109,6 +110,23 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
         AddChange(row);
         await store.SaveAsync(ct);
         return MapAll([row])[0];
+    }
+
+    public Task<IReadOnlyList<AdminAttendeeResponse>> GetAttendeesAsync(string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = FindEvent(eventId);
+        var now = DateTimeOffset.UtcNow;
+        var registrations = store.Registrations.Where(x => x.EventId == eventId).OrderByDescending(x => x.RegisteredAt).ToArray();
+        var memberIds = registrations.Select(x => x.MemberId).ToArray();
+        var profiles = store.Profiles.Where(x => memberIds.Contains(x.MemberId)).ToDictionary(x => x.MemberId);
+        var live = store.LiveSessions.Where(x => x.EventId == eventId && x.Status == "ACTIVE" && x.ActiveUntil > now).Select(x => x.MemberId).ToHashSet();
+        IReadOnlyList<AdminAttendeeResponse> result = registrations.Select(x =>
+        {
+            var p = profiles.GetValueOrDefault(x.MemberId);
+            return new AdminAttendeeResponse(x.MemberId, p?.DisplayName ?? x.MemberId, p?.Headline, x.Status, x.RegisteredAt, x.CheckedInAt, live.Contains(x.MemberId));
+        }).ToArray();
+        return Task.FromResult(result);
     }
 
     public Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct)

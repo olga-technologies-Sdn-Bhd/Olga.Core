@@ -51,3 +51,4 @@ public sealed record AdminMemberStatusRequest(string ProfileStatus);
 public sealed record AdminReportResponse(string ReportId, string SourceType, string? SubjectMemberId, string? SubjectDisplayName, string? ResourceType, string? ResourceId, string Priority, string Status, DateTimeOffset CreatedAt, DateTimeOffset? ClosedAt);
 public sealed record AdminStatusRequest(string Status);
 public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);
+public sealed record AdminAttendeeResponse(string MemberId, string DisplayName, string? Headline, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt, bool IsLive);

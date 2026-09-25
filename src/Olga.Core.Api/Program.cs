@@ -164,6 +164,7 @@ adminV1.MapGet("/reports", async (string? status, IAdminService s, CancellationT
 adminV1.MapPatch("/reports/{reportId}", async (string reportId, AdminStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetReportStatusAsync(reportId, body, ct)));
 adminV1.MapGet("/privacy-requests", async (string? status, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(status, ct)));
 adminV1.MapPatch("/privacy-requests/{privacyRequestId}", async (string privacyRequestId, AdminStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetPrivacyRequestStatusAsync(privacyRequestId, body, ct)));
+adminV1.MapGet("/events/{eventId}/attendees", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetAttendeesAsync(eventId, ct)));
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)));
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); });
 
