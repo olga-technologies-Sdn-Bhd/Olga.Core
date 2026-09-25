@@ -196,6 +196,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         ct.ThrowIfCancellationRequested();
         var events = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).ToArray();
         var eventIds = events.Select(x => x.EventId).ToArray();
+        var now = DateTimeOffset.UtcNow;
+
+        var liveCounts = store.LiveSessions
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE" && x.ActiveUntil > now)
+            .Select(x => x.EventId)
+            .ToList()
+            .GroupBy(id => id)
+            .ToDictionary(g => g.Key, g => g.Count());
 
         var attendeeCounts = store.Registrations
             .Where(x => eventIds.Contains(x.EventId) && x.Status != "CANCELLED")
@@ -208,7 +216,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
 
         IReadOnlyList<EventResponse> result = events
-            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0)))
+            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0)))
             .ToArray();
         return Task.FromResult(result);
     }
@@ -430,7 +438,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount);
+    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);

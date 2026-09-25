@@ -246,6 +246,50 @@ public sealed class CoreServiceTests
         Assert.Equal(0, result.AttendeeCount);
     }
 
+    [Fact]
+    public async Task Events_list_counts_currently_active_live_sessions()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        await db.SaveChangesAsync();
+
+        await service.RegisterAsync("A", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+
+        await service.RegisterAsync("B", "E", default);
+        await service.RecordConsentAsync("B", new("LIVE_MODE", "1", "GRANTED"), default);
+        await service.StartLiveModeAsync("B", "E", new(30), default);
+
+        var events = await service.GetEventsAsync(default);
+        var result = Assert.Single(events);
+
+        Assert.Equal(2, result.LiveCount);
+    }
+
+    [Fact]
+    public async Task Events_list_excludes_expired_and_stopped_live_sessions_from_count()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        await db.SaveChangesAsync();
+
+        await service.RegisterAsync("A", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.StopLiveModeAsync("A", "E", default);
+
+        db.LiveModeSessions.Add(new LiveModeSession { EventId = "E", MemberId = "B", ConsentRecordId = 1, Status = "ACTIVE", ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-5) });
+        await db.SaveChangesAsync();
+
+        var events = await service.GetEventsAsync(default);
+        var result = Assert.Single(events);
+
+        Assert.Equal(0, result.LiveCount);
+    }
+
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
     private static void SeedMembersAndEvent(CoreDbContext db)
