@@ -47,6 +47,11 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(profileUpdate, "Idempotency-Key", required: true, maxLength: 128);
         AssertHeader(profileUpdate, "If-Match", required: false);
 
+        var lookupByEmail = Operation(document, "/v1/members/lookup", "post");
+        AssertHeader(lookupByEmail, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(lookupByEmail, "X-Member-Id");
+        Assert.Equal("LookupMember", lookupByEmail.GetProperty("operationId").GetString());
+
         var publicEvents = Operation(document, "/v1/events", "get");
         AssertNoHeader(publicEvents, "X-Member-Id");
     }

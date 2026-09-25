@@ -8,6 +8,7 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
     IQueryable<MemberConsent> Consents { get; }
     IQueryable<EventRecord> Events { get; }
@@ -38,6 +39,7 @@ public interface ICoreStore
 public interface ICoreService
 {
     Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct);
+    Task<MemberLookupResponse> LookupMemberByEmailAsync(MemberLookupRequest request, CancellationToken ct);
     Task ProvisionMemberAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
@@ -77,6 +79,8 @@ public interface IIdentityProtector
 {
     ProtectedIdentity ProtectEmail(string memberId, string value, bool isPrimary);
     ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
+    // Keyed lookup hash for an email, identical to the SubjectHash ProtectEmail stores.
+    string EmailLookupHash(string email);
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
@@ -114,6 +118,20 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         await store.CreateMemberAsync(member, ct);
         return new MemberRegistrationResponse(memberId, identities.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
             identities.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint, "DRAFT", "\"1\"");
+    }
+
+    public Task<MemberLookupResponse> LookupMemberByEmailAsync(MemberLookupRequest request, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(request.Email)) throw new DomainException("MEMBER_IDENTITY_REQUIRED");
+        var subjectHash = identityProtector.EmailLookupHash(request.Email);
+        var memberId = store.Identities
+            .Where(x => x.Provider == "EMAIL" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE")
+            .Select(x => x.MemberId)
+            .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var mapped = Map(profile);
+        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, mapped.DisplayName, mapped.ProfileStatus, mapped.ETag));
     }
 
     public Task ProvisionMemberAsync(string memberId, CancellationToken ct)
