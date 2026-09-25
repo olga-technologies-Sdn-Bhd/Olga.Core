@@ -15,8 +15,10 @@ builder.Services.ConfigureHttpJsonOptions(o => { o.SerializerOptions.PropertyNam
 const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
+const string adminKeyHeader = "X-Admin-Key";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
 var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
+var configuredAdminKey = builder.Configuration["Admin:ApiKey"];
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
 builder.Services.AddOpenApi(options =>
 {
@@ -37,6 +39,9 @@ builder.Services.AddOpenApi(options =>
             && method is "POST" or "PUT" or "PATCH" or "DELETE")
             AddHeaderParameter(operation, idempotencyKeyHeader, true, "Unique key for this logical mutation. Reuse the same key only when retrying the same request.", 128);
 
+        if (metadata.OfType<AdminKeyMetadata>().Any())
+            AddHeaderParameter(operation, adminKeyHeader, true, "Admin API key. Interim protection for admin routes until Entra sign-in is wired.");
+
         if (metadata.OfType<IfMatchMetadata>().Any())
             AddHeaderParameter(operation, ifMatchHeader, false, "ETag returned by GET /v1/me/profile. Required after the initial empty draft update.");
 
@@ -54,6 +59,9 @@ var identityMasterKey = local
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
 builder.Services.AddScoped<ICoreService, CoreService>();
+builder.Services.AddScoped<IAdminEventService, AdminEventService>();
+// Local InMemory runs get a fixed dev key; deployed environments must supply Admin__ApiKey or admin routes stay closed.
+var adminKey = string.IsNullOrWhiteSpace(configuredAdminKey) ? (local ? "local-admin-key" : null) : configuredAdminKey;
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
@@ -133,6 +141,24 @@ memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, Notifica
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)));
 memberV1.MapGet("/sync/changes", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetChangesAsync(Member(c), DecodeCursor(cursor), limit ?? 100, ct)));
 
+var adminV1 = app.MapGroup("/v1/admin").WithMetadata(new AdminKeyMetadata());
+adminV1.AddEndpointFilter(async (invocationContext, next) =>
+{
+    if (adminKey is null) throw new DomainException("ADMIN_NOT_CONFIGURED", 503);
+    var supplied = invocationContext.HttpContext.Request.Headers[adminKeyHeader].ToString();
+    if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(supplied), Encoding.UTF8.GetBytes(adminKey)))
+        throw new DomainException("ADMIN_KEY_INVALID", 401);
+    return await next(invocationContext);
+});
+adminV1.MapGet("/events", async (string? status, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(status, ct)));
+adminV1.MapGet("/events/{eventId}", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetEventAsync(eventId, ct)));
+adminV1.MapPost("/events", async (HttpContext c, AdminEventCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateEventAsync(defaultCommunityId, body, Idempotency(c), ct); return Results.Created($"/v1/admin/events/{value.EventId}", value); });
+adminV1.MapPut("/events/{eventId}", async (string eventId, AdminEventUpdateRequest body, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.UpdateEventAsync(eventId, body, ct)));
+adminV1.MapPost("/events/{eventId}/publish", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.PublishEventAsync(eventId, ct)));
+adminV1.MapPost("/events/{eventId}/cancel", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CancelEventAsync(eventId, ct)));
+adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)));
+adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); });
+
 if (local) await LocalDevelopmentSeeder.SeedAsync(app.Services, CancellationToken.None);
 app.Run();
 
@@ -184,6 +210,8 @@ static async Task Error(HttpContext context, int status, string code, Exception?
     {
         "IDEMPOTENCY_KEY_REQUIRED" => "An Idempotency-Key header is required for every mutation.",
         "IF_MATCH_REQUIRED" => "An If-Match header is required.",
+        "ADMIN_KEY_INVALID" => "A valid X-Admin-Key header is required.",
+        "ADMIN_NOT_CONFIGURED" => "Admin routes are disabled because no admin API key is configured.",
         "MEMBER_NOT_REGISTERED" => "The member must be registered by the identity service before profile onboarding.",
         "RESOURCE_REFERENCE_NOT_FOUND" => "A referenced resource does not exist.",
         "RESOURCE_VERSION_CONFLICT" => "The resource changed since it was read.",
@@ -208,3 +236,4 @@ static byte[] ReadIdentityMasterKey(IConfiguration configuration)
 public partial class Program { }
 internal sealed class MemberContextMetadata { }
 internal sealed class IfMatchMetadata { }
+internal sealed class AdminKeyMetadata { }

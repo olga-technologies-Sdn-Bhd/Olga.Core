@@ -63,7 +63,13 @@ public sealed class Venue
     public string VenueId { get; set; } = "";
     public string Name { get; set; } = "";
     public string? City { get; set; }
+    public string? Region { get; set; }
     public string CountryCode { get; set; } = "";
+    public string TimezoneId { get; set; } = "UTC";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class EventRegistration

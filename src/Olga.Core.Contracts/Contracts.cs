@@ -40,3 +40,8 @@ public sealed record PrivacyRequestCreate(string RequestType);
 public sealed record PrivacyRequestResponse(string PrivacyRequestId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt);
 public sealed record SyncItem(long Sequence, string ResourceType, string ResourceId, string ChangeType, long? ResourceVersion, object? Payload, DateTimeOffset OccurredAt);
 public sealed record SyncResponse(IReadOnlyList<SyncItem> Items, string? NextCursor, bool HasMore);
+public sealed record AdminEventCreateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true, bool Publish = false);
+public sealed record AdminEventUpdateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true);
+public sealed record AdminEventResponse(string EventId, string CommunityId, string Name, string? Description, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? VenueId, string? Venue, int AttendeeCount, int LiveCount, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public sealed record AdminVenueCreateRequest(string Name, string CountryCode, string TimezoneId, string? City = null, string? Region = null);
+public sealed record AdminVenueResponse(string VenueId, string Name, string CountryCode, string? Region, string? City, string TimezoneId, string Status, DateTimeOffset CreatedAt);
