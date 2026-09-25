@@ -258,3 +258,20 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
 }
+
+public sealed class ModerationCase
+{
+    public string ModerationCaseId { get; set; } = Guid.NewGuid().ToString("N");
+    public string SourceType { get; set; } = "MEMBER_REPORT";
+    public string? SourceId { get; set; }
+    public string? SubjectMemberId { get; set; }
+    public string? ResourceType { get; set; }
+    public string? ResourceId { get; set; }
+    public string Priority { get; set; } = "NORMAL";
+    public string Status { get; set; } = "OPEN";
+    public string? AssignedTo { get; set; }
+    public DateTimeOffset? ClosedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}

@@ -45,3 +45,9 @@ public sealed record AdminEventUpdateRequest(string Name, DateTimeOffset StartsA
 public sealed record AdminEventResponse(string EventId, string CommunityId, string Name, string? Description, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? VenueId, string? Venue, int AttendeeCount, int LiveCount, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
 public sealed record AdminVenueCreateRequest(string Name, string CountryCode, string TimezoneId, string? City = null, string? Region = null);
 public sealed record AdminVenueResponse(string VenueId, string Name, string CountryCode, string? Region, string? City, string TimezoneId, string Status, DateTimeOffset CreatedAt);
+public sealed record AdminStatsResponse(int TotalMembers, int ActiveMembers, int UpcomingEvents, int OpenReports, int PendingPrivacyRequests, int ConnectionsLast7Days);
+public sealed record AdminMemberResponse(string MemberId, string DisplayName, string? Headline, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public sealed record AdminMemberStatusRequest(string ProfileStatus);
+public sealed record AdminReportResponse(string ReportId, string SourceType, string? SubjectMemberId, string? SubjectDisplayName, string? ResourceType, string? ResourceId, string Priority, string Status, DateTimeOffset CreatedAt, DateTimeOffset? ClosedAt);
+public sealed record AdminStatusRequest(string Status);
+public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);

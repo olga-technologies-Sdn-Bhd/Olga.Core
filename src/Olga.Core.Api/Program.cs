@@ -60,6 +60,7 @@ builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(ident
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
+builder.Services.AddScoped<IAdminService, AdminService>();
 // Local InMemory runs get a fixed dev key; deployed environments must supply Admin__ApiKey or admin routes stay closed.
 var adminKey = string.IsNullOrWhiteSpace(configuredAdminKey) ? (local ? "local-admin-key" : null) : configuredAdminKey;
 
@@ -156,6 +157,13 @@ adminV1.MapPost("/events", async (HttpContext c, AdminEventCreateRequest body, I
 adminV1.MapPut("/events/{eventId}", async (string eventId, AdminEventUpdateRequest body, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.UpdateEventAsync(eventId, body, ct)));
 adminV1.MapPost("/events/{eventId}/publish", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.PublishEventAsync(eventId, ct)));
 adminV1.MapPost("/events/{eventId}/cancel", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CancelEventAsync(eventId, ct)));
+adminV1.MapGet("/stats", async (IAdminService s, CancellationToken ct) => Results.Ok(await s.GetStatsAsync(ct)));
+adminV1.MapGet("/members", async (string? status, string? search, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetMembersAsync(status, search, ct)));
+adminV1.MapPatch("/members/{memberId}", async (string memberId, AdminMemberStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetMemberStatusAsync(memberId, body, ct)));
+adminV1.MapGet("/reports", async (string? status, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetReportsAsync(status, ct)));
+adminV1.MapPatch("/reports/{reportId}", async (string reportId, AdminStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetReportStatusAsync(reportId, body, ct)));
+adminV1.MapGet("/privacy-requests", async (string? status, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(status, ct)));
+adminV1.MapPatch("/privacy-requests/{privacyRequestId}", async (string privacyRequestId, AdminStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetPrivacyRequestStatusAsync(privacyRequestId, body, ct)));
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)));
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); });
 
