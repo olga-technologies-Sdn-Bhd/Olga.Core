@@ -66,6 +66,19 @@ public sealed class Venue
     public string CountryCode { get; set; } = "";
 }
 
+public sealed class MemberIdentity
+{
+    public long Id { get; set; }
+    public string MemberId { get; set; } = "";
+    public string Provider { get; set; } = "";
+    public string ProviderSubjectHash { get; set; } = "";
+    public byte[] ProviderSubjectCiphertext { get; set; } = [];
+    public string? DisplayHint { get; set; }
+    public bool IsPrimary { get; set; }
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset? VerifiedAt { get; set; }
+}
+
 public sealed class EventRegistration
 {
     public long Id { get; set; }

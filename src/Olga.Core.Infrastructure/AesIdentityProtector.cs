@@ -29,6 +29,8 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
         return Protect("PHONE", memberId, normalized, hint, isPrimary, false);
     }
 
+    public string EmailLookupHash(string email) => LookupHash("EMAIL", NormalizeEmail(email));
+
     public string Unprotect(string memberId, string provider, byte[] envelope)
     {
         if (envelope.Length <= 1 + NonceSize + TagSize || envelope[0] != 1) throw new CryptographicException("Unsupported identity ciphertext.");
@@ -58,10 +60,11 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
         ciphertext.CopyTo(envelope, 1 + NonceSize + TagSize);
         CryptographicOperations.ZeroMemory(plaintext);
 
-        var lookupInput = Encoding.UTF8.GetBytes($"{provider}\n{normalized}");
-        var subjectHash = Convert.ToHexString(HMACSHA256.HashData(lookupKey, lookupInput)).ToLowerInvariant();
-        return new ProtectedIdentity(provider, subjectHash, envelope, hint, isPrimary, isVerified);
+        return new ProtectedIdentity(provider, LookupHash(provider, normalized), envelope, hint, isPrimary, isVerified);
     }
+
+    private string LookupHash(string provider, string normalized) =>
+        Convert.ToHexString(HMACSHA256.HashData(lookupKey, Encoding.UTF8.GetBytes($"{provider}\n{normalized}"))).ToLowerInvariant();
 
     private static string NormalizeEmail(string value)
     {
