@@ -34,6 +34,9 @@ builder.Services.AddOpenApi(options =>
         if (metadata.OfType<MemberContextMetadata>().Any())
             AddHeaderParameter(operation, memberIdHeader, false, $"MVP caller member ID. Defaults to {defaultMemberId} when omitted.", 64);
 
+        if (metadata.OfType<OptionalMemberContextMetadata>().Any())
+            AddHeaderParameter(operation, memberIdHeader, false, "Optional MVP caller member ID. When supplied, each event includes is_registered for this member; no default member is applied.", 64);
+
         var method = context.Description.HttpMethod;
         if (context.Description.RelativePath?.StartsWith("v1/", StringComparison.OrdinalIgnoreCase) == true
             && method is "POST" or "PUT" or "PATCH" or "DELETE")
@@ -139,7 +142,8 @@ memberV1.MapGet("/members/{memberId}", async (HttpContext c, string memberId, IC
     .WithName("GetMemberProfile").WithTags("Members").Produces<ProfileResponse>(200);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
-v1.MapGet("/events", async (ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(ct)))
+v1.MapGet("/events", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(OptionalMember(c), ct)))
+    .WithMetadata(new OptionalMemberContextMetadata())
     .WithName("ListEvents").WithTags("Events").Produces<IReadOnlyList<EventResponse>>(200);
 memberV1.MapPost("/events/{eventId}/register", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.RegisterAsync(Member(c), eventId, ct)))
     .WithName("RegisterForEvent").WithTags("Events").Produces<RegistrationResponse>(200);
@@ -215,6 +219,15 @@ adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, I
 if (local) await LocalDevelopmentSeeder.SeedAsync(app.Services, CancellationToken.None);
 app.Run();
 
+// For public routes that personalise the response only when the caller identifies itself.
+static string? OptionalMember(HttpContext context)
+{
+    var id = context.Request.Headers[memberIdHeader].FirstOrDefault();
+    if (string.IsNullOrWhiteSpace(id)) return null;
+    if (id.Length > 64) throw new DomainException("MEMBER_ID_INVALID");
+    return id;
+}
+
 string Member(HttpContext context)
 {
     var id = context.Request.Headers[memberIdHeader].FirstOrDefault();
@@ -288,5 +301,6 @@ static byte[] ReadIdentityMasterKey(IConfiguration configuration)
 
 public partial class Program { }
 internal sealed class MemberContextMetadata { }
+internal sealed class OptionalMemberContextMetadata { }
 internal sealed class IfMatchMetadata { }
 internal sealed class AdminKeyMetadata { }

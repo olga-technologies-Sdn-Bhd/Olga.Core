@@ -19,10 +19,10 @@ public sealed class AdminEventServiceTests
         var replay = await admin.CreateEventAsync("olga", request, "create-1", default);
         Assert.Equal(created.EventId, replay.EventId);
         Assert.Equal("DRAFT", created.Status);
-        Assert.Empty(await Core(db).GetEventsAsync(default));
+        Assert.Empty(await Core(db).GetEventsAsync(null, default));
 
         await admin.PublishEventAsync(created.EventId, default);
-        Assert.Single(await Core(db).GetEventsAsync(default));
+        Assert.Single(await Core(db).GetEventsAsync(null, default));
         Assert.Contains(db.Changes, x => x.ResourceType == "EVENT" && x.MemberScopeId == null);
     }
 

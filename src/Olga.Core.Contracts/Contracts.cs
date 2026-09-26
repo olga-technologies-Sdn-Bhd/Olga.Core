@@ -22,7 +22,7 @@ public sealed record ProfileResponse(string MemberId, string DisplayName, string
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
-public sealed record EventResponse(string EventId, string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? Venue, int AttendeeCount, int LiveCount);
+public sealed record EventResponse(string EventId, string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? Venue, int AttendeeCount, int LiveCount, bool? IsRegistered = null);
 public sealed record RegistrationResponse(string EventId, string MemberId, string Status, DateTimeOffset RegisteredAt);
 public sealed record LiveModeRequest(int DurationMinutes = 60);
 public sealed record LiveModeResponse(string SessionId, string EventId, string Status, DateTimeOffset ActiveUntil);
