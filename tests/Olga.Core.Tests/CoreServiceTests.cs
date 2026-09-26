@@ -28,6 +28,51 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Member_lookup_by_email_returns_the_registered_draft_member_for_any_case_or_whitespace()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "Asha@Example.com", "+60123456789"), "register-lookup", default);
+
+        var exact = await service.LookupMemberByEmailAsync(new("asha@example.com"), default);
+        var variant = await service.LookupMemberByEmailAsync(new("  ASHA@example.COM "), default);
+
+        Assert.Equal(registered.MemberId, exact.MemberId);
+        Assert.Equal(registered.MemberId, variant.MemberId);
+        Assert.Equal(("Asha", "DRAFT", registered.ETag), (exact.DisplayName, exact.ProfileStatus, exact.ETag));
+    }
+
+    [Fact]
+    public async Task Member_lookup_rejects_unknown_phone_only_missing_and_invalid_emails()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        await service.RegisterMemberAsync("olga", new MemberCreateRequest("Phone only", Phone: "+60123456789"), "register-phone", default);
+
+        var unknown = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("nobody@example.com"), default));
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("  "), default));
+        var invalid = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("not-an-email"), default));
+
+        Assert.Equal(("MEMBER_NOT_REGISTERED", 404), (unknown.Code, unknown.StatusCode));
+        Assert.Equal(("MEMBER_IDENTITY_REQUIRED", 400), (missing.Code, missing.StatusCode));
+        Assert.Equal(("MEMBER_EMAIL_INVALID", 400), (invalid.Code, invalid.StatusCode));
+    }
+
+    [Fact]
+    public async Task Registering_an_already_registered_email_with_a_new_key_is_still_a_conflict()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        await service.RegisterMemberAsync("olga", new MemberCreateRequest("First", "taken@example.com"), "register-a", default);
+
+        var conflict = await Assert.ThrowsAsync<DomainException>(() =>
+            service.RegisterMemberAsync("olga", new MemberCreateRequest("Second", "TAKEN@example.com"), "register-b", default));
+
+        Assert.Equal(("MEMBER_IDENTITY_ALREADY_REGISTERED", 409), (conflict.Code, conflict.StatusCode));
+        Assert.Single(db.MemberProfiles);
+    }
+
+    [Fact]
     public void Member_identity_is_encrypted_and_can_be_decrypted_with_the_master_key()
     {
         var identity = IdentityProtector.ProtectEmail("member-1", "Member@Example.com", true);

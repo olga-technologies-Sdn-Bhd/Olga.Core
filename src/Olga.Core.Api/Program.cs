@@ -116,6 +116,13 @@ v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreServ
     return Results.Created("/v1/me/profile", value);
 })
     .WithName("RegisterMember").WithTags("Members").Produces<MemberRegistrationResponse>(201);
+v1.MapPost("/members/lookup", async (HttpContext c, MemberLookupRequest body, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.LookupMemberByEmailAsync(body, ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
+    .WithName("LookupMember").WithTags("Members").Produces<MemberLookupResponse>(200);
 var profileV1 = memberV1.MapGroup("/me/profile");
 profileV1.AddEndpointFilter(async (invocationContext, next) =>
 {

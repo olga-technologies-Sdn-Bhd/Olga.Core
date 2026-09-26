@@ -16,6 +16,8 @@ public sealed record MemberCreateRequest(
     string Locale = "en",
     string Visibility = "MEMBERS");
 public sealed record MemberRegistrationResponse(string MemberId, string? EmailHint, string? PhoneHint, string ProfileStatus, string ETag);
+public sealed record MemberLookupRequest(string? Email);
+public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
 public sealed record ProfileResponse(string MemberId, string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
