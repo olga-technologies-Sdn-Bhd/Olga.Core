@@ -32,6 +32,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<NotificationPreference> Preferences => Set<NotificationPreference>();
     public DbSet<PrivacyRequest> MemberPrivacyRequests => Set<PrivacyRequest>();
     public DbSet<SyncChange> Changes => Set<SyncChange>();
+    public DbSet<ModerationCase> ModerationCases => Set<ModerationCase>();
     public DbSet<OutboxEvent> OutboxEvents => Set<OutboxEvent>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
@@ -53,6 +54,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<NotificationPreference> ICoreStore.NotificationPreferences => Preferences;
     IQueryable<PrivacyRequest> ICoreStore.PrivacyRequests => MemberPrivacyRequests;
     IQueryable<SyncChange> ICoreStore.SyncChanges => Changes;
+    IQueryable<ModerationCase> ICoreStore.ModerationCases => ModerationCases;
 
     void ICoreStore.Add<T>(T entity) => Set<T>().Add(entity);
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
@@ -273,7 +275,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });
         model.Entity<EventRecord>(e => { e.ToTable("event", "event"); e.HasKey(x => x.EventId); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(250); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.CommunityId, x.Status, x.StartsAt }); });
-        model.Entity<Venue>(e => { e.ToTable("venue", "event"); e.HasKey(x => x.VenueId); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(200); e.Property(x => x.City).HasMaxLength(120); e.Property(x => x.CountryCode).HasMaxLength(2); });
+        model.Entity<Venue>(e => { e.ToTable("venue", "event"); e.HasKey(x => x.VenueId); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(200); e.Property(x => x.City).HasMaxLength(120); e.Property(x => x.Region).HasMaxLength(120); e.Property(x => x.CountryCode).HasColumnType("character(2)").IsFixedLength(); e.Property(x => x.TimezoneId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<EventRegistration>(e => { e.ToTable("event_registration", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_registration_id").UseIdentityByDefaultColumn(); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId }).IsUnique(); });
         model.Entity<LiveModeSession>(e => { e.ToTable("live_mode_session", "event"); e.HasKey(x => x.SessionId); e.Property(x => x.SessionId).HasColumnName("live_session_id").HasMaxLength(64); e.Property(x => x.StartedAt).HasColumnName("activated_at"); e.Property(x => x.RevokedAt).HasColumnName("disabled_at"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId, x.Status }); });
         model.Entity<EventPresence>(e => { e.ToTable("event_presence", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("presence_id").UseIdentityByDefaultColumn(); e.Property(x => x.SessionId).HasColumnName("live_session_id").HasMaxLength(64); e.Property(x => x.CoarseCell).HasMaxLength(32); e.HasIndex(x => new { x.SessionId, x.ExpiresAt }); });
@@ -285,6 +287,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<Message>(e => { e.ToTable("message", "chat"); e.HasKey(x => x.MessageId); e.Property(x => x.MessageId).HasMaxLength(64); e.Property(x => x.Body).HasColumnType("text"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.ConversationId, x.ServerSequence }).IsUnique(); });
         model.Entity<MessageReceipt>(e => { e.ToTable("message_receipt", "chat"); e.HasKey(x => new { x.MessageId, x.MemberId }); });
         model.Entity<NotificationPreference>(e => { e.ToTable("notification_preference", "notification"); e.HasKey(x => new { x.MemberId, x.PurposeCode }); ConfigureVersion(e.Property(x => x.RowVersion)); });
+        model.Entity<ModerationCase>(e => { e.ToTable("moderation_case", "moderation"); e.HasKey(x => x.ModerationCaseId); e.Property(x => x.ModerationCaseId).HasMaxLength(64); e.Property(x => x.SourceType).HasMaxLength(32); e.Property(x => x.SourceId).HasMaxLength(64); e.Property(x => x.SubjectMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Priority).HasMaxLength(16); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.AssignedTo).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<SyncChange>(e => { e.ToTable("sync_change", "ops"); e.HasKey(x => x.SyncSequence); e.Property(x => x.SyncSequence).ValueGeneratedOnAdd(); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberScopeId, x.SyncSequence }); });
         model.Entity<OutboxEvent>(e => { e.ToTable("outbox_event", "ops"); e.HasKey(x => x.OutboxEventId); e.Property(x => x.OutboxEventId).HasMaxLength(64); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.PublishedAt, x.OccurredAt }); });
@@ -320,6 +323,7 @@ public static class LocalDevelopmentSeeder
                 new ConsentPolicy { PolicyId = "live-mode-v1", PurposeCode = "LIVE_MODE", Version = "1", ContentHash = new string('0', 64), EffectiveFrom = DateTimeOffset.UtcNow.AddYears(-1) },
                 new ConsentPolicy { PolicyId = "matching-v1", PurposeCode = "MATCHING", Version = "1", ContentHash = new string('1', 64), EffectiveFrom = DateTimeOffset.UtcNow.AddYears(-1) });
             db.EventRecords.Add(new EventRecord { EventId = "event-001", Name = "OLGA Connect Pilot", StartsAt = DateTimeOffset.UtcNow.AddDays(-1), EndsAt = DateTimeOffset.UtcNow.AddDays(30), LiveModeEnabled = true });
+            db.ModerationCases.Add(new ModerationCase { ModerationCaseId = "case-001", SubjectMemberId = "B456", ResourceType = "PROFILE", ResourceId = "B456" });
             await db.SaveChangesAsync(ct);
         }
         finally

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -10,7 +11,8 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
 {
     private readonly WebApplicationFactory<Program> factory;
 
-    public OpenApiContractTests(WebApplicationFactory<Program> factory) => this.factory = factory;
+    // Non-Development environment so a developer's user-secrets (real DB connection) never leak into these InMemory tests.
+    public OpenApiContractTests(WebApplicationFactory<Program> factory) => this.factory = factory.WithWebHostBuilder(b => b.UseEnvironment("Testing"));
 
     [Fact]
     public async Task Generated_document_uses_only_the_browser_https_origin_behind_a_proxy()
@@ -54,6 +56,48 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
 
         var publicEvents = Operation(document, "/v1/events", "get");
         AssertNoHeader(publicEvents, "X-Member-Id");
+
+        var adminCreateEvent = Operation(document, "/v1/admin/events", "post");
+        AssertHeader(adminCreateEvent, "X-Admin-Key", required: true);
+        AssertNoHeader(adminCreateEvent, "X-Member-Id");
+    }
+
+    [Fact]
+    public async Task Every_operation_has_a_unique_name_a_meaningful_tag_and_a_documented_success_response()
+    {
+        using var document = await GetDocumentAsync();
+
+        var operationIds = new List<string>();
+        foreach (var path in document.RootElement.GetProperty("paths").EnumerateObject())
+        foreach (var operation in path.Value.EnumerateObject())
+        {
+            var label = $"{operation.Name.ToUpperInvariant()} {path.Name}";
+            Assert.True(operation.Value.TryGetProperty("operationId", out var operationId), $"{label} has no operation name.");
+            operationIds.Add(operationId.GetString()!);
+
+            var tag = Assert.Single(operation.Value.GetProperty("tags").EnumerateArray()).GetString();
+            Assert.NotEqual("Olga.Core.Api", tag);
+
+            var success = operation.Value.GetProperty("responses").EnumerateObject().Where(response => response.Name.StartsWith('2')).ToArray();
+            Assert.NotEmpty(success);
+            foreach (var response in success.Where(response => response.Name is "200" or "201" && path.Name != "/ready"))
+                Assert.True(response.Value.TryGetProperty("content", out _), $"{label} {response.Name} has no response schema.");
+        }
+
+        Assert.Equal(operationIds.Count, operationIds.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public async Task Event_list_response_schema_exposes_venue_and_attendance_counts()
+    {
+        using var document = await GetDocumentAsync();
+
+        var properties = document.RootElement.GetProperty("components").GetProperty("schemas")
+            .GetProperty("EventResponse").GetProperty("properties");
+
+        Assert.True(properties.TryGetProperty("venue", out _));
+        Assert.True(properties.TryGetProperty("attendee_count", out _));
+        Assert.True(properties.TryGetProperty("live_count", out _));
     }
 
     [Fact]
@@ -84,6 +128,21 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
         using var body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
         Assert.Equal("MEMBER_ID_INVALID", body.RootElement.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Admin_routes_reject_a_missing_or_wrong_key()
+    {
+        using var client = factory.CreateClient();
+        using var missing = await client.GetAsync("/v1/admin/events");
+        using var wrong = new HttpRequestMessage(HttpMethod.Get, "/v1/admin/events");
+        wrong.Headers.Add("X-Admin-Key", "nope");
+        using var ok = new HttpRequestMessage(HttpMethod.Get, "/v1/admin/events");
+        ok.Headers.Add("X-Admin-Key", "local-admin-key");
+
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, missing.StatusCode);
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, (await client.SendAsync(wrong)).StatusCode);
+        Assert.Equal(System.Net.HttpStatusCode.OK, (await client.SendAsync(ok)).StatusCode);
     }
 
     private async Task<JsonDocument> GetDocumentAsync(string? forwardedProto = null)

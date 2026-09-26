@@ -26,6 +26,7 @@ public interface ICoreStore
     IQueryable<NotificationPreference> NotificationPreferences { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
+    IQueryable<ModerationCase> ModerationCases { get; }
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
