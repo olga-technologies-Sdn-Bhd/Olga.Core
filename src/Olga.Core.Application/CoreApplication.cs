@@ -46,7 +46,8 @@ public interface ICoreService
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
-    Task<IReadOnlyList<EventResponse>> GetEventsAsync(CancellationToken ct);
+    // memberId is optional: when supplied, each event carries is_registered for that member.
+    Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
@@ -210,7 +211,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return new(row.Id, row.PolicyId, request.PurposeCode, request.PolicyVersion, request.Decision, row.CapturedAt, row.WithdrawnAt);
     }
 
-    public Task<IReadOnlyList<EventResponse>> GetEventsAsync(CancellationToken ct)
+    public Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var events = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).ToArray();
@@ -234,8 +235,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var venueIds = events.Where(x => x.VenueId != null).Select(x => x.VenueId!).Distinct().ToArray();
         var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
 
+        // Same statuses that allow Live Mode, so is_registered matches what the member can do next.
+        HashSet<string>? registeredEventIds = memberId is null ? null : store.Registrations
+            .Where(x => eventIds.Contains(x.EventId) && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))
+            .Select(x => x.EventId)
+            .ToHashSet();
+
         IReadOnlyList<EventResponse> result = events
-            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0)))
+            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0), registeredEventIds?.Contains(x.EventId)))
             .ToArray();
         return Task.FromResult(result);
     }
@@ -457,7 +464,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount);
+    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount, bool? isRegistered) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount, isRegistered);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);

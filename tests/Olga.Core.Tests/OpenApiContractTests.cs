@@ -55,7 +55,7 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.Equal("LookupMember", lookupByEmail.GetProperty("operationId").GetString());
 
         var publicEvents = Operation(document, "/v1/events", "get");
-        AssertNoHeader(publicEvents, "X-Member-Id");
+        AssertHeader(publicEvents, "X-Member-Id", required: false, maxLength: 64);
 
         var adminCreateEvent = Operation(document, "/v1/admin/events", "post");
         AssertHeader(adminCreateEvent, "X-Admin-Key", required: true);
@@ -98,6 +98,23 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.True(properties.TryGetProperty("venue", out _));
         Assert.True(properties.TryGetProperty("attendee_count", out _));
         Assert.True(properties.TryGetProperty("live_count", out _));
+    }
+
+    [Fact]
+    public async Task Event_list_includes_is_registered_only_when_a_member_is_supplied()
+    {
+        using var client = factory.CreateClient();
+
+        using var anonymous = JsonDocument.Parse(await client.GetStringAsync("/v1/events"));
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/v1/events");
+        request.Headers.Add("X-Member-Id", $"events-{Guid.NewGuid():N}");
+        using var response = await client.SendAsync(request);
+        response.EnsureSuccessStatusCode();
+        using var personalised = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+
+        Assert.NotEmpty(anonymous.RootElement.EnumerateArray());
+        Assert.All(anonymous.RootElement.EnumerateArray(), e => Assert.False(e.TryGetProperty("is_registered", out _)));
+        Assert.All(personalised.RootElement.EnumerateArray(), e => Assert.False(e.GetProperty("is_registered").GetBoolean()));
     }
 
     [Fact]

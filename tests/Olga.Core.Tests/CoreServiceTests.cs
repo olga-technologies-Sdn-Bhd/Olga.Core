@@ -252,7 +252,7 @@ public sealed class CoreServiceTests
             new EventRegistration { EventId = "E", MemberId = "B", Status = "CHECKED_IN" });
         await db.SaveChangesAsync();
 
-        var events = await service.GetEventsAsync(default);
+        var events = await service.GetEventsAsync(null, default);
         var result = Assert.Single(events);
 
         Assert.Equal("Grand Hyatt KL", result.Venue);
@@ -270,7 +270,7 @@ public sealed class CoreServiceTests
             new EventRegistration { EventId = "E", MemberId = "B", Status = "CANCELLED" });
         await db.SaveChangesAsync();
 
-        var events = await service.GetEventsAsync(default);
+        var events = await service.GetEventsAsync(null, default);
         var result = Assert.Single(events);
 
         Assert.Equal(1, result.AttendeeCount);
@@ -284,7 +284,7 @@ public sealed class CoreServiceTests
         SeedMembersAndEvent(db);
         await db.SaveChangesAsync();
 
-        var events = await service.GetEventsAsync(default);
+        var events = await service.GetEventsAsync(null, default);
         var result = Assert.Single(events);
 
         Assert.Null(result.Venue);
@@ -307,7 +307,7 @@ public sealed class CoreServiceTests
         await service.RecordConsentAsync("B", new("LIVE_MODE", "1", "GRANTED"), default);
         await service.StartLiveModeAsync("B", "E", new(30), default);
 
-        var events = await service.GetEventsAsync(default);
+        var events = await service.GetEventsAsync(null, default);
         var result = Assert.Single(events);
 
         Assert.Equal(2, result.LiveCount);
@@ -329,7 +329,7 @@ public sealed class CoreServiceTests
         db.LiveModeSessions.Add(new LiveModeSession { EventId = "E", MemberId = "B", ConsentRecordId = 1, Status = "ACTIVE", ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-5) });
         await db.SaveChangesAsync();
 
-        var events = await service.GetEventsAsync(default);
+        var events = await service.GetEventsAsync(null, default);
         var result = Assert.Single(events);
 
         Assert.Equal(0, result.LiveCount);
@@ -337,6 +337,30 @@ public sealed class CoreServiceTests
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
+    [Fact]
+    public async Task Event_list_marks_registration_only_for_the_supplied_member()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        SeedMembersAndEvent(db);
+        db.EventRecords.Add(new EventRecord { EventId = "F", Name = "Other", StartsAt = DateTimeOffset.UtcNow.AddDays(1), EndsAt = DateTimeOffset.UtcNow.AddDays(2) });
+        db.EventRegistrations.AddRange(
+            new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" },
+            new EventRegistration { EventId = "F", MemberId = "A", Status = "CANCELLED" },
+            new EventRegistration { EventId = "F", MemberId = "B", Status = "CHECKED_IN" });
+        await db.SaveChangesAsync();
+
+        var forA = (await service.GetEventsAsync("A", default)).ToDictionary(x => x.EventId, x => x.IsRegistered);
+        var forB = (await service.GetEventsAsync("B", default)).ToDictionary(x => x.EventId, x => x.IsRegistered);
+        var forUnknown = await service.GetEventsAsync("nobody", default);
+        var anonymous = await service.GetEventsAsync(null, default);
+
+        Assert.Equal(new Dictionary<string, bool?> { ["E"] = true, ["F"] = false }, forA);
+        Assert.Equal(new Dictionary<string, bool?> { ["E"] = false, ["F"] = true }, forB);
+        Assert.All(forUnknown, x => Assert.False(x.IsRegistered));
+        Assert.All(anonymous, x => Assert.Null(x.IsRegistered));
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });
