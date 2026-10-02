@@ -8,9 +8,12 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
     IQueryable<MemberConsent> Consents { get; }
     IQueryable<EventRecord> Events { get; }
+    IQueryable<Venue> Venues { get; }
+    IQueryable<EventMatchingPolicy> MatchingPolicies { get; }
     IQueryable<EventRegistration> Registrations { get; }
     IQueryable<LiveModeSession> LiveSessions { get; }
     IQueryable<EventPresence> Presence { get; }
@@ -24,6 +27,9 @@ public interface ICoreStore
     IQueryable<NotificationPreference> NotificationPreferences { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
+    IQueryable<ModerationCase> ModerationCases { get; }
+    Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
+    Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
     void Remove<T>(T entity) where T : class;
     Task SaveAsync(CancellationToken ct);
@@ -34,11 +40,15 @@ public interface ICoreStore
 
 public interface ICoreService
 {
+    Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct);
+    Task<MemberLookupResponse> LookupMemberByEmailAsync(MemberLookupRequest request, CancellationToken ct);
+    Task ProvisionMemberAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
-    Task<IReadOnlyList<EventResponse>> GetEventsAsync(CancellationToken ct);
+    // memberId is optional: when supplied, each event carries is_registered for that member.
+    Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
@@ -55,14 +65,89 @@ public interface ICoreService
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
 }
 
-public sealed class CoreService(ICoreStore store) : ICoreService
+public sealed record ProtectedIdentity(string Provider, string SubjectHash, byte[] SubjectCiphertext, string DisplayHint, bool IsPrimary, bool IsVerified);
+public sealed record NewMemberRegistration(
+    string MemberId,
+    string CommunityId,
+    string Locale,
+    string DisplayName,
+    string? Headline,
+    string? ProfessionalSummary,
+    string? RoleCategory,
+    string Visibility,
+    decimal CompletenessScore,
+    IReadOnlyList<ProtectedIdentity> Identities);
+
+public interface IIdentityProtector
+{
+    ProtectedIdentity ProtectEmail(string memberId, string value, bool isPrimary);
+    ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
+    // Keyed lookup hash for an email, identical to the SubjectHash ProtectEmail stores.
+    string EmailLookupHash(string email);
+    string Unprotect(string memberId, string provider, byte[] ciphertext);
+}
+
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    public async Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(communityId) || communityId.Length > 64) throw new DomainException("COMMUNITY_ID_INVALID");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (string.IsNullOrWhiteSpace(request.DisplayName) || request.DisplayName.Length > 150) throw new DomainException("PROFILE_INVALID");
+        if (request.Headline?.Length > 240 || request.ProfessionalSummary?.Length > 2000 || request.RoleCategory?.Length > 64) throw new DomainException("PROFILE_INVALID");
+        if (request.Visibility is not ("PUBLIC" or "MEMBERS" or "CONNECTED" or "HIDDEN")) throw new DomainException("PROFILE_VISIBILITY_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Locale) || request.Locale.Length > 16) throw new DomainException("MEMBER_LOCALE_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Email) && string.IsNullOrWhiteSpace(request.Phone)) throw new DomainException("MEMBER_IDENTITY_REQUIRED");
+
+        var memberHash = Hash("iam.register_member", communityId, idempotencyKey);
+        var memberId = $"mem_{memberHash[..32]}";
+        var identities = new List<ProtectedIdentity>(2);
+        if (!string.IsNullOrWhiteSpace(request.Email)) identities.Add(identityProtector.ProtectEmail(memberId, request.Email, true));
+        if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0));
+
+        var member = new NewMemberRegistration(
+            memberId,
+            communityId,
+            request.Locale.Trim(),
+            request.DisplayName.Trim(),
+            request.Headline?.Trim(),
+            request.ProfessionalSummary?.Trim(),
+            request.RoleCategory?.Trim(),
+            request.Visibility,
+            new[] { request.DisplayName, request.Headline, request.ProfessionalSummary, request.RoleCategory }.Count(value => !string.IsNullOrWhiteSpace(value)) * 25m,
+            identities);
+        await store.CreateMemberAsync(member, ct);
+        return new MemberRegistrationResponse(memberId, identities.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
+            identities.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint, "DRAFT", "\"1\"");
+    }
+
+    public Task<MemberLookupResponse> LookupMemberByEmailAsync(MemberLookupRequest request, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(request.Email)) throw new DomainException("MEMBER_IDENTITY_REQUIRED");
+        var subjectHash = identityProtector.EmailLookupHash(request.Email);
+        var memberId = store.Identities
+            .Where(x => x.Provider == "EMAIL" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE")
+            .Select(x => x.MemberId)
+            .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var mapped = Map(profile);
+        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, mapped.DisplayName, mapped.ProfileStatus, mapped.ETag));
+    }
+
+    public Task ProvisionMemberAsync(string memberId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(memberId) || memberId.Length > 64) throw new DomainException("MEMBER_ID_INVALID");
+        return store.EnsureMemberAsync(memberId, ct);
+    }
 
     public Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        return Task.FromResult(Map(FindProfile(memberId)));
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        return Task.FromResult(Map(profile));
     }
 
     public Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct)
@@ -87,8 +172,10 @@ public sealed class CoreService(ICoreStore store) : ICoreService
         }
         else
         {
-            if (string.IsNullOrWhiteSpace(ifMatch)) throw new DomainException("IF_MATCH_REQUIRED", 428);
-            if (!string.Equals(ifMatch.Trim('"'), profile.Version.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
+            if (profile.Status is not ("DRAFT" or "ACTIVE")) throw new DomainException("PROFILE_NOT_EDITABLE", 409);
+            var isInitialDraft = profile.Status == "DRAFT" && profile.PublishedAt is null && string.IsNullOrWhiteSpace(profile.DisplayName);
+            if (string.IsNullOrWhiteSpace(ifMatch) && !isInitialDraft) throw new DomainException("IF_MATCH_REQUIRED", 428);
+            if (!string.IsNullOrWhiteSpace(ifMatch) && !string.Equals(ifMatch.Trim('"'), profile.Version.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
                 throw new DomainException("RESOURCE_VERSION_CONFLICT", 409);
             if (!store.IsRelational) profile.Version++;
         }
@@ -125,10 +212,39 @@ public sealed class CoreService(ICoreStore store) : ICoreService
         return new(row.Id, row.PolicyId, request.PurposeCode, request.PolicyVersion, request.Decision, row.CapturedAt, row.WithdrawnAt);
     }
 
-    public Task<IReadOnlyList<EventResponse>> GetEventsAsync(CancellationToken ct)
+    public Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        IReadOnlyList<EventResponse> result = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).Select(Map).ToArray();
+        var events = store.Events.Where(x => x.Status == "PUBLISHED" || x.Status == "ACTIVE").OrderBy(x => x.StartsAt).ToArray();
+        var eventIds = events.Select(x => x.EventId).ToArray();
+        var now = DateTimeOffset.UtcNow;
+
+        var liveCounts = store.LiveSessions
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE" && x.ActiveUntil > now)
+            .Select(x => x.EventId)
+            .ToList()
+            .GroupBy(id => id)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var attendeeCounts = store.Registrations
+            .Where(x => eventIds.Contains(x.EventId) && x.Status != "CANCELLED")
+            .Select(x => x.EventId)
+            .ToList()
+            .GroupBy(id => id)
+            .ToDictionary(g => g.Key, g => g.Count());
+
+        var venueIds = events.Where(x => x.VenueId != null).Select(x => x.VenueId!).Distinct().ToArray();
+        var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
+
+        // Same statuses that allow Live Mode, so is_registered matches what the member can do next.
+        HashSet<string>? registeredEventIds = memberId is null ? null : store.Registrations
+            .Where(x => eventIds.Contains(x.EventId) && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))
+            .Select(x => x.EventId)
+            .ToHashSet();
+
+        IReadOnlyList<EventResponse> result = events
+            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0), registeredEventIds?.Contains(x.EventId)))
+            .ToArray();
         return Task.FromResult(result);
     }
 
@@ -150,9 +266,15 @@ public sealed class CoreService(ICoreStore store) : ICoreService
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
-        if (evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
+        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
         if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_NOT_ENABLED", 409);
         var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
+        // A published event becomes ACTIVE once it has started; the database only allows Live Mode
+        // sessions (and matching eligibility) for ACTIVE events with an active matching policy.
+        // Saved before the session so the session insert sees the ACTIVE event.
+        var activated = false;
+        if (evt.Status == "PUBLISHED") { evt.Status = "ACTIVE"; evt.UpdatedAt = now; activated = true; }
+        if (EventMatchingPolicies.EnsureDefault(store, evt.EventId, now) || activated) await store.SaveAsync(ct);
         var existing = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE");
         if (existing is not null) { existing.ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt); await store.SaveAsync(ct); return Map(existing); }
         var row = new LiveModeSession { EventId = eventId, MemberId = memberId, ConsentRecordId = consent.Id, ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt) };
@@ -187,6 +309,7 @@ public sealed class CoreService(ICoreStore store) : ICoreService
     public async Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, CancellationToken ct)
     {
         if (senderId == request.RecipientMemberId) throw new DomainException("SELF_CONNECTION_INVALID");
+        _ = FindProfile(senderId);
         _ = FindProfile(request.RecipientMemberId);
         if (IsBlocked(senderId, request.RecipientMemberId)) throw new DomainException("CONNECTION_NOT_ALLOWED", 403);
         if (IsConnected(senderId, request.RecipientMemberId)) throw new DomainException("CONNECTION_EXISTS", 409);
@@ -348,7 +471,7 @@ public sealed class CoreService(ICoreStore store) : ICoreService
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled);
+    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount, bool? isRegistered) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount, isRegistered);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);

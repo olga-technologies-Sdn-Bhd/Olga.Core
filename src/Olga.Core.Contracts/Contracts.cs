@@ -1,11 +1,28 @@
 namespace Olga.Core.Contracts;
 
-public sealed record ApiError(string Code, string Message, string CorrelationId, IReadOnlyDictionary<string, string[]>? FieldErrors = null);
+public sealed record ApiError(
+    string Code,
+    string Message,
+    string CorrelationId,
+    IReadOnlyDictionary<string, string[]>? FieldErrors = null,
+    string? StackTrace = null);
+public sealed record MemberCreateRequest(
+    string DisplayName,
+    string? Email = null,
+    string? Phone = null,
+    string? Headline = null,
+    string? ProfessionalSummary = null,
+    string? RoleCategory = null,
+    string Locale = "en",
+    string Visibility = "MEMBERS");
+public sealed record MemberRegistrationResponse(string MemberId, string? EmailHint, string? PhoneHint, string ProfileStatus, string ETag);
+public sealed record MemberLookupRequest(string? Email);
+public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
 public sealed record ProfileResponse(string MemberId, string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
-public sealed record EventResponse(string EventId, string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled);
+public sealed record EventResponse(string EventId, string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? Venue, int AttendeeCount, int LiveCount, bool? IsRegistered = null);
 public sealed record RegistrationResponse(string EventId, string MemberId, string Status, DateTimeOffset RegisteredAt);
 public sealed record LiveModeRequest(int DurationMinutes = 60);
 public sealed record LiveModeResponse(string SessionId, string EventId, string Status, DateTimeOffset ActiveUntil);
@@ -25,3 +42,15 @@ public sealed record PrivacyRequestCreate(string RequestType);
 public sealed record PrivacyRequestResponse(string PrivacyRequestId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt);
 public sealed record SyncItem(long Sequence, string ResourceType, string ResourceId, string ChangeType, long? ResourceVersion, object? Payload, DateTimeOffset OccurredAt);
 public sealed record SyncResponse(IReadOnlyList<SyncItem> Items, string? NextCursor, bool HasMore);
+public sealed record AdminEventCreateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true, bool Publish = false);
+public sealed record AdminEventUpdateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true);
+public sealed record AdminEventResponse(string EventId, string CommunityId, string Name, string? Description, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string Status, bool LiveModeEnabled, string? VenueId, string? Venue, int AttendeeCount, int LiveCount, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public sealed record AdminVenueCreateRequest(string Name, string CountryCode, string TimezoneId, string? City = null, string? Region = null);
+public sealed record AdminVenueResponse(string VenueId, string Name, string CountryCode, string? Region, string? City, string TimezoneId, string Status, DateTimeOffset CreatedAt);
+public sealed record AdminStatsResponse(int TotalMembers, int ActiveMembers, int UpcomingEvents, int OpenReports, int PendingPrivacyRequests, int ConnectionsLast7Days);
+public sealed record AdminMemberResponse(string MemberId, string DisplayName, string? Headline, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt);
+public sealed record AdminMemberStatusRequest(string ProfileStatus);
+public sealed record AdminReportResponse(string ReportId, string SourceType, string? SubjectMemberId, string? SubjectDisplayName, string? ResourceType, string? ResourceId, string Priority, string Status, DateTimeOffset CreatedAt, DateTimeOffset? ClosedAt);
+public sealed record AdminStatusRequest(string Status);
+public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);
+public sealed record AdminAttendeeResponse(string MemberId, string DisplayName, string? Headline, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt, bool IsLive);

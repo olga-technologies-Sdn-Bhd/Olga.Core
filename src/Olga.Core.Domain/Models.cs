@@ -46,6 +46,7 @@ public sealed class EventRecord
 {
     public string EventId { get; set; } = "";
     public string CommunityId { get; set; } = "olga";
+    public string? VenueId { get; set; }
     public string Name { get; set; } = "";
     public string? Description { get; set; }
     public DateTimeOffset StartsAt { get; set; }
@@ -55,6 +56,43 @@ public sealed class EventRecord
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public long RowVersion { get; set; } = 1;
+}
+
+// Per-event matching rules (event.event_matching_policy). Unmapped columns use their database defaults.
+public sealed class EventMatchingPolicy
+{
+    public long Id { get; set; }
+    public string EventId { get; set; } = "";
+    public short PolicyVersion { get; set; } = 1;
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset EffectiveFrom { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class Venue
+{
+    public string VenueId { get; set; } = "";
+    public string Name { get; set; } = "";
+    public string? City { get; set; }
+    public string? Region { get; set; }
+    public string CountryCode { get; set; } = "";
+    public string TimezoneId { get; set; } = "UTC";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+public sealed class MemberIdentity
+{
+    public long Id { get; set; }
+    public string MemberId { get; set; } = "";
+    public string Provider { get; set; } = "";
+    public string ProviderSubjectHash { get; set; } = "";
+    public byte[] ProviderSubjectCiphertext { get; set; } = [];
+    public string? DisplayHint { get; set; }
+    public bool IsPrimary { get; set; }
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset? VerifiedAt { get; set; }
 }
 
 public sealed class EventRegistration
@@ -242,4 +280,21 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
 {
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
+}
+
+public sealed class ModerationCase
+{
+    public string ModerationCaseId { get; set; } = Guid.NewGuid().ToString("N");
+    public string SourceType { get; set; } = "MEMBER_REPORT";
+    public string? SourceId { get; set; }
+    public string? SubjectMemberId { get; set; }
+    public string? ResourceType { get; set; }
+    public string? ResourceId { get; set; }
+    public string Priority { get; set; } = "NORMAL";
+    public string Status { get; set; } = "OPEN";
+    public string? AssignedTo { get; set; }
+    public DateTimeOffset? ClosedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
