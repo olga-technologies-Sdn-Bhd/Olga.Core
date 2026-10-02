@@ -58,7 +58,23 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     void ICoreStore.Add<T>(T entity) => Set<T>().Add(entity);
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
-    Task ICoreStore.SaveAsync(CancellationToken ct) => SaveChangesAsync(ct);
+    Task ICoreStore.SaveAsync(CancellationToken ct)
+    {
+        if (Database.IsRelational()) ApplyDatabaseSyncResourceTypes();
+        return SaveChangesAsync(ct);
+    }
+
+    // ops.sync_change's ck_sync_change_values only accepts the resource types in SyncResourceTypes.Database.
+    // Map or skip the rest so the surrounding write isn't rejected; remove once the database accepts them.
+    private void ApplyDatabaseSyncResourceTypes()
+    {
+        foreach (var entry in ChangeTracker.Entries<SyncChange>().Where(x => x.State == EntityState.Added).ToList())
+        {
+            var mapped = SyncResourceTypes.ForDatabase(entry.Entity.ResourceType);
+            if (mapped is null) entry.State = EntityState.Detached;
+            else entry.Entity.ResourceType = mapped;
+        }
+    }
 
     async Task ICoreStore.CreateMemberAsync(NewMemberRegistration member, CancellationToken ct)
     {
