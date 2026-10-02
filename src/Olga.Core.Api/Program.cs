@@ -80,6 +80,11 @@ app.Use(async (context, next) =>
     catch (DbUpdateConcurrencyException) { await Error(context, 409, "RESOURCE_VERSION_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsUniqueViolation(ex)) { await Error(context, 409, "RESOURCE_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsForeignKeyViolation(ex)) { await Error(context, 409, "RESOURCE_REFERENCE_NOT_FOUND"); }
+    catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsCheckViolation(ex))
+    {
+        app.Logger.LogWarning(ex, "Database rule rejected {Method} {Path}; correlation ID {CorrelationId}", context.Request.Method, context.Request.Path, context.TraceIdentifier);
+        await Error(context, 409, "RESOURCE_STATE_CONFLICT");
+    }
     catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation) { await Error(context, 409, "IDEMPOTENCY_KEY_REUSED"); }
     catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.ForeignKeyViolation) { await Error(context, 409, "RESOURCE_REFERENCE_NOT_FOUND"); }
     catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.CheckViolation) { await Error(context, 409, "RESOURCE_STATE_CONFLICT"); }

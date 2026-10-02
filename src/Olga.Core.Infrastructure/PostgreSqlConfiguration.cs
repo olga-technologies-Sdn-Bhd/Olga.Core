@@ -25,6 +25,10 @@ public static class PostgreSqlConfiguration
     public static bool IsForeignKeyViolation(DbUpdateException exception) =>
         exception.InnerException is PostgresException { SqlState: PostgresErrorCodes.ForeignKeyViolation };
 
+    // A database CHECK constraint or invariant trigger (SQLSTATE 23514) rejected the write.
+    public static bool IsCheckViolation(DbUpdateException exception) =>
+        exception.InnerException is PostgresException { SqlState: PostgresErrorCodes.CheckViolation };
+
     public static bool IsUnavailable(Exception exception) =>
         exception is NpgsqlException { IsTransient: true } || exception.InnerException is NpgsqlException { IsTransient: true };
 }
