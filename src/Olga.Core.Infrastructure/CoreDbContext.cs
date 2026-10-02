@@ -19,6 +19,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<MemberConsent> MemberConsents => Set<MemberConsent>();
     public DbSet<EventRecord> EventRecords => Set<EventRecord>();
     public DbSet<Venue> Venues => Set<Venue>();
+    public DbSet<EventMatchingPolicy> EventMatchingPolicies => Set<EventMatchingPolicy>();
     public DbSet<EventRegistration> EventRegistrations => Set<EventRegistration>();
     public DbSet<LiveModeSession> LiveModeSessions => Set<LiveModeSession>();
     public DbSet<EventPresence> EventPresences => Set<EventPresence>();
@@ -41,6 +42,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<MemberConsent> ICoreStore.Consents => MemberConsents;
     IQueryable<EventRecord> ICoreStore.Events => EventRecords;
     IQueryable<Venue> ICoreStore.Venues => Venues;
+    IQueryable<EventMatchingPolicy> ICoreStore.MatchingPolicies => EventMatchingPolicies;
     IQueryable<EventRegistration> ICoreStore.Registrations => EventRegistrations;
     IQueryable<LiveModeSession> ICoreStore.LiveSessions => LiveModeSessions;
     IQueryable<EventPresence> ICoreStore.Presence => EventPresences;
@@ -290,6 +292,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });
+        model.Entity<EventMatchingPolicy>(e => { e.ToTable("event_matching_policy", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_matching_policy_id").UseIdentityByDefaultColumn(); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.EventId, x.Status }); });
         model.Entity<EventRecord>(e => { e.ToTable("event", "event"); e.HasKey(x => x.EventId); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(250); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.CommunityId, x.Status, x.StartsAt }); });
         model.Entity<Venue>(e => { e.ToTable("venue", "event"); e.HasKey(x => x.VenueId); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(200); e.Property(x => x.City).HasMaxLength(120); e.Property(x => x.Region).HasMaxLength(120); e.Property(x => x.CountryCode).HasColumnType("character(2)").IsFixedLength(); e.Property(x => x.TimezoneId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<EventRegistration>(e => { e.ToTable("event_registration", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_registration_id").UseIdentityByDefaultColumn(); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId }).IsUnique(); });

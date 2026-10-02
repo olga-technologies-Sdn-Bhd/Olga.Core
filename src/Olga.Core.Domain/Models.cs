@@ -58,6 +58,16 @@ public sealed class EventRecord
     public long RowVersion { get; set; } = 1;
 }
 
+// Per-event matching rules (event.event_matching_policy). Unmapped columns use their database defaults.
+public sealed class EventMatchingPolicy
+{
+    public long Id { get; set; }
+    public string EventId { get; set; } = "";
+    public short PolicyVersion { get; set; } = 1;
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset EffectiveFrom { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class Venue
 {
     public string VenueId { get; set; } = "";
