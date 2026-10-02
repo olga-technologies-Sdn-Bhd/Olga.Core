@@ -98,6 +98,22 @@ public sealed class AdminEventServiceTests
         Assert.Equal("VENUE_TIMEZONE_INVALID", timezone.Code);
     }
 
+    [Fact]
+    public async Task Publishing_adds_a_single_default_matching_policy_and_drafts_get_none()
+    {
+        await using var db = Db();
+        var admin = new AdminEventService(db);
+        var draft = await admin.CreateEventAsync("olga", new("Draft", DateTimeOffset.UtcNow.AddDays(1), DateTimeOffset.UtcNow.AddDays(2)), "policy-draft", default);
+        var published = await admin.CreateEventAsync("olga", new("Live", DateTimeOffset.UtcNow.AddDays(1), DateTimeOffset.UtcNow.AddDays(2), Publish: true), "policy-published", default);
+        Assert.Equal(published.EventId, Assert.Single(db.EventMatchingPolicies).EventId);
+
+        await admin.PublishEventAsync(draft.EventId, default);
+        await admin.PublishEventAsync(draft.EventId, default);
+
+        Assert.Equal(2, db.EventMatchingPolicies.Count());
+        Assert.Single(db.EventMatchingPolicies, x => x.EventId == draft.EventId && x.Status == "ACTIVE");
+    }
+
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Core(CoreDbContext db) => new(db, new AesIdentityProtector(new byte[32]));
 }

@@ -361,6 +361,45 @@ public sealed class CoreServiceTests
         Assert.All(anonymous, x => Assert.Null(x.IsRegistered));
     }
 
+    [Fact]
+    public async Task Going_live_activates_a_started_published_event_and_adds_one_default_matching_policy()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterAsync("A", "E", default);
+        await service.RegisterAsync("B", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        await service.RecordConsentAsync("B", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.StartLiveModeAsync("B", "E", new(30), default);
+
+        Assert.Equal("ACTIVE", db.EventRecords.Single(x => x.EventId == "E").Status);
+        var policy = Assert.Single(db.EventMatchingPolicies);
+        Assert.Equal(("E", "ACTIVE", (short)1), (policy.EventId, policy.Status, policy.PolicyVersion));
+        var listed = Assert.Single(await service.GetEventsAsync("A", default));
+        Assert.Equal(("ACTIVE", 2, true), (listed.Status, listed.LiveCount, listed.IsRegistered));
+    }
+
+    [Fact]
+    public async Task Live_mode_is_rejected_before_the_event_starts_and_leaves_it_published()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var evt = db.EventRecords.Single(x => x.EventId == "E");
+        evt.StartsAt = DateTimeOffset.UtcNow.AddHours(2);
+        evt.EndsAt = DateTimeOffset.UtcNow.AddHours(6);
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterAsync("A", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        var notStarted = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "E", new(30), default));
+
+        Assert.Equal(("EVENT_NOT_ACTIVE", 409), (notStarted.Code, notStarted.StatusCode));
+        Assert.Equal("PUBLISHED", db.EventRecords.Single(x => x.EventId == "E").Status);
+        Assert.Empty(db.EventMatchingPolicies);
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

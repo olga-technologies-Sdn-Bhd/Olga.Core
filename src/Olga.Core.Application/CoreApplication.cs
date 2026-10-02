@@ -13,6 +13,7 @@ public interface ICoreStore
     IQueryable<MemberConsent> Consents { get; }
     IQueryable<EventRecord> Events { get; }
     IQueryable<Venue> Venues { get; }
+    IQueryable<EventMatchingPolicy> MatchingPolicies { get; }
     IQueryable<EventRegistration> Registrations { get; }
     IQueryable<LiveModeSession> LiveSessions { get; }
     IQueryable<EventPresence> Presence { get; }
@@ -214,7 +215,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        var events = store.Events.Where(x => x.Status == "PUBLISHED").OrderBy(x => x.StartsAt).ToArray();
+        var events = store.Events.Where(x => x.Status == "PUBLISHED" || x.Status == "ACTIVE").OrderBy(x => x.StartsAt).ToArray();
         var eventIds = events.Select(x => x.EventId).ToArray();
         var now = DateTimeOffset.UtcNow;
 
@@ -265,9 +266,15 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
-        if (evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
+        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
         if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_NOT_ENABLED", 409);
         var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
+        // A published event becomes ACTIVE once it has started; the database only allows Live Mode
+        // sessions (and matching eligibility) for ACTIVE events with an active matching policy.
+        // Saved before the session so the session insert sees the ACTIVE event.
+        var activated = false;
+        if (evt.Status == "PUBLISHED") { evt.Status = "ACTIVE"; evt.UpdatedAt = now; activated = true; }
+        if (EventMatchingPolicies.EnsureDefault(store, evt.EventId, now) || activated) await store.SaveAsync(ct);
         var existing = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE");
         if (existing is not null) { existing.ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt); await store.SaveAsync(ct); return Map(existing); }
         var row = new LiveModeSession { EventId = eventId, MemberId = memberId, ConsentRecordId = consent.Id, ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt) };

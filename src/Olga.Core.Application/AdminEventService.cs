@@ -59,6 +59,8 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
         store.Add(row);
         AddChange(row);
         await store.SaveAsync(ct);
+        // Saved separately: the policy references the event row.
+        if (request.Publish && EventMatchingPolicies.EnsureDefault(store, row.EventId, DateTimeOffset.UtcNow)) await store.SaveAsync(ct);
         return MapAll([row])[0];
     }
 
@@ -88,6 +90,7 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
         row.Status = "PUBLISHED";
         row.UpdatedAt = DateTimeOffset.UtcNow;
         AddChange(row);
+        EventMatchingPolicies.EnsureDefault(store, row.EventId, row.UpdatedAt);
         await store.SaveAsync(ct);
         return MapAll([row])[0];
     }
