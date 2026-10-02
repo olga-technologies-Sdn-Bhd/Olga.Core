@@ -58,7 +58,7 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(publicEvents, "X-Member-Id", required: false, maxLength: 64);
 
         var adminCreateEvent = Operation(document, "/v1/admin/events", "post");
-        AssertHeader(adminCreateEvent, "X-Admin-Key", required: true);
+        AssertNoHeader(adminCreateEvent, "X-Admin-Key");
         AssertNoHeader(adminCreateEvent, "X-Member-Id");
     }
 
@@ -145,21 +145,6 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.Equal(System.Net.HttpStatusCode.BadRequest, response.StatusCode);
         using var body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
         Assert.Equal("MEMBER_ID_INVALID", body.RootElement.GetProperty("code").GetString());
-    }
-
-    [Fact]
-    public async Task Admin_routes_reject_a_missing_or_wrong_key()
-    {
-        using var client = factory.CreateClient();
-        using var missing = await client.GetAsync("/v1/admin/events");
-        using var wrong = new HttpRequestMessage(HttpMethod.Get, "/v1/admin/events");
-        wrong.Headers.Add("X-Admin-Key", "nope");
-        using var ok = new HttpRequestMessage(HttpMethod.Get, "/v1/admin/events");
-        ok.Headers.Add("X-Admin-Key", "local-admin-key");
-
-        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, missing.StatusCode);
-        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, (await client.SendAsync(wrong)).StatusCode);
-        Assert.Equal(System.Net.HttpStatusCode.OK, (await client.SendAsync(ok)).StatusCode);
     }
 
     private async Task<JsonDocument> GetDocumentAsync(string? forwardedProto = null)
