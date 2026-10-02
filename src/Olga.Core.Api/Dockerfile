@@ -14,6 +14,9 @@ RUN dotnet publish "src/Olga.Core.Api/Olga.Core.Api.csproj" -c Release -o /app/p
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
 ENV ASPNETCORE_URLS=http://+:8080
 EXPOSE 8080
 USER $APP_UID

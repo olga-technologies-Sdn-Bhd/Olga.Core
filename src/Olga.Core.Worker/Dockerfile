@@ -14,6 +14,9 @@ RUN dotnet publish "src/Olga.Core.Worker/Olga.Core.Worker.csproj" -c Release -o 
 
 FROM mcr.microsoft.com/dotnet/runtime:10.0 AS final
 WORKDIR /app
+RUN apt-get update \
+    && apt-get upgrade -y \
+    && rm -rf /var/lib/apt/lists/*
 USER $APP_UID
 COPY --from=build /app/publish .
 ENTRYPOINT ["dotnet", "Olga.Core.Worker.dll"]
