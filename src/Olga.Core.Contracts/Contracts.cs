@@ -52,5 +52,8 @@ public sealed record AdminMemberResponse(string MemberId, string DisplayName, st
 public sealed record AdminMemberStatusRequest(string ProfileStatus);
 public sealed record AdminReportResponse(string ReportId, string SourceType, string? SubjectMemberId, string? SubjectDisplayName, string? ResourceType, string? ResourceId, string Priority, string Status, DateTimeOffset CreatedAt, DateTimeOffset? ClosedAt);
 public sealed record AdminStatusRequest(string Status);
+public sealed record AdminConsentPolicyCreateRequest(string PurposeCode, string Version, DateTimeOffset? EffectiveFrom = null, string Locale = "en", string? Text = null, string? ContentHash = null);
+public sealed record AdminConsentPolicyResponse(string PolicyId, string PurposeCode, string Version, string Locale, string ContentHash, DateTimeOffset EffectiveFrom, DateTimeOffset? RetiredAt, string Status);
+public sealed record ActiveConsentPolicyResponse(string PurposeCode, string Version, string Locale, DateTimeOffset EffectiveFrom);
 public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);
 public sealed record AdminAttendeeResponse(string MemberId, string DisplayName, string? Headline, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt, bool IsLive);
