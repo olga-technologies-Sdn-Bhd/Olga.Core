@@ -167,6 +167,10 @@ memberV1.MapGet("/conversations", async (HttpContext c, string? cursor, int? lim
     .WithName("ListConversations").WithTags("Chat").Produces<ConversationListResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationAsync(Member(c), conversationId, ct)))
     .WithName("GetConversation").WithTags("Chat").Produces<ConversationResponse>(200);
+memberV1.MapPost("/conversations/{conversationId}/read", async (HttpContext c, string conversationId, ConversationReadRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.MarkConversationReadAsync(Member(c), conversationId, body, Idempotency(c), ct)))
+    .WithName("MarkConversationRead").WithTags("Chat").Produces<ConversationResponse>(200);
+memberV1.MapPut("/conversations/{conversationId}/mute", async (HttpContext c, string conversationId, ConversationMuteRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.MuteConversationAsync(Member(c), conversationId, body, ct)))
+    .WithName("MuteConversation").WithTags("Chat").Produces<ConversationResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, long? after, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMessagesAsync(Member(c), conversationId, after ?? 0, limit ?? 50, ct)))
     .WithName("ListMessages").WithTags("Chat").Produces<IReadOnlyList<MessageResponse>>(200);
 memberV1.MapPost("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, MessageCreateRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/conversations/{conversationId}/messages/{body.MessageId}", await s.SendMessageAsync(Member(c), conversationId, body, Idempotency(c), ct)))

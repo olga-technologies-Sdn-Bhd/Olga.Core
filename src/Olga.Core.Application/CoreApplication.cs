@@ -63,6 +63,8 @@ public interface ICoreService
     // Newest activity first; cursor is the opaque next_cursor from the previous page.
     Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct);
     Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct);
+    Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct);
+    Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
@@ -447,6 +449,53 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId));
     }
 
+    public async Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.LastReadMessageId) || request.LastReadMessageId.Length > 64) throw new DomainException("CONVERSATION_READ_INVALID");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        var connection = RequireConversationMember(memberId, conversationId);
+        var upTo = store.Messages.SingleOrDefault(x => x.MessageId == request.LastReadMessageId && x.ConversationId == conversationId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        // Only messages still unread are touched, so a retry after success does nothing.
+        var unread = store.Messages
+            .Where(x => x.ConversationId == conversationId && x.SenderMemberId != memberId && x.DeletedAt == null && x.ServerSequence <= upTo.ServerSequence
+                && !store.MessageReceipts.Any(r => r.MessageId == x.MessageId && r.MemberId == memberId && r.ReadAt != null))
+            .OrderBy(x => x.ServerSequence)
+            .ToArray();
+        var readAt = DateTimeOffset.UtcNow;
+        if (store.IsRelational)
+        {
+            // chat.save_message_receipt writes the receipt, the read cursor, the outbox event and sync changes.
+            // Per-message keys and hashes leave out readAt so a retry of the same request replays cleanly.
+            foreach (var message in unread)
+                await store.SaveMessageReceiptAsync(memberId, message.MessageId, new(ReadAt: readAt), $"read:{Hash(idempotencyKey, message.MessageId)[..59]}", Hash("chat.conversation_read", memberId, message.MessageId, idempotencyKey), ct);
+        }
+        else if (unread.Length > 0)
+        {
+            foreach (var message in unread)
+            {
+                var row = store.MessageReceipts.SingleOrDefault(x => x.MessageId == message.MessageId && x.MemberId == memberId);
+                if (row is null) { row = new MessageReceipt { MessageId = message.MessageId, MemberId = memberId }; store.Add(row); }
+                row.DeliveredAt ??= readAt; row.ReadAt = readAt; row.UpdatedAt = readAt;
+            }
+            var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId);
+            var current = participant?.LastReadMessageId is null ? 0 : store.Messages.Where(x => x.MessageId == participant.LastReadMessageId).Select(x => x.ServerSequence).SingleOrDefault();
+            if (participant is not null && unread[^1].ServerSequence > current) participant.LastReadMessageId = unread[^1].MessageId;
+            await store.SaveAsync(ct);
+        }
+        return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
+    }
+
+    public async Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct)
+    {
+        if (request.MutedUntil is { } until && until <= DateTimeOffset.UtcNow) throw new DomainException("CONVERSATION_MUTE_INVALID");
+        var connection = RequireConversationMember(memberId, conversationId);
+        var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId) ?? throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        participant.MutedUntil = request.MutedUntil?.ToUniversalTime();
+        AddChange(memberId, "CONVERSATION", conversationId, "UPSERT", new { conversation_id = conversationId, muted_until = participant.MutedUntil });
+        await store.SaveAsync(ct);
+        return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
+    }
+
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))) throw new DomainException("MESSAGE_INVALID");
@@ -582,6 +631,11 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .GroupBy(x => x.ConversationId)
             .Select(g => new { ConversationId = g.Key, Count = g.Count() })
             .ToDictionary(x => x.ConversationId, x => x.Count);
+        // An expired mute is reported as not muted.
+        var now = DateTimeOffset.UtcNow;
+        var mutedUntil = store.ConversationParticipants
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.MemberId == memberId && x.MutedUntil > now)
+            .ToDictionary(x => x.ConversationId, x => x.MutedUntil);
 
         return conversations.Select(c =>
         {
@@ -591,7 +645,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var last = lastMessages.GetValueOrDefault(c.ConversationId);
             return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
                 last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
-                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId));
+                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId));
         }).ToArray();
     }
 

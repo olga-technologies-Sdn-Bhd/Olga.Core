@@ -38,8 +38,12 @@ public sealed record BlockRequest(string MemberId);
 public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null);
 public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
-public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend);
+public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend, DateTimeOffset? MutedUntil = null);
 public sealed record ConversationListResponse(IReadOnlyList<ConversationResponse> Items, string? NextCursor, bool HasMore);
+// Marks every message from the other member up to and including this one as read.
+public sealed record ConversationReadRequest(string LastReadMessageId);
+// MutedUntil null unmutes; otherwise it must be in the future.
+public sealed record ConversationMuteRequest(DateTimeOffset? MutedUntil);
 public sealed record MessageReceiptRequest(DateTimeOffset? DeliveredAt = null, DateTimeOffset? ReadAt = null);
 public sealed record MessageReceiptResponse(string MessageId, string MemberId, DateTimeOffset? DeliveredAt, DateTimeOffset? ReadAt, DateTimeOffset UpdatedAt);
 public sealed record NotificationPreferenceRequest(string PurposeCode, bool PushEnabled, bool EmailEnabled, TimeOnly? QuietStartLocal = null, TimeOnly? QuietEndLocal = null, string? TimezoneId = null);
