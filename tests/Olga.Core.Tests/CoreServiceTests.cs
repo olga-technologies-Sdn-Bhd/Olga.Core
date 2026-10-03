@@ -224,6 +224,87 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Conversation_list_shows_other_member_last_message_and_unread_count()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        var first = await service.SendMessageAsync("A", conversationId, new("m1", "Hello"), "list-m1", default);
+        await service.SendMessageAsync("A", conversationId, new("m2", "Are you here?"), "list-m2", default);
+        await service.SendMessageAsync("B", conversationId, new("m3", "Yes"), "list-m3", default);
+        await service.SaveMessageReceiptAsync("B", first.MessageId, new(ReadAt: DateTimeOffset.UtcNow), "list-r1", default);
+
+        var forB = await service.GetConversationsAsync("B", null, 20, default);
+        var forA = await service.GetConversationsAsync("A", null, 20, default);
+
+        var item = Assert.Single(forB.Items);
+        Assert.Equal((conversationId, "A", "A", "m3", 1, true), (item.ConversationId, item.MemberId, item.DisplayName, item.LastMessage?.MessageId, item.UnreadCount, item.CanSend));
+        Assert.Equal(item.LastMessage!.CreatedAt, item.LastActivityAt);
+        Assert.Equal(("B", 1), (forA.Items.Single().MemberId, forA.Items.Single().UnreadCount));
+        Assert.False(forB.HasMore); Assert.Null(forB.NextCursor);
+    }
+
+    [Fact]
+    public async Task Conversation_list_orders_by_latest_activity_and_pages_with_an_opaque_cursor()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.AddRange(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" }, new MemberProfile { MemberId = "D", DisplayName = "D", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var withB = await ConnectAsync(service, "A", "B");
+        var withC = await ConnectAsync(service, "A", "C");
+        var withD = await ConnectAsync(service, "A", "D");
+        await service.SendMessageAsync("C", withC, new("c1", "Newest"), "page-c1", default);
+
+        var first = await service.GetConversationsAsync("A", null, 2, default);
+        var second = await service.GetConversationsAsync("A", first.NextCursor, 2, default);
+
+        Assert.True(first.HasMore); Assert.NotNull(first.NextCursor);
+        Assert.Equal(withC, first.Items[0].ConversationId);
+        Assert.False(second.HasMore); Assert.Null(second.NextCursor);
+        Assert.Equal(new[] { withB, withC, withD }.Order(), first.Items.Concat(second.Items).Select(x => x.ConversationId).Order());
+    }
+
+    [Fact]
+    public async Task Conversation_list_hides_blocked_or_disconnected_members_and_rejects_bad_cursors()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await ConnectAsync(service, "A", "B");
+        await service.BlockAsync("B", new("A"), default);
+
+        Assert.Empty((await service.GetConversationsAsync("A", null, 20, default)).Items);
+        var invalid = await Assert.ThrowsAsync<DomainException>(() => service.GetConversationsAsync("A", "not-a-cursor", 20, default));
+        Assert.Equal(("CONVERSATION_CURSOR_INVALID", 400), (invalid.Code, invalid.StatusCode));
+    }
+
+    [Fact]
+    public async Task Conversation_detail_is_only_visible_to_its_two_members()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        db.ChatConversations.Single(x => x.ConversationId == conversationId).Status = "RESTRICTED";
+        await db.SaveChangesAsync();
+
+        var detail = await service.GetConversationAsync("A", conversationId, default);
+        var outsider = await Assert.ThrowsAsync<DomainException>(() => service.GetConversationAsync("C", conversationId, default));
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.GetConversationAsync("A", "unknown", default));
+
+        Assert.Equal(("B", "RESTRICTED", false, (MessageResponse?)null, 0), (detail.MemberId, detail.Status, detail.CanSend, detail.LastMessage, detail.UnreadCount));
+        Assert.Equal(("CONVERSATION_FORBIDDEN", 403), (outsider.Code, outsider.StatusCode));
+        Assert.Equal(("CONVERSATION_NOT_FOUND", 404), (missing.Code, missing.StatusCode));
+    }
+
+    private static async Task<string> ConnectAsync(CoreService service, string sender, string recipient)
+    {
+        var request = await service.CreateConnectionRequestAsync(sender, new(recipient), default);
+        return (await service.DecideConnectionRequestAsync(recipient, request.RequestId, new("ACCEPT"), $"accept-{sender}-{recipient}", default)).ConversationId;
+    }
+
+    [Fact]
     public void PostgreSql_model_matches_database_source_names_and_concurrency()
     {
         var options = new DbContextOptionsBuilder<CoreDbContext>().UseNpgsql("Host=localhost;Database=model_check;Username=model_check").UseSnakeCaseNamingConvention().Options;
