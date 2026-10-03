@@ -29,6 +29,7 @@ public interface ICoreStore
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
     IQueryable<ModerationCase> ModerationCases { get; }
+    IQueryable<MemberReport> MemberReports { get; }
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
@@ -67,6 +68,8 @@ public interface ICoreService
     Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
+    Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
+    Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
@@ -541,6 +544,38 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return new(row.MessageId, row.MemberId, row.DeliveredAt, row.ReadAt, row.UpdatedAt);
     }
 
+    public async Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct)
+    {
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        var connection = RequireConversationMember(memberId, message.ConversationId);
+        if (message.SenderMemberId != memberId) throw new DomainException("MESSAGE_DELETE_FORBIDDEN", 403);
+        if (message.DeletedAt is not null) return;
+        // Soft delete: the body stays in the database for moderation but is never returned again.
+        var now = DateTimeOffset.UtcNow;
+        message.DeletedAt = now; message.UpdatedAt = now;
+        foreach (var id in new[] { memberId, OtherMember(connection, memberId) }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        await store.SaveAsync(ct);
+    }
+
+    public async Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct)
+    {
+        var category = request.Category?.Trim().ToUpperInvariant();
+        if (category is not ("SPAM" or "HARASSMENT" or "INAPPROPRIATE" or "SCAM" or "OTHER") || request.Description?.Length > 2000) throw new DomainException("MESSAGE_REPORT_INVALID");
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        // Either participant may still report after a block or disconnect, so only membership is checked.
+        var conversation = store.Conversations.SingleOrDefault(x => x.ConversationId == message.ConversationId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        if (!store.Connections.Any(x => x.ConnectionId == conversation.ConnectionId && (x.MemberLowId == memberId || x.MemberHighId == memberId))) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        if (message.SenderMemberId == memberId) throw new DomainException("MESSAGE_REPORT_FORBIDDEN", 403);
+        var existing = store.MemberReports.FirstOrDefault(x => x.ReporterMemberId == memberId && x.ResourceType == "MESSAGE" && x.ResourceId == messageId);
+        if (existing is not null) return new(existing.ReportId, messageId, existing.Category, existing.Status, existing.CreatedAt);
+        var report = new MemberReport { ReporterMemberId = memberId, ReportedMemberId = message.SenderMemberId, ResourceType = "MESSAGE", ResourceId = messageId, Category = category, Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim() };
+        store.Add(report);
+        // The admin reports list reads moderation cases, so each member report opens one.
+        store.Add(new ModerationCase { SourceType = "MEMBER_REPORT", SourceId = report.ReportId, SubjectMemberId = message.SenderMemberId, ResourceType = "MESSAGE", ResourceId = messageId });
+        await store.SaveAsync(ct);
+        return new(report.ReportId, messageId, report.Category, report.Status, report.CreatedAt);
+    }
+
     public Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -684,6 +719,6 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount, bool? isRegistered) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount, isRegistered);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
-    private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);
+    private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.ServerSequence, x.ModerationStatus, x.CreatedAt, x.DeletedAt);
     private static PrivacyRequestResponse Map(PrivacyRequest x) => new(x.PrivacyRequestId, x.RequestType, x.Status, x.CreatedAt, x.DueAt);
 }
