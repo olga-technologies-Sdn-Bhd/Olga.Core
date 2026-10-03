@@ -60,6 +60,9 @@ public interface ICoreService
     Task<ConnectionResponse> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct);
     Task BlockAsync(string memberId, BlockRequest request, CancellationToken ct);
     Task<IReadOnlyList<ConnectionResponse>> GetConnectionsAsync(string memberId, CancellationToken ct);
+    // Newest activity first; cursor is the opaque next_cursor from the previous page.
+    Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct);
+    Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
@@ -420,6 +423,30 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult<IReadOnlyList<ConnectionResponse>>(result);
     }
 
+    public Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var bounded = Math.Clamp(limit, 1, 50);
+        var after = DecodeConversationCursor(cursor);
+        var connections = store.Connections.Where(x => x.Status == "ACTIVE" && (x.MemberLowId == memberId || x.MemberHighId == memberId)).ToArray();
+        var blocked = BlockedAmong(memberId, connections.Select(x => OtherMember(x, memberId)).ToArray());
+        // A member's active connections are bounded, so the page is cut after building every summary.
+        var ordered = BuildConversations(memberId, connections.Where(x => !blocked.Contains(OtherMember(x, memberId))).ToArray())
+            .OrderByDescending(x => x.LastActivityAt).ThenByDescending(x => x.ConversationId, StringComparer.Ordinal);
+        var remaining = after is null ? ordered : ordered.Where(x => x.LastActivityAt < after.Value.At || (x.LastActivityAt == after.Value.At && string.CompareOrdinal(x.ConversationId, after.Value.Id) < 0));
+        var rows = remaining.Take(bounded + 1).ToArray();
+        var page = rows.Take(bounded).ToArray();
+        var hasMore = rows.Length > bounded;
+        return Task.FromResult(new ConversationListResponse(page, hasMore ? EncodeConversationCursor(page[^1]) : null, hasMore));
+    }
+
+    public Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var connection = RequireConversationMember(memberId, conversationId);
+        return Task.FromResult(BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId));
+    }
+
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))) throw new DomainException("MESSAGE_INVALID");
@@ -522,6 +549,67 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private bool IsBlocked(string a, string b) => store.Blocks.Any(x => x.RemovedAt == null && ((x.BlockerMemberId == a && x.BlockedMemberId == b) || (x.BlockerMemberId == b && x.BlockedMemberId == a)));
     private bool IsConnected(string a, string b) { var p = Pair(a, b); return store.Connections.Any(x => x.MemberLowId == p.Low && x.MemberHighId == p.High && x.Status == "ACTIVE"); }
     private Connection RequireConversationMember(string memberId, string conversationId) { var c = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404); var link = store.Connections.Single(x => x.ConnectionId == c.ConnectionId); return link.Status == "ACTIVE" && (link.MemberLowId == memberId || link.MemberHighId == memberId) ? link : throw new DomainException("CONVERSATION_FORBIDDEN", 403); }
+    private static string OtherMember(Connection x, string memberId) => x.MemberLowId == memberId ? x.MemberHighId : x.MemberLowId;
+    private HashSet<string> BlockedAmong(string memberId, string[] ids) => store.Blocks
+        .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
+        .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
+        .ToHashSet();
+
+    private ConversationResponse[] BuildConversations(string memberId, Connection[] connections)
+    {
+        var byConnection = connections.ToDictionary(x => x.ConnectionId);
+        var connectionIds = byConnection.Keys.ToArray();
+        var conversations = store.Conversations.Where(x => connectionIds.Contains(x.ConnectionId)).ToArray();
+        var conversationIds = conversations.Select(x => x.ConversationId).ToArray();
+        var otherIds = connections.Select(x => OtherMember(x, memberId)).ToArray();
+        var profiles = store.Profiles.Where(x => otherIds.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN").ToDictionary(x => x.MemberId);
+        var blocked = BlockedAmong(memberId, otherIds);
+        var lastSequences = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.DeletedAt == null)
+            .GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) })
+            .ToDictionary(x => x.ConversationId, x => x.Sequence);
+        var sequences = lastSequences.Values.ToArray();
+        var lastMessages = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && sequences.Contains(x.ServerSequence))
+            .AsEnumerable()
+            .Where(x => lastSequences.GetValueOrDefault(x.ConversationId) == x.ServerSequence)
+            .ToDictionary(x => x.ConversationId);
+        // Unread means a non-deleted message from the other member with no read receipt from this member.
+        var unread = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.SenderMemberId != memberId && x.DeletedAt == null
+                && !store.MessageReceipts.Any(r => r.MessageId == x.MessageId && r.MemberId == memberId && r.ReadAt != null))
+            .GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Count = g.Count() })
+            .ToDictionary(x => x.ConversationId, x => x.Count);
+
+        return conversations.Select(c =>
+        {
+            var connection = byConnection[c.ConnectionId];
+            var otherId = OtherMember(connection, memberId);
+            var profile = profiles.GetValueOrDefault(otherId);
+            var last = lastMessages.GetValueOrDefault(c.ConversationId);
+            return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
+                last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
+                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId));
+        }).ToArray();
+    }
+
+    private static string EncodeConversationCursor(ConversationResponse x) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{x.LastActivityAt.UtcTicks}:{x.ConversationId}")));
+    private static (DateTimeOffset At, string Id)? DecodeConversationCursor(string? cursor)
+    {
+        if (string.IsNullOrWhiteSpace(cursor)) return null;
+        try
+        {
+            var parts = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor)).Split(':', 2);
+            if (parts.Length == 2 && long.TryParse(parts[0], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var ticks)
+                && ticks <= DateTimeOffset.MaxValue.UtcTicks && parts[1].Length is > 0 and <= 64)
+                return (new DateTimeOffset(ticks, TimeSpan.Zero), parts[1]);
+        }
+        catch (FormatException) { }
+        throw new DomainException("CONVERSATION_CURSOR_INVALID");
+    }
+
     private void AddChange(string? memberId, string type, string id, string change, object? payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = change, PayloadJson = payload is null ? null : JsonSerializer.Serialize(payload, JsonOptions) });
     private void AddOutbox(string aggregateType, string aggregateId, string eventType, object payload) => store.Add(new OutboxEvent { AggregateType = aggregateType, AggregateId = aggregateId, EventType = eventType, PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
     private static (string Low, string High) Pair(string a, string b) => string.CompareOrdinal(a, b) < 0 ? (a, b) : (b, a);

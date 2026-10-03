@@ -163,6 +163,10 @@ memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, Cancellati
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
     .WithName("BlockMember").WithTags("Social").Produces(204);
+memberV1.MapGet("/conversations", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationsAsync(Member(c), cursor, limit ?? 20, ct)))
+    .WithName("ListConversations").WithTags("Chat").Produces<ConversationListResponse>(200);
+memberV1.MapGet("/conversations/{conversationId}", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationAsync(Member(c), conversationId, ct)))
+    .WithName("GetConversation").WithTags("Chat").Produces<ConversationResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, long? after, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMessagesAsync(Member(c), conversationId, after ?? 0, limit ?? 50, ct)))
     .WithName("ListMessages").WithTags("Chat").Produces<IReadOnlyList<MessageResponse>>(200);
 memberV1.MapPost("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, MessageCreateRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/conversations/{conversationId}/messages/{body.MessageId}", await s.SendMessageAsync(Member(c), conversationId, body, Idempotency(c), ct)))
