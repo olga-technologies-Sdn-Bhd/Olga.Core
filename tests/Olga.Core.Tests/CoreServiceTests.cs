@@ -532,6 +532,40 @@ public sealed class CoreServiceTests
         Assert.Equal(("CONSENT_POLICY_NOT_FOUND", 404), (unknown.Code, unknown.StatusCode));
     }
 
+    [Fact]
+    public async Task Outbox_aggregate_ids_fit_the_64_character_column_for_real_event_and_member_ids()
+    {
+        await using var db = Db();
+        var eventId = "evt_" + new string('a', 32);
+        var memberA = "mem_" + new string('b', 32);
+        var memberB = "mem_" + new string('c', 32);
+        db.MemberProfiles.AddRange(new MemberProfile { MemberId = memberA, DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = memberB, DisplayName = "B", Status = "ACTIVE" });
+        db.EventRecords.Add(new EventRecord { EventId = eventId, Name = "Long ids", StartsAt = DateTimeOffset.UtcNow.AddHours(-1), EndsAt = DateTimeOffset.UtcNow.AddDays(1) });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+
+        await service.RegisterAsync(memberA, eventId, default);
+        await service.RegisterAsync(memberA, eventId, default);
+        await service.BlockAsync(memberA, new(memberB), default);
+
+        var registration = db.OutboxEvents.Where(x => x.AggregateType == "EVENT_REGISTRATION").Select(x => x.AggregateId).ToList();
+        var relationship = Assert.Single(db.OutboxEvents.Where(x => x.AggregateType == "MEMBER_RELATIONSHIP")).AggregateId;
+        Assert.All(db.OutboxEvents, x => Assert.True(x.AggregateId.Length <= 64, x.AggregateId));
+        Assert.Single(registration.Distinct());
+        Assert.StartsWith("agg_", registration[0]);
+        Assert.StartsWith("agg_", relationship);
+    }
+
+    [Fact]
+    public async Task Short_outbox_aggregate_ids_keep_the_readable_pair_form()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+
+        await Service(db).RegisterAsync("A", "E", default);
+
+        Assert.Equal("E:A", Assert.Single(db.OutboxEvents.Where(x => x.AggregateType == "EVENT_REGISTRATION")).AggregateId);
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

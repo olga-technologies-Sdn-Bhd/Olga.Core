@@ -299,7 +299,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId);
         if (row is null) { row = new EventRegistration { EventId = eventId, MemberId = memberId }; store.Add(row); }
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
-        AddOutbox("EVENT_REGISTRATION", $"{eventId}:{memberId}", "EventRegistrationChanged.v1", new { event_id = eventId, member_id = memberId, status = row.Status });
+        AddOutbox("EVENT_REGISTRATION", AggregateKey(eventId, memberId), "EventRegistrationChanged.v1", new { event_id = eventId, member_id = memberId, status = row.Status });
         await store.SaveAsync(ct);
         return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt);
     }
@@ -403,7 +403,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (!store.Blocks.Any(x => x.BlockerMemberId == memberId && x.BlockedMemberId == request.MemberId && x.RemovedAt == null)) store.Add(new MemberBlock { BlockerMemberId = memberId, BlockedMemberId = request.MemberId });
         foreach (var connection in store.Connections.Where(x => x.Status == "ACTIVE" && ((x.MemberLowId == memberId && x.MemberHighId == request.MemberId) || (x.MemberLowId == request.MemberId && x.MemberHighId == memberId))).ToArray()) { connection.Status = "DISCONNECTED"; connection.DisconnectedAt = DateTimeOffset.UtcNow; }
         foreach (var id in new[] { memberId, request.MemberId }) AddChange(id, "CONNECTION", PairKey(memberId, request.MemberId), "DELETE", null);
-        AddOutbox("MEMBER_RELATIONSHIP", PairKey(memberId, request.MemberId), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
+        AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, request.MemberId).Low, Pair(memberId, request.MemberId).High), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
         await store.SaveAsync(ct);
     }
 
@@ -510,6 +510,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private void AddChange(string? memberId, string type, string id, string change, object? payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = change, PayloadJson = payload is null ? null : JsonSerializer.Serialize(payload, JsonOptions) });
     private void AddOutbox(string aggregateType, string aggregateId, string eventType, object payload) => store.Add(new OutboxEvent { AggregateType = aggregateType, AggregateId = aggregateId, EventType = eventType, PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
     private static (string Low, string High) Pair(string a, string b) => string.CompareOrdinal(a, b) < 0 ? (a, b) : (b, a);
+    // ops.outbox_event.aggregate_id is varchar(64). Keep the readable "a:b" key when it fits;
+    // otherwise use a deterministic hash so real 36-character event/member IDs still fit.
+    private static string AggregateKey(string a, string b)
+    {
+        var key = $"{a}:{b}";
+        return key.Length <= 64 ? key : $"agg_{Hash("outbox.aggregate", a, b)[..60]}";
+    }
+
     private static string PairKey(string a, string b) { var p = Pair(a, b); return $"{p.Low}:{p.High}"; }
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
