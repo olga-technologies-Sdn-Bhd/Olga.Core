@@ -13,6 +13,9 @@ public interface IAdminService
     Task<AdminReportResponse> SetReportStatusAsync(string reportId, AdminStatusRequest request, CancellationToken ct);
     Task<IReadOnlyList<AdminPrivacyRequestResponse>> GetPrivacyRequestsAsync(string? status, CancellationToken ct);
     Task<AdminPrivacyRequestResponse> SetPrivacyRequestStatusAsync(string privacyRequestId, AdminStatusRequest request, CancellationToken ct);
+    Task<IReadOnlyList<AdminConsentPolicyResponse>> GetConsentPoliciesAsync(CancellationToken ct);
+    Task<AdminConsentPolicyResponse> CreateConsentPolicyAsync(AdminConsentPolicyCreateRequest request, string idempotencyKey, CancellationToken ct);
+    Task<AdminConsentPolicyResponse> RetireConsentPolicyAsync(string policyId, CancellationToken ct);
 }
 
 public sealed class AdminService(ICoreStore store) : IAdminService
@@ -118,6 +121,62 @@ public sealed class AdminService(ICoreStore store) : IAdminService
         await store.SaveAsync(ct);
         return Map(row);
     }
+
+    public Task<IReadOnlyList<AdminConsentPolicyResponse>> GetConsentPoliciesAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var now = DateTimeOffset.UtcNow;
+        IReadOnlyList<AdminConsentPolicyResponse> result = store.ConsentPolicies.OrderBy(x => x.PurposeCode).ThenByDescending(x => x.EffectiveFrom).AsEnumerable().Select(x => Map(x, now)).ToArray();
+        return Task.FromResult(result);
+    }
+
+    public async Task<AdminConsentPolicyResponse> CreateConsentPolicyAsync(AdminConsentPolicyCreateRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        var purpose = request.PurposeCode?.Trim().ToUpperInvariant() ?? "";
+        if (purpose.Length is 0 or > 64 || !purpose.All(ch => char.IsAsciiLetterUpper(ch) || char.IsAsciiDigit(ch) || ch == '_')) throw new DomainException("CONSENT_POLICY_INVALID");
+        var version = request.Version?.Trim() ?? "";
+        var locale = string.IsNullOrWhiteSpace(request.Locale) ? "en" : request.Locale.Trim();
+        if (version.Length is 0 or > 32 || locale.Length > 16) throw new DomainException("CONSENT_POLICY_INVALID");
+        if (request.ContentHash is not null && (request.ContentHash.Length != 64 || !request.ContentHash.All(char.IsAsciiHexDigit))) throw new DomainException("CONSENT_POLICY_INVALID");
+
+        // Policy ID derives from the idempotency key, so a retried create returns the original policy.
+        var policyId = $"cpol_{Hash("consent.policy.create", idempotencyKey)[..32]}";
+        var existing = store.ConsentPolicies.SingleOrDefault(x => x.PolicyId == policyId);
+        if (existing is not null) return Map(existing, DateTimeOffset.UtcNow);
+        // Mirrors ux_consent_policy_purpose_version_locale.
+        if (store.ConsentPolicies.Any(x => x.PurposeCode == purpose && x.Version == version && x.Locale == locale)) throw new DomainException("CONSENT_POLICY_EXISTS", 409);
+
+        var row = new ConsentPolicy
+        {
+            PolicyId = policyId,
+            PurposeCode = purpose,
+            Version = version,
+            Locale = locale,
+            // content_hash records what the member was shown; derived from the text when only that is supplied.
+            ContentHash = request.ContentHash?.ToLowerInvariant() ?? Hash(request.Text ?? $"{purpose}\n{version}\n{locale}"),
+            EffectiveFrom = request.EffectiveFrom ?? DateTimeOffset.UtcNow
+        };
+        store.Add(row);
+        await store.SaveAsync(ct);
+        return Map(row, DateTimeOffset.UtcNow);
+    }
+
+    public async Task<AdminConsentPolicyResponse> RetireConsentPolicyAsync(string policyId, CancellationToken ct)
+    {
+        var row = store.ConsentPolicies.SingleOrDefault(x => x.PolicyId == policyId) ?? throw new DomainException("CONSENT_POLICY_NOT_FOUND", 404);
+        var now = DateTimeOffset.UtcNow;
+        if (row.RetiredAt is null)
+        {
+            row.RetiredAt = now;
+            row.UpdatedAt = now;
+            await store.SaveAsync(ct);
+        }
+        return Map(row, now);
+    }
+
+    private static string Hash(params string[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
+    private static AdminConsentPolicyResponse Map(ConsentPolicy x, DateTimeOffset now) => new(x.PolicyId, x.PurposeCode, x.Version, x.Locale, x.ContentHash, x.EffectiveFrom, x.RetiredAt,
+        x.RetiredAt is not null && x.RetiredAt <= now ? "RETIRED" : x.EffectiveFrom > now ? "SCHEDULED" : "ACTIVE");
 
     private void AddChange(string memberId, string type, string id, object payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = "UPSERT", PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
 

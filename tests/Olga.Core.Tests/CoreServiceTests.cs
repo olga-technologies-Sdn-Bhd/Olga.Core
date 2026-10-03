@@ -467,6 +467,71 @@ public sealed class CoreServiceTests
         Assert.Equal("M00", result.Attendees[0].MemberId);
     }
 
+    [Fact]
+    public async Task Admin_created_consent_policy_unblocks_consent_and_is_returned_as_active()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var admin = new AdminService(db);
+        var service = Service(db);
+
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
+        var noActive = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("LIVE_MODE", default));
+        var created = await admin.CreateConsentPolicyAsync(new("live_mode", "1", Text: "Live Mode terms v1"), "policy-1", default);
+        var replay = await admin.CreateConsentPolicyAsync(new("LIVE_MODE", "1"), "policy-1", default);
+        var consent = await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var active = await service.GetActiveConsentPolicyAsync("live_mode", default);
+
+        Assert.Equal(("CONSENT_POLICY_NOT_ACTIVE", 409), (missing.Code, missing.StatusCode));
+        Assert.Equal(("CONSENT_POLICY_NOT_ACTIVE", 404), (noActive.Code, noActive.StatusCode));
+        Assert.Equal(("LIVE_MODE", "1", "en", "ACTIVE"), (created.PurposeCode, created.Version, created.Locale, created.Status));
+        Assert.Equal(64, created.ContentHash.Length);
+        Assert.Equal(created.PolicyId, replay.PolicyId);
+        Assert.Equal(created.PolicyId, consent.PolicyId);
+        Assert.Equal(("LIVE_MODE", "1"), (active.PurposeCode, active.Version));
+        Assert.Single(await admin.GetConsentPoliciesAsync(default));
+    }
+
+    [Fact]
+    public async Task Duplicate_consent_policy_is_a_conflict_and_invalid_input_is_rejected()
+    {
+        await using var db = Db();
+        var admin = new AdminService(db);
+        await admin.CreateConsentPolicyAsync(new("MATCHING", "1"), "policy-a", default);
+
+        var duplicate = await Assert.ThrowsAsync<DomainException>(() => admin.CreateConsentPolicyAsync(new("matching", "1"), "policy-b", default));
+        var badPurpose = await Assert.ThrowsAsync<DomainException>(() => admin.CreateConsentPolicyAsync(new("live mode!", "1"), "policy-c", default));
+        var badHash = await Assert.ThrowsAsync<DomainException>(() => admin.CreateConsentPolicyAsync(new("MATCHING", "2", ContentHash: "xyz"), "policy-d", default));
+
+        Assert.Equal(("CONSENT_POLICY_EXISTS", 409), (duplicate.Code, duplicate.StatusCode));
+        Assert.Equal("CONSENT_POLICY_INVALID", badPurpose.Code);
+        Assert.Equal("CONSENT_POLICY_INVALID", badHash.Code);
+    }
+
+    [Fact]
+    public async Task Retired_consent_policy_is_no_longer_accepted_or_active()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var admin = new AdminService(db);
+        var service = Service(db);
+        var policy = await admin.CreateConsentPolicyAsync(new("LIVE_MODE", "1"), "policy-r", default);
+
+        var retired = await admin.RetireConsentPolicyAsync(policy.PolicyId, default);
+        var again = await admin.RetireConsentPolicyAsync(policy.PolicyId, default);
+        var consent = await Assert.ThrowsAsync<DomainException>(() => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
+        var active = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("LIVE_MODE", default));
+        var unknown = await Assert.ThrowsAsync<DomainException>(() => admin.RetireConsentPolicyAsync("missing", default));
+
+        Assert.Equal("RETIRED", retired.Status);
+        Assert.Equal(retired.RetiredAt, again.RetiredAt);
+        Assert.Equal(("CONSENT_POLICY_NOT_ACTIVE", 409), (consent.Code, consent.StatusCode));
+        Assert.Equal(404, active.StatusCode);
+        Assert.Equal(("CONSENT_POLICY_NOT_FOUND", 404), (unknown.Code, unknown.StatusCode));
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

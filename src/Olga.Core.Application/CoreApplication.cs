@@ -47,6 +47,7 @@ public interface ICoreService
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
+    Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string purposeCode, CancellationToken ct);
     // memberId is optional: when supplied, each event carries is_registered for that member.
     Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
@@ -193,6 +194,19 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddOutbox("MEMBER", memberId, "MemberProfileChanged.v1", new { member_id = memberId, profile.Version });
         await store.SaveAsync(ct);
         return Map(profile);
+    }
+
+    public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string purposeCode, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var purpose = purposeCode.Trim().ToUpperInvariant();
+        var now = DateTimeOffset.UtcNow;
+        // Same rule RecordConsentAsync uses to accept a policy version.
+        var policy = store.ConsentPolicies
+            .Where(x => x.PurposeCode == purpose && x.EffectiveFrom <= now && (x.RetiredAt == null || x.RetiredAt > now))
+            .OrderByDescending(x => x.EffectiveFrom)
+            .FirstOrDefault() ?? throw new DomainException("CONSENT_POLICY_NOT_ACTIVE", 404);
+        return Task.FromResult(new ActiveConsentPolicyResponse(policy.PurposeCode, policy.Version, policy.Locale, policy.EffectiveFrom));
     }
 
     public async Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct)
