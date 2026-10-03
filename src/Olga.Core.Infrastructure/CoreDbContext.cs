@@ -186,7 +186,10 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     {
         if (!Database.IsRelational())
         {
+            // Mirror PostgreSQL: a registered member (identity row, standing in for iam.member) without a
+            // profile gets the private draft; an unknown ID fails like fk_member_profile_member_id.
             if (await MemberProfiles.AnyAsync(x => x.MemberId == memberId, ct)) return;
+            if (!await MemberIdentities.AnyAsync(x => x.MemberId == memberId, ct)) throw new DomainException("MEMBER_NOT_REGISTERED", 404);
             MemberProfiles.Add(new MemberProfile { MemberId = memberId, Status = "DRAFT", Visibility = "HIDDEN" });
             await SaveChangesAsync(ct);
             return;

@@ -90,7 +90,7 @@ public sealed class CoreServiceTests
         await using var db = Db();
         var service = Service(db);
 
-        await service.ProvisionMemberAsync("NEW", default);
+        RegisterAccountOnly(db, "NEW"); await service.ProvisionMemberAsync("NEW", default);
         await service.ProvisionMemberAsync("NEW", default);
 
         var profile = await service.GetOwnProfileAsync("NEW", default);
@@ -105,7 +105,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        await service.ProvisionMemberAsync("NEW", default);
+        RegisterAccountOnly(db, "NEW"); await service.ProvisionMemberAsync("NEW", default);
 
         var profile = await service.UpdateProfileAsync("NEW", new("New member", null, null, null), null, default);
 
@@ -118,7 +118,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        await service.ProvisionMemberAsync("NEW", default);
+        RegisterAccountOnly(db, "NEW"); await service.ProvisionMemberAsync("NEW", default);
 
         var error = await Assert.ThrowsAsync<DomainException>(() => service.GetVisibleProfileAsync("A", "NEW", default));
 
@@ -151,7 +151,7 @@ public sealed class CoreServiceTests
         db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" });
         await db.SaveChangesAsync();
         var service = Service(db);
-        await service.ProvisionMemberAsync("NEW", default);
+        RegisterAccountOnly(db, "NEW"); await service.ProvisionMemberAsync("NEW", default);
 
         var error = await Assert.ThrowsAsync<DomainException>(() => service.CreateConnectionRequestAsync("NEW", new("A"), default));
 
@@ -564,6 +564,25 @@ public sealed class CoreServiceTests
         await Service(db).RegisterAsync("A", "E", default);
 
         Assert.Equal("E:A", Assert.Single(db.OutboxEvents.Where(x => x.AggregateType == "EVENT_REGISTRATION")).AggregateId);
+    }
+
+    [Fact]
+    public async Task Unknown_member_is_not_created_and_returns_member_not_registered()
+    {
+        await using var db = Db();
+        var service = Service(db);
+
+        var error = await Assert.ThrowsAsync<DomainException>(() => service.ProvisionMemberAsync("never-registered", default));
+
+        Assert.Equal(("MEMBER_NOT_REGISTERED", 404), (error.Code, error.StatusCode));
+        Assert.Empty(db.MemberProfiles);
+    }
+
+    // A registered account (identity row) without a profile yet, like iam.member before onboarding.
+    private static void RegisterAccountOnly(CoreDbContext db, string memberId)
+    {
+        db.MemberIdentities.Add(new MemberIdentity { MemberId = memberId, Provider = "EMAIL", ProviderSubjectHash = new string('0', 64) + memberId });
+        db.SaveChanges();
     }
 
     [Fact]
