@@ -365,6 +365,89 @@ public sealed class CoreServiceTests
         Assert.Equal(("CONVERSATION_MUTE_INVALID", 400), (past.Code, past.StatusCode));
     }
 
+    [Fact]
+    public async Task Sender_can_delete_own_message_which_stays_as_a_bodyless_tombstone()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("d1", "Keep"), "del-m1", default);
+        await service.SendMessageAsync("A", conversationId, new("d2", "Oops"), "del-m2", default);
+
+        await service.DeleteMessageAsync("A", "d2", default);
+        await service.DeleteMessageAsync("A", "d2", default);
+
+        var messages = await service.GetMessagesAsync("B", conversationId, 0, 50, default);
+        var deleted = messages.Single(x => x.MessageId == "d2");
+        Assert.Equal(2, messages.Count);
+        Assert.Null(deleted.Body); Assert.NotNull(deleted.DeletedAt);
+        Assert.Equal("Oops", db.ChatMessages.Single(x => x.MessageId == "d2").Body);
+        var forB = await service.GetConversationAsync("B", conversationId, default);
+        Assert.Equal(("d1", 1), (forB.LastMessage?.MessageId, forB.UnreadCount));
+        Assert.Equal(2, db.Changes.Count(x => x.ResourceType == "MESSAGE" && x.ResourceId == "d2" && x.ChangeType == "DELETE"));
+    }
+
+    [Fact]
+    public async Task Only_the_sender_can_delete_a_message()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("d3", "Mine"), "del-m3", default);
+
+        var other = await Assert.ThrowsAsync<DomainException>(() => service.DeleteMessageAsync("B", "d3", default));
+        var outsider = await Assert.ThrowsAsync<DomainException>(() => service.DeleteMessageAsync("C", "d3", default));
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.DeleteMessageAsync("A", "nope", default));
+
+        Assert.Equal(("MESSAGE_DELETE_FORBIDDEN", 403), (other.Code, other.StatusCode));
+        Assert.Equal(("CONVERSATION_FORBIDDEN", 403), (outsider.Code, outsider.StatusCode));
+        Assert.Equal(("MESSAGE_NOT_FOUND", 404), (missing.Code, missing.StatusCode));
+        Assert.Null(db.ChatMessages.Single().DeletedAt);
+    }
+
+    [Fact]
+    public async Task Reporting_a_message_opens_one_report_and_moderation_case_even_after_blocking()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("p1", "Rude"), "rep-m1", default);
+        await service.BlockAsync("B", new("A"), default);
+
+        var report = await service.ReportMessageAsync("B", "p1", new("harassment", "  Abusive  "), default);
+        var again = await service.ReportMessageAsync("B", "p1", new("SPAM"), default);
+
+        Assert.Equal((report.ReportId, "HARASSMENT", "OPEN"), (again.ReportId, report.Category, report.Status));
+        var row = Assert.Single(db.MemberReports);
+        Assert.Equal(("B", "A", "MESSAGE", "p1", "Abusive"), (row.ReporterMemberId, row.ReportedMemberId, row.ResourceType, row.ResourceId, row.Description));
+        var moderation = Assert.Single(db.ModerationCases);
+        Assert.Equal(("MEMBER_REPORT", report.ReportId, "A", "MESSAGE", "p1"), (moderation.SourceType, moderation.SourceId, moderation.SubjectMemberId, moderation.ResourceType, moderation.ResourceId));
+    }
+
+    [Fact]
+    public async Task Reporting_rejects_own_messages_outsiders_and_unknown_categories()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("p2", "Hi"), "rep-m2", default);
+
+        var own = await Assert.ThrowsAsync<DomainException>(() => service.ReportMessageAsync("A", "p2", new("SPAM"), default));
+        var outsider = await Assert.ThrowsAsync<DomainException>(() => service.ReportMessageAsync("C", "p2", new("SPAM"), default));
+        var category = await Assert.ThrowsAsync<DomainException>(() => service.ReportMessageAsync("B", "p2", new("BORING"), default));
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.ReportMessageAsync("B", "nope", new("SPAM"), default));
+
+        Assert.Equal(("MESSAGE_REPORT_FORBIDDEN", 403), (own.Code, own.StatusCode));
+        Assert.Equal(("CONVERSATION_FORBIDDEN", 403), (outsider.Code, outsider.StatusCode));
+        Assert.Equal(("MESSAGE_REPORT_INVALID", 400), (category.Code, category.StatusCode));
+        Assert.Equal(("MESSAGE_NOT_FOUND", 404), (missing.Code, missing.StatusCode));
+        Assert.Empty(db.MemberReports); Assert.Empty(db.ModerationCases);
+    }
+
     private static async Task<string> ConnectAsync(CoreService service, string sender, string recipient)
     {
         var request = await service.CreateConnectionRequestAsync(sender, new(recipient), default);
