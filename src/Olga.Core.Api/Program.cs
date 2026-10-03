@@ -141,7 +141,7 @@ memberV1.MapGet("/members/{memberId}", async (HttpContext c, string memberId, IC
     .WithName("GetMemberProfile").WithTags("Members").Produces<ProfileResponse>(200);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
-memberV1.MapGet("/consent-policies/{purposeCode}", async (string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(purposeCode, ct)))
+memberV1.MapGet("/consent-policies/{purposeCode}", async (HttpContext c, string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(Member(c), purposeCode, ct)))
     .WithName("GetActiveConsentPolicy").WithTags("Members").Produces<ActiveConsentPolicyResponse>(200);
 v1.MapGet("/events", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(OptionalMember(c), ct)))
     .WithMetadata(new OptionalMemberContextMetadata())
@@ -211,6 +211,8 @@ adminV1.MapPost("/events/{eventId}/publish", async (string eventId, IAdminEventS
     .WithName("AdminPublishEvent").WithTags("Admin events").Produces<AdminEventResponse>(200);
 adminV1.MapPost("/events/{eventId}/cancel", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CancelEventAsync(eventId, ct)))
     .WithName("AdminCancelEvent").WithTags("Admin events").Produces<AdminEventResponse>(200);
+adminV1.MapPut("/events/{eventId}/matching-policy", async (string eventId, AdminEventMatchingPolicyUpdateRequest body, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.UpdateMatchingPolicyAsync(eventId, body, ct)))
+    .WithName("AdminUpdateEventMatchingPolicy").WithTags("Admin events").Produces<AdminEventResponse>(200);
 adminV1.MapGet("/stats", async (IAdminService s, CancellationToken ct) => Results.Ok(await s.GetStatsAsync(ct)))
     .WithName("AdminGetStats").WithTags("Admin stats").Produces<AdminStatsResponse>(200);
 adminV1.MapGet("/members", async (string? status, string? search, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetMembersAsync(status, search, ct)))
@@ -233,6 +235,8 @@ adminV1.MapPost("/consent-policies/{policyId}/retire", async (string policyId, I
     .WithName("AdminRetireConsentPolicy").WithTags("Admin").Produces<AdminConsentPolicyResponse>(200);
 adminV1.MapGet("/events/{eventId}/attendees", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetAttendeesAsync(eventId, ct)))
     .WithName("AdminListEventAttendees").WithTags("Admin events").Produces<IReadOnlyList<AdminAttendeeResponse>>(200);
+adminV1.MapPost("/events/{eventId}/attendees/{memberId}/check-in", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CheckInAsync(eventId, memberId, ct)))
+    .WithName("AdminCheckInEventAttendee").WithTags("Admin events").Produces<RegistrationResponse>(200);
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)))
     .WithName("AdminListVenues").WithTags("Admin venues").Produces<IReadOnlyList<AdminVenueResponse>>(200);
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); })

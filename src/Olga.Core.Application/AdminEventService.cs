@@ -12,7 +12,9 @@ public interface IAdminEventService
     Task<AdminEventResponse> UpdateEventAsync(string eventId, AdminEventUpdateRequest request, CancellationToken ct);
     Task<AdminEventResponse> PublishEventAsync(string eventId, CancellationToken ct);
     Task<AdminEventResponse> CancelEventAsync(string eventId, CancellationToken ct);
+    Task<AdminEventResponse> UpdateMatchingPolicyAsync(string eventId, AdminEventMatchingPolicyUpdateRequest request, CancellationToken ct);
     Task<IReadOnlyList<AdminAttendeeResponse>> GetAttendeesAsync(string eventId, CancellationToken ct);
+    Task<RegistrationResponse> CheckInAsync(string eventId, string memberId, CancellationToken ct);
     Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct);
     Task<AdminVenueResponse> CreateVenueAsync(AdminVenueCreateRequest request, string idempotencyKey, CancellationToken ct);
 }
@@ -115,6 +117,30 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
         return MapAll([row])[0];
     }
 
+    public async Task<AdminEventResponse> UpdateMatchingPolicyAsync(string eventId, AdminEventMatchingPolicyUpdateRequest request, CancellationToken ct)
+    {
+        var row = FindEvent(eventId);
+        if (row.Status is not ("PUBLISHED" or "ACTIVE")) throw new DomainException("EVENT_STATE_CONFLICT", 409);
+        var policy = store.MatchingPolicies
+            .Where(x => x.EventId == eventId && x.Status == "ACTIVE")
+            .OrderByDescending(x => x.PolicyVersion)
+            .FirstOrDefault();
+        if (policy is null)
+        {
+            EventMatchingPolicies.EnsureDefault(store, eventId, DateTimeOffset.UtcNow);
+            await store.SaveAsync(ct);
+            policy = store.MatchingPolicies.Single(x => x.EventId == eventId && x.Status == "ACTIVE");
+        }
+        if (policy.CheckInRequired != request.CheckInRequired)
+        {
+            policy.CheckInRequired = request.CheckInRequired;
+            row.UpdatedAt = DateTimeOffset.UtcNow;
+            AddChange(row);
+            await store.SaveAsync(ct);
+        }
+        return MapAll([row])[0];
+    }
+
     public Task<IReadOnlyList<AdminAttendeeResponse>> GetAttendeesAsync(string eventId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -130,6 +156,39 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
             return new AdminAttendeeResponse(x.MemberId, p?.DisplayName ?? x.MemberId, p?.Headline, x.Status, x.RegisteredAt, x.CheckedInAt, live.Contains(x.MemberId));
         }).ToArray();
         return Task.FromResult(result);
+    }
+
+    public async Task<RegistrationResponse> CheckInAsync(string eventId, string memberId, CancellationToken ct)
+    {
+        var evt = FindEvent(eventId);
+        if (evt.Status is not ("PUBLISHED" or "ACTIVE")) throw new DomainException("EVENT_STATE_CONFLICT", 409);
+        var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId)
+            ?? throw new DomainException("EVENT_REGISTRATION_NOT_FOUND", 404);
+        if (row.Status == "CHECKED_IN") return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt, row.CheckedInAt);
+        if (row.Status != "REGISTERED") throw new DomainException("EVENT_REGISTRATION_STATE_CONFLICT", 409);
+
+        var now = DateTimeOffset.UtcNow;
+        row.Status = "CHECKED_IN";
+        row.CheckedInAt = now;
+        row.UpdatedAt = now;
+        store.Add(new SyncChange
+        {
+            CommunityId = evt.CommunityId,
+            MemberScopeId = memberId,
+            ResourceType = "EVENT_REGISTRATION",
+            ResourceId = eventId,
+            ChangeType = "UPSERT",
+            PayloadJson = JsonSerializer.Serialize(new { event_id = eventId, status = row.Status, checked_in_at = row.CheckedInAt }, JsonOptions)
+        });
+        store.Add(new OutboxEvent
+        {
+            AggregateType = "EVENT_REGISTRATION",
+            AggregateId = AggregateKey(eventId, memberId),
+            EventType = "EventRegistrationChanged.v1",
+            PayloadJson = JsonSerializer.Serialize(new { event_id = eventId, member_id = memberId, status = row.Status, checked_in_at = row.CheckedInAt }, JsonOptions)
+        });
+        await store.SaveAsync(ct);
+        return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt, row.CheckedInAt);
     }
 
     public Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct)
@@ -176,10 +235,11 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
     // Events are community-wide, so the change has no member scope and reaches every device's sync feed.
     private void AddChange(EventRecord x) => store.Add(new SyncChange
     {
+        CommunityId = x.CommunityId,
         ResourceType = "EVENT",
         ResourceId = x.EventId,
         ChangeType = "UPSERT",
-        PayloadJson = JsonSerializer.Serialize(new { event_id = x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, x.VenueId }, JsonOptions)
+        PayloadJson = JsonSerializer.Serialize(new { event_id = x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, x.VenueId, check_in_required = ActivePolicy(x.EventId)?.CheckInRequired ?? false }, JsonOptions)
     });
 
     private IReadOnlyList<AdminEventResponse> MapAll(IReadOnlyList<EventRecord> events)
@@ -196,14 +256,31 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
             .GroupBy(id => id).ToDictionary(g => g.Key, g => g.Count());
         var venueIds = events.Where(x => x.VenueId != null).Select(x => x.VenueId!).Distinct().ToArray();
         var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
+        var policies = store.MatchingPolicies
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE")
+            .OrderByDescending(x => x.PolicyVersion)
+            .ToList()
+            .GroupBy(x => x.EventId)
+            .ToDictionary(x => x.Key, x => x.First());
 
         return events.Select(x => new AdminEventResponse(
             x.EventId, x.CommunityId, x.Name, x.Description, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled,
+            policies.GetValueOrDefault(x.EventId)?.CheckInRequired ?? false,
             x.VenueId, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null,
             attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0),
             x.CreatedAt, x.UpdatedAt)).ToArray();
     }
 
+    private EventMatchingPolicy? ActivePolicy(string eventId) => store.MatchingPolicies
+        .Where(x => x.EventId == eventId && x.Status == "ACTIVE")
+        .OrderByDescending(x => x.PolicyVersion)
+        .FirstOrDefault();
+
     private static AdminVenueResponse Map(Venue x) => new(x.VenueId, x.Name, x.CountryCode, x.Region, x.City, x.TimezoneId, x.Status, x.CreatedAt);
+    private static string AggregateKey(string eventId, string memberId)
+    {
+        var value = $"{eventId}:{memberId}";
+        return value.Length <= 64 ? value : $"agg_{Hash(eventId, memberId)[..60]}";
+    }
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
 }

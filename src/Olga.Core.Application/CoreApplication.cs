@@ -53,8 +53,8 @@ public interface ICoreService
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
-    Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string purposeCode, CancellationToken ct);
-    // memberId is optional: when supplied, each event carries is_registered for that member.
+    Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct);
+    // memberId is optional: when supplied, each event carries registration state for that member.
     Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
     Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct);
@@ -217,7 +217,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Map(profile);
     }
 
-    public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string purposeCode, CancellationToken ct)
+    public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         var purpose = purposeCode.Trim().ToUpperInvariant();
@@ -227,7 +227,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Where(x => x.PurposeCode == purpose && x.EffectiveFrom <= now && (x.RetiredAt == null || x.RetiredAt > now))
             .OrderByDescending(x => x.EffectiveFrom)
             .FirstOrDefault() ?? throw new DomainException("CONSENT_POLICY_NOT_ACTIVE", 404);
-        return Task.FromResult(new ActiveConsentPolicyResponse(policy.PurposeCode, policy.Version, policy.Locale, policy.EffectiveFrom));
+        var decision = store.Consents
+            .Where(x => x.MemberId == memberId && x.PolicyId == policy.PolicyId)
+            .OrderByDescending(x => x.CapturedAt)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefault();
+        return Task.FromResult(new ActiveConsentPolicyResponse(
+            policy.PolicyId, policy.PurposeCode, policy.Version, policy.Locale, policy.ContentHash,
+            policy.EffectiveFrom, decision?.Decision, decision?.CapturedAt));
     }
 
     public async Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct)
@@ -273,14 +280,26 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var venueIds = events.Where(x => x.VenueId != null).Select(x => x.VenueId!).Distinct().ToArray();
         var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
 
-        // Same statuses that allow Live Mode, so is_registered matches what the member can do next.
-        HashSet<string>? registeredEventIds = memberId is null ? null : store.Registrations
+        var matchingPolicies = store.MatchingPolicies
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE")
+            .OrderByDescending(x => x.PolicyVersion)
+            .ToList()
+            .GroupBy(x => x.EventId)
+            .ToDictionary(x => x.Key, x => x.First());
+
+        Dictionary<string, string>? registrationStatuses = memberId is null ? null : store.Registrations
             .Where(x => eventIds.Contains(x.EventId) && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))
-            .Select(x => x.EventId)
-            .ToHashSet();
+            .ToDictionary(x => x.EventId, x => x.Status);
 
         IReadOnlyList<EventResponse> result = events
-            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0), registeredEventIds?.Contains(x.EventId)))
+            .Select(x => Map(
+                x,
+                matchingPolicies.GetValueOrDefault(x.EventId)?.CheckInRequired ?? false,
+                x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null,
+                attendeeCounts.GetValueOrDefault(x.EventId, 0),
+                liveCounts.GetValueOrDefault(x.EventId, 0),
+                memberId is null ? null : registrationStatuses!.ContainsKey(x.EventId),
+                registrationStatuses?.GetValueOrDefault(x.EventId)))
             .ToArray();
         return Task.FromResult(result);
     }
@@ -323,7 +342,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
         AddOutbox("EVENT_REGISTRATION", AggregateKey(eventId, memberId), "EventRegistrationChanged.v1", new { event_id = eventId, member_id = memberId, status = row.Status });
         await store.SaveAsync(ct);
-        return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt);
+        return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt, row.CheckedInAt);
     }
 
     public async Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct)
@@ -333,7 +352,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         // Mirror event.enforce_live_mode_session_consent so callers get a specific code, not RESOURCE_STATE_CONFLICT.
         var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
         if (account is not null && account.Status != "ACTIVE") throw new DomainException("MEMBER_NOT_ACTIVE", 403);
-        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN")))
+            throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
         if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_LIVE", 409);
@@ -877,7 +897,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount, bool? isRegistered) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount, isRegistered);
+    private static EventResponse Map(EventRecord x, bool checkInRequired, string? venue, int attendeeCount, int liveCount, bool? isRegistered, string? registrationStatus) => new(
+        x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, checkInRequired, venue,
+        attendeeCount, liveCount, isRegistered, registrationStatus);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
     // The sender sees a declined Commit as PENDING.

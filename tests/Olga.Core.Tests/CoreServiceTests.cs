@@ -184,6 +184,27 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Check_in_required_is_exposed_without_blocking_live_mode()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventMatchingPolicies.Add(new EventMatchingPolicy { EventId = "E", CheckInRequired = true });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterAsync("A", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        var listed = Assert.Single(await service.GetEventsAsync("A", default));
+        var session = await service.StartLiveModeAsync("A", "E", new(30), default);
+        var checkedIn = await new AdminEventService(db).CheckInAsync("E", "A", default);
+
+        Assert.True(listed.CheckInRequired);
+        Assert.Equal("REGISTERED", listed.RegistrationStatus);
+        Assert.Equal("CHECKED_IN", checkedIn.Status);
+        Assert.NotNull(checkedIn.CheckedInAt);
+        Assert.Equal("ACTIVE", session.Status);
+    }
+
+    [Fact]
     public async Task Accepting_request_creates_one_connection_and_conversation()
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
@@ -845,11 +866,11 @@ public sealed class CoreServiceTests
         var service = Service(db);
 
         var missing = await Assert.ThrowsAsync<DomainException>(() => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
-        var noActive = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("LIVE_MODE", default));
+        var noActive = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("A", "LIVE_MODE", default));
         var created = await admin.CreateConsentPolicyAsync(new("live_mode", "1", Text: "Live Mode terms v1"), "policy-1", default);
         var replay = await admin.CreateConsentPolicyAsync(new("LIVE_MODE", "1"), "policy-1", default);
         var consent = await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
-        var active = await service.GetActiveConsentPolicyAsync("live_mode", default);
+        var active = await service.GetActiveConsentPolicyAsync("A", "live_mode", default);
 
         Assert.Equal(("CONSENT_POLICY_NOT_ACTIVE", 409), (missing.Code, missing.StatusCode));
         Assert.Equal(("CONSENT_POLICY_NOT_ACTIVE", 404), (noActive.Code, noActive.StatusCode));
@@ -857,7 +878,8 @@ public sealed class CoreServiceTests
         Assert.Equal(64, created.ContentHash.Length);
         Assert.Equal(created.PolicyId, replay.PolicyId);
         Assert.Equal(created.PolicyId, consent.PolicyId);
-        Assert.Equal(("LIVE_MODE", "1"), (active.PurposeCode, active.Version));
+        Assert.Equal((created.PolicyId, "LIVE_MODE", "1", created.ContentHash, "GRANTED"), (active.PolicyId, active.PurposeCode, active.Version, active.ContentHash, active.CurrentDecision));
+        Assert.NotNull(active.DecisionCapturedAt);
         Assert.Single(await admin.GetConsentPoliciesAsync(default));
     }
 
@@ -890,7 +912,7 @@ public sealed class CoreServiceTests
         var retired = await admin.RetireConsentPolicyAsync(policy.PolicyId, default);
         var again = await admin.RetireConsentPolicyAsync(policy.PolicyId, default);
         var consent = await Assert.ThrowsAsync<DomainException>(() => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
-        var active = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("LIVE_MODE", default));
+        var active = await Assert.ThrowsAsync<DomainException>(() => service.GetActiveConsentPolicyAsync("A", "LIVE_MODE", default));
         var unknown = await Assert.ThrowsAsync<DomainException>(() => admin.RetireConsentPolicyAsync("missing", default));
 
         Assert.Equal("RETIRED", retired.Status);

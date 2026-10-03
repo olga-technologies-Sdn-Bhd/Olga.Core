@@ -114,6 +114,28 @@ public sealed class AdminEventServiceTests
         Assert.Single(db.EventMatchingPolicies, x => x.EventId == draft.EventId && x.Status == "ACTIVE");
     }
 
+    [Fact]
+    public async Task Admin_can_configure_check_in_and_check_in_a_registered_attendee_idempotently()
+    {
+        await using var db = Db();
+        var admin = new AdminEventService(db);
+        var evt = await admin.CreateEventAsync("olga", new("Meetup", DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(1), Publish: true), "check-in-event", default);
+        db.EventRegistrations.Add(new EventRegistration { EventId = evt.EventId, MemberId = "A" });
+        await db.SaveChangesAsync();
+
+        var configured = await admin.UpdateMatchingPolicyAsync(evt.EventId, new(true), default);
+        var first = await admin.CheckInAsync(evt.EventId, "A", default);
+        var replay = await admin.CheckInAsync(evt.EventId, "A", default);
+        var disabled = await admin.UpdateMatchingPolicyAsync(evt.EventId, new(false), default);
+
+        Assert.True(configured.CheckInRequired);
+        Assert.False(disabled.CheckInRequired);
+        Assert.False(db.EventMatchingPolicies.Single().CheckInRequired);
+        Assert.Equal("CHECKED_IN", first.Status);
+        Assert.Equal(first.CheckedInAt, replay.CheckedInAt);
+        Assert.Single(db.Changes, x => x.MemberScopeId == "A" && x.ResourceType == "EVENT_REGISTRATION");
+    }
+
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Core(CoreDbContext db) => new(db, new AesIdentityProtector(new byte[32]));
 }

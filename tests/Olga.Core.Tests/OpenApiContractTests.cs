@@ -44,6 +44,9 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(consent, "X-Member-Id", required: false, maxLength: 64);
         AssertHeader(consent, "Idempotency-Key", required: true, maxLength: 128);
 
+        var consentPolicy = Operation(document, "/v1/consent-policies/{purposeCode}", "get");
+        AssertHeader(consentPolicy, "X-Member-Id", required: false, maxLength: 64);
+
         var profileUpdate = Operation(document, "/v1/me/profile", "patch");
         AssertHeader(profileUpdate, "X-Member-Id", required: false, maxLength: 64);
         AssertHeader(profileUpdate, "Idempotency-Key", required: true, maxLength: 128);
@@ -60,6 +63,12 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         var adminCreateEvent = Operation(document, "/v1/admin/events", "post");
         AssertNoHeader(adminCreateEvent, "X-Admin-Key");
         AssertNoHeader(adminCreateEvent, "X-Member-Id");
+
+        var adminCheckIn = Operation(document, "/v1/admin/events/{eventId}/attendees/{memberId}/check-in", "post");
+        AssertHeader(adminCheckIn, "Idempotency-Key", required: true, maxLength: 128);
+
+        var adminMatchingPolicy = Operation(document, "/v1/admin/events/{eventId}/matching-policy", "put");
+        AssertHeader(adminMatchingPolicy, "Idempotency-Key", required: true, maxLength: 128);
     }
 
     [Fact]
@@ -98,6 +107,21 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.True(properties.TryGetProperty("venue", out _));
         Assert.True(properties.TryGetProperty("attendee_count", out _));
         Assert.True(properties.TryGetProperty("live_count", out _));
+        Assert.True(properties.TryGetProperty("check_in_required", out _));
+        Assert.True(properties.TryGetProperty("registration_status", out _));
+    }
+
+    [Fact]
+    public async Task Active_consent_policy_exposes_identity_hash_and_member_decision()
+    {
+        using var document = await GetDocumentAsync();
+        var properties = document.RootElement.GetProperty("components").GetProperty("schemas")
+            .GetProperty("ActiveConsentPolicyResponse").GetProperty("properties");
+
+        Assert.True(properties.TryGetProperty("policy_id", out _));
+        Assert.True(properties.TryGetProperty("content_hash", out _));
+        Assert.True(properties.TryGetProperty("current_decision", out _));
+        Assert.True(properties.TryGetProperty("decision_captured_at", out _));
     }
 
     [Fact]

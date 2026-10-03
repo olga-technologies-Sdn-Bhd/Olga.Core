@@ -16,7 +16,7 @@ The Core API does not own NLP intents, embeddings, model versions, ranking confi
 | `Olga.Core.Infrastructure` | EF Core/Npgsql unit of work, PostgreSQL schema mapping, indexes, and local seed data. | Application, Domain |
 | `Olga.Core.Api` | Minimal API endpoints, correlation/error handling, identity extraction, OpenAPI, health, and readiness. | Application, Contracts, Infrastructure |
 | `Olga.Core.Worker` | Publishes transactional outbox events to Service Bus and consumes NLP completion events into Core-owned notification and sync projections. | Infrastructure |
-| `Olga.Core.Tests` | Boundary and invariant tests for ETag updates, consent-gated Live Mode, connection/chat creation, idempotent messages, and blocking. | Application, Infrastructure |
+| `Olga.Core.Tests` | Boundary and invariant tests for ETag updates, versioned consent, event check-in policy, consent-gated Live Mode, connection/chat creation, idempotent messages, and blocking. | Application, Infrastructure |
 
 Dependencies point inward. Domain and Contracts never reference EF Core or ASP.NET. Application depends on the `ICoreStore` abstraction; Infrastructure implements it.
 
@@ -70,6 +70,28 @@ Refresh presence
 ```
 
 Withdrawing Live Mode consent revokes all active sessions immediately. Coarse cells are never returned through member endpoints or placed in event payloads.
+
+## Matching consent and check-in eligibility
+
+```text
+Read active MATCHING policy for the selected member
+  -> return immutable policy identity/version/hash
+  -> return that member's latest decision for the active version, when present
+
+Grant MATCHING consent
+  -> append consent.MemberConsent against the active policy_id
+
+Read event
+  -> return active matching policy check_in_required
+  -> return member registration_status when member context is supplied
+
+Administrator check-in
+  -> require an existing REGISTERED attendee
+  -> set registration status to CHECKED_IN and checked_in_at
+  -> emit member-scoped SyncChange and EventRegistrationChanged.v1
+```
+
+`event.event_matching_policy.check_in_required` belongs to a specific matching-policy version. When false, registration may satisfy the attendance portion of eligibility. When true, `CHECKED_IN` is required before the eligibility view admits the member for matching. This rule does not gate Live Mode itself: a `REGISTERED` member may start Live Mode, but remains ineligible for matching until checked in when the policy requires it.
 
 ## Connection and chat flow
 
@@ -138,7 +160,7 @@ The implemented slice demonstrates the solution boundary and the highest-risk in
 
 ## PostgreSQL v2.4 integration
 
-The code model follows the physical `lower_snake_case` names in the database repository. Profile summary and role category map to `professional_summary` and `role_category`; consent resolves an active `consent_policy` and records its immutable `policy_id`; Live Mode stores the required consent evidence and uses `ACTIVE`, `DISABLED`, and `EXPIRED` lifecycle values.
+The code model follows the physical `lower_snake_case` names in the database repository. Profile summary and role category map to `professional_summary` and `role_category`; consent resolves an active `consent_policy` and records its immutable `policy_id`; event matching maps `check_in_required` from the active policy version; Live Mode stores the required consent evidence and uses `ACTIVE`, `DISABLED`, and `EXPIRED` lifecycle values.
 
 PostgreSQL deployments execute `social.accept_connection_request`, `chat.save_message`, and `chat.save_message_receipt` through typed Npgsql parameters. Those database-owned functions are the transaction boundary for authorization rechecks, idempotency records, participant creation, sync changes, and outbox events. The in-memory profile retains equivalent application logic for isolated tests only.
 
