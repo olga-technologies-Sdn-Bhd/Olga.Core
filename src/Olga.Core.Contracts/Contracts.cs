@@ -18,7 +18,8 @@ public sealed record MemberCreateRequest(
 public sealed record MemberRegistrationResponse(string MemberId, string? EmailHint, string? PhoneHint, string ProfileStatus, string ETag);
 public sealed record MemberLookupRequest(string? Email);
 public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
-public sealed record ProfileResponse(string MemberId, string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt);
+// display_name is null when another member reads a profile they aren't connected to.
+public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
@@ -30,10 +31,28 @@ public sealed record RegistrationResponse(string EventId, string MemberId, strin
 public sealed record LiveModeRequest(int DurationMinutes = 60);
 public sealed record LiveModeResponse(string SessionId, string EventId, string Status, DateTimeOffset ActiveUntil);
 public sealed record PresenceRequest(string CoarseCell, DateTimeOffset ObservedAt, string Source = "FOREGROUND_GEO");
-public sealed record ConnectionRequestCreate(string RecipientMemberId, int ExpiresInDays = 14, string? ContextId = null, long? MatchResultId = null, string? Note = null);
-public sealed record ConnectionRequestResponse(string RequestId, string SenderMemberId, string RecipientMemberId, string Status, DateTimeOffset ExpiresAt);
+// A Commit is a connection request with context_id = event_id: a short meeting in that room.
+// where.type: THEIR_CHOICE or SPOT (with spot_id); when: NOW, IN_10_MIN, NEXT_BREAK or AFTER_SESSION.
+public sealed record CommitPlanWhere(string Type, string? SpotId = null);
+public sealed record CommitPlan(CommitPlanWhere? Where, string? When);
+public sealed record ConnectionRequestCreate(string RecipientMemberId, int ExpiresInDays = 14, string? ContextId = null, long? MatchResultId = null, string? Note = null, CommitPlan? Plan = null);
+// commits_remaining is set for Commits only.
+public sealed record ConnectionRequestResponse(string RequestId, string SenderMemberId, string RecipientMemberId, string Status, DateTimeOffset ExpiresAt, int? CommitsRemaining = null);
 public sealed record ConnectionDecisionRequest(string Decision);
-public sealed record ConnectionResponse(string ConnectionId, string MemberId, string Status, string ConversationId);
+// display_name is the other member's name, returned once the request is accepted.
+public sealed record ConnectionResponse(string ConnectionId, string MemberId, string Status, string ConversationId, string? DisplayName = null);
+// where is the spot label, or THEIR_CHOICE.
+public sealed record CommitPlanResponse(string Where, string When, string? SpotId = null, string? EventId = null);
+public sealed record CommitEventSummary(string EventId, string Name);
+// Before Accept the sender is described only by role: never name, photo, contact details or member ID.
+public sealed record CommitSenderSummary(string? Headline, string? RoleCategory, string? Want = null, decimal? Score = null);
+public sealed record IncomingCommitResponse(string RequestId, CommitEventSummary Event, CommitPlanResponse Plan, CommitSenderSummary Sender, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt);
+// display_name and conversation_id are present only once ACCEPTED.
+public sealed record CommitRecipientSummary(string? Headline, string? RoleCategory, string? DisplayName = null);
+// status is only PENDING, ACCEPTED or EXPIRED: a decline looks like PENDING until it expires.
+public sealed record OutgoingCommitResponse(string RequestId, CommitEventSummary Event, CommitPlanResponse Plan, CommitRecipientSummary Recipient, string Status, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt, string? ConversationId = null);
+public sealed record CommitQuotaResponse(int Limit, int Used, int Remaining);
+public sealed record MeetingSpotResponse(string SpotId, string Label);
 public sealed record BlockRequest(string MemberId);
 public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null);
 // A deleted message keeps its place in the conversation with a null body and deleted_at set.
@@ -42,7 +61,8 @@ public sealed record MessageResponse(string MessageId, string ConversationId, st
 public sealed record MessageReportRequest(string Category, string? Description = null);
 public sealed record MessageReportResponse(string ReportId, string MessageId, string Category, string Status, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
-public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend, DateTimeOffset? MutedUntil = null);
+// plan is the accepted Commit's meeting plan, when the conversation came from a Commit.
+public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend, DateTimeOffset? MutedUntil = null, CommitPlanResponse? Plan = null);
 public sealed record ConversationListResponse(IReadOnlyList<ConversationResponse> Items, string? NextCursor, bool HasMore);
 // Marks every message from the other member up to and including this one as read.
 public sealed record ConversationReadRequest(string LastReadMessageId);

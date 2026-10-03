@@ -256,6 +256,24 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
+    async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
+    {
+        if (!Database.IsRelational() || matchResultIds.Length == 0) return [];
+        await using var command = CreateCommand("SELECT match_result_id, requester_id, candidate_id, final_score FROM nlp.nlp_match_result WHERE match_result_id = ANY(@ids) AND policy_status = 'ELIGIBLE'");
+        command.Parameters.Add(new NpgsqlParameter("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint) { Value = matchResultIds });
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            var scores = new List<MatchScore>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) scores.Add(new MatchScore(reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetDecimal(3)));
+            return scores;
+        }
+        // The score is optional; without read access to the NLP schema it is simply left out.
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege) { return []; }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
     async Task<MessageReceipt> ICoreStore.SaveMessageReceiptAsync(string memberId, string messageId, Contracts.MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct)
     {
         await using var command = CreateCommand("SELECT * FROM chat.save_message_receipt(@message_id, @member_id, @delivered_at, @read_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
