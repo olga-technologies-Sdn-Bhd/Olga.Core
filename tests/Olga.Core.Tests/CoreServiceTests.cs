@@ -153,7 +153,7 @@ public sealed class CoreServiceTests
         var service = Service(db);
         RegisterAccountOnly(db, "NEW"); await service.ProvisionMemberAsync("NEW", default);
 
-        var error = await Assert.ThrowsAsync<DomainException>(() => service.CreateConnectionRequestAsync("NEW", new("A"), default));
+        var error = await Assert.ThrowsAsync<DomainException>(() => service.CreateConnectionRequestAsync("NEW", new("A"), "request-key", default));
 
         Assert.Equal("PROFILE_NOT_FOUND", error.Code);
     }
@@ -188,8 +188,8 @@ public sealed class CoreServiceTests
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
         var service = Service(db);
-        var request = await service.CreateConnectionRequestAsync("A", new("B"), default);
-        var accepted = await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-1", default);
+        var request = await service.CreateConnectionRequestAsync("A", new("B"), "request-key", default);
+        var accepted = (await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-1", default))!;
         Assert.Single(db.SocialConnections); Assert.Single(db.ChatConversations); Assert.NotEmpty(accepted.ConversationId);
         var message = await service.SendMessageAsync("A", accepted.ConversationId, new("m1", "Hello"), "message-1", default);
         var replay = await service.SendMessageAsync("A", accepted.ConversationId, new("m1", "Hello"), "message-1", default);
@@ -201,8 +201,8 @@ public sealed class CoreServiceTests
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
         var service = Service(db);
-        var request = await service.CreateConnectionRequestAsync("A", new("B"), default);
-        var accepted = await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-2", default);
+        var request = await service.CreateConnectionRequestAsync("A", new("B"), "request-key", default);
+        var accepted = (await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-2", default))!;
         await service.BlockAsync("A", new("B"), default);
         Assert.Equal("DISCONNECTED", db.SocialConnections.Single().Status);
         Assert.Contains(db.MemberBlocks, x => x.BlockerMemberId == "A" && x.BlockedMemberId == "B" && x.RemovedAt == null);
@@ -214,8 +214,8 @@ public sealed class CoreServiceTests
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
         var service = Service(db);
-        var request = await service.CreateConnectionRequestAsync("A", new("B"), default);
-        var accepted = await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-3", default);
+        var request = await service.CreateConnectionRequestAsync("A", new("B"), "request-key", default);
+        var accepted = (await service.DecideConnectionRequestAsync("B", request.RequestId, new("ACCEPT"), "accept-3", default))!;
         var message = await service.SendMessageAsync("A", accepted.ConversationId, new("m1", "Hello"), "message-3", default);
         var now = DateTimeOffset.UtcNow;
         var receipt = await service.SaveMessageReceiptAsync("B", message.MessageId, new(now, now.AddSeconds(1)), "receipt-1", default);
@@ -448,10 +448,147 @@ public sealed class CoreServiceTests
         Assert.Empty(db.MemberReports); Assert.Empty(db.ModerationCases);
     }
 
+    [Fact]
+    public async Task Commit_is_sent_by_a_live_registered_member_with_a_plan_and_replays_by_key()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "Z");
+        db.EventRegistrations.Remove(db.EventRegistrations.Single(x => x.MemberId == "Z"));
+        await db.SaveChangesAsync();
+        var endsAt = db.EventRecords.Single().EndsAt;
+
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "commit-1", default);
+        var replay = await service.CreateConnectionRequestAsync("A", Commit("B"), "commit-1", default);
+
+        Assert.Equal(("PENDING", 4, endsAt), (sent.Status, sent.CommitsRemaining, sent.ExpiresAt));
+        Assert.Equal((sent.RequestId, 4), (replay.RequestId, replay.CommitsRemaining));
+        Assert.Single(db.SocialConnectionRequests);
+        await AssertCode("COMMIT_ALREADY_SENT", 409, () => service.CreateConnectionRequestAsync("A", Commit("B"), "commit-2", default));
+        await AssertCode("COMMIT_SENDER_NOT_LIVE", 403, () => service.CreateConnectionRequestAsync("B", Commit("A"), "commit-3", default));
+        await AssertCode("EVENT_REGISTRATION_REQUIRED", 403, () => service.CreateConnectionRequestAsync("A", Commit("Z"), "commit-4", default));
+        await AssertCode("PLAN_INVALID", 400, () => service.CreateConnectionRequestAsync("A", new("B", ContextId: "E", Plan: new(new("THEIR_CHOICE"), "TOMORROW")), "commit-5", default));
+        await AssertCode("PLAN_INVALID", 400, () => service.CreateConnectionRequestAsync("A", new("B", ContextId: "E"), "commit-6", default));
+        await AssertCode("MEETING_SPOT_NOT_FOUND", 404, () => service.CreateConnectionRequestAsync("A", new("B", ContextId: "E", Plan: new(new("SPOT", "bar"), "NOW")), "commit-7", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => service.CreateConnectionRequestAsync("A", new("B", ContextId: "nope", Plan: new(new("THEIR_CHOICE"), "NOW")), "commit-8", default));
+    }
+
+    [Fact]
+    public async Task Commit_to_a_blocked_member_fails_like_an_unknown_member()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        db.MemberBlocks.Add(new MemberBlock { BlockerMemberId = "B", BlockedMemberId = "A" });
+        await db.SaveChangesAsync();
+
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.CreateConnectionRequestAsync("A", Commit("B"), "commit-blocked", default));
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.CreateConnectionRequestAsync("A", Commit("nobody"), "commit-unknown", default));
+    }
+
+    [Fact]
+    public async Task Commit_limit_is_five_per_event_whatever_happened_to_them()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C1", "C2", "C3", "C4", "C5");
+        foreach (var id in new[] { "B", "C1", "C2", "C3", "C4" }) await service.CreateConnectionRequestAsync("A", Commit(id), $"limit-{id}", default);
+        var declined = db.SocialConnectionRequests.Single(x => x.RecipientMemberId == "C1");
+        await service.DecideConnectionRequestAsync("C1", declined.RequestId, new("DECLINE"), "limit-decline", default);
+
+        await AssertCode("COMMIT_LIMIT_REACHED", 409, () => service.CreateConnectionRequestAsync("A", Commit("C5"), "limit-C5", default));
+        Assert.Equal(new CommitQuotaResponse(5, 5, 0), await service.GetCommitQuotaAsync("A", "E", default));
+        Assert.Equal(new CommitQuotaResponse(5, 0, 5), await service.GetCommitQuotaAsync("B", "E", default));
+        Assert.Empty(await service.GetMeetingSpotsAsync("A", "E", default));
+    }
+
+    [Fact]
+    public async Task Incoming_commit_shows_role_only_and_a_decline_stays_invisible_to_the_sender()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B", "NEXT_BREAK"), "decline-1", default);
+
+        var incoming = Assert.Single(await service.GetIncomingCommitsAsync("B", "E", default));
+        Assert.Equal((sent.RequestId, "E", "Event", "THEIR_CHOICE", "NEXT_BREAK", "A headline", "SALES"), (incoming.RequestId, incoming.Event.EventId, incoming.Event.Name, incoming.Plan.Where, incoming.Plan.When, incoming.Sender.Headline, incoming.Sender.RoleCategory));
+        Assert.Null((await service.GetVisibleProfileAsync("B", "A", default)).DisplayName);
+        Assert.Equal("A", (await service.GetVisibleProfileAsync("A", "A", default)).DisplayName);
+        Assert.DoesNotContain(db.Changes, x => x.ResourceType == "CONNECTION_REQUEST" && x.PayloadJson!.Contains("\"A\""));
+
+        Assert.Null(await service.DecideConnectionRequestAsync("B", sent.RequestId, new("DECLINE"), "decline-2", default));
+
+        Assert.Empty(await service.GetIncomingCommitsAsync("B", null, default));
+        Assert.Equal("PENDING", Assert.Single(await service.GetOutgoingCommitsAsync("A", "E", default)).Status);
+        Assert.Equal("PENDING", (await service.CreateConnectionRequestAsync("A", Commit("B", "NEXT_BREAK"), "decline-1", default)).Status);
+        await AssertCode("COMMIT_ALREADY_SENT", 409, () => service.CreateConnectionRequestAsync("A", Commit("B"), "decline-3", default));
+        db.SocialConnectionRequests.Single().ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Equal("EXPIRED", Assert.Single(await service.GetOutgoingCommitsAsync("A", null, default)).Status);
+    }
+
+    [Fact]
+    public async Task Accepting_a_commit_reveals_names_and_pins_the_plan_on_the_conversation()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C");
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "accept-c1", default);
+        var stale = await service.CreateConnectionRequestAsync("A", Commit("C"), "accept-c2", default);
+        db.SocialConnectionRequests.Single(x => x.RequestId == stale.RequestId).ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+
+        var accepted = await service.DecideConnectionRequestAsync("B", sent.RequestId, new("ACCEPT"), "accept-c3", default);
+
+        Assert.NotNull(accepted);
+        Assert.Equal(("A", "A"), (accepted.MemberId, accepted.DisplayName));
+        var conversation = await service.GetConversationAsync("B", accepted.ConversationId, default);
+        Assert.Equal(("A", "THEIR_CHOICE", "IN_10_MIN", "E"), (conversation.DisplayName, conversation.Plan?.Where, conversation.Plan?.When, conversation.Plan?.EventId));
+        var outgoing = (await service.GetOutgoingCommitsAsync("A", "E", default)).Single(x => x.RequestId == sent.RequestId);
+        Assert.Equal(("ACCEPTED", "B", accepted.ConversationId), (outgoing.Status, outgoing.Recipient.DisplayName, outgoing.ConversationId));
+        Assert.Equal("A", (await service.GetVisibleProfileAsync("B", "A", default)).DisplayName);
+        await AssertCode("COMMIT_NOT_PENDING", 409, () => service.DecideConnectionRequestAsync("B", sent.RequestId, new("ACCEPT"), "accept-c4", default));
+        await AssertCode("COMMIT_EXPIRED", 409, () => service.DecideConnectionRequestAsync("C", stale.RequestId, new("ACCEPT"), "accept-c5", default));
+        Assert.Empty(await service.GetIncomingCommitsAsync("C", null, default));
+    }
+
+    [Fact]
+    public async Task Going_live_again_extends_the_session_onto_the_latest_consent()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var first = await service.StartLiveModeAsync("A", "E", new(30), default);
+        var latest = await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        var again = await service.StartLiveModeAsync("A", "E", new(60), default);
+
+        Assert.Equal(first.SessionId, again.SessionId);
+        Assert.Equal(latest.MemberConsentId, db.LiveModeSessions.Single().ConsentRecordId);
+    }
+
+    private static async Task<CoreService> CommitSetupAsync(CoreDbContext db, params string[] others)
+    {
+        SeedMembersAndEvent(db);
+        await db.SaveChangesAsync();
+        db.MemberProfiles.Single(x => x.MemberId == "A").Headline = "A headline";
+        db.MemberProfiles.Single(x => x.MemberId == "A").Sector = "SALES";
+        foreach (var id in others) db.MemberProfiles.Add(new MemberProfile { MemberId = id, DisplayName = id, Status = "ACTIVE" });
+        foreach (var id in new[] { "A", "B" }.Concat(others)) db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = id, Status = "REGISTERED" });
+        db.LiveModeSessions.Add(new LiveModeSession { EventId = "E", MemberId = "A", ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(30) });
+        await db.SaveChangesAsync();
+        return Service(db);
+    }
+
+    private static ConnectionRequestCreate Commit(string recipient, string when = "IN_10_MIN") => new(recipient, ContextId: "E", Plan: new(new("THEIR_CHOICE"), when));
+
+    private static async Task AssertCode(string code, int status, Func<Task> action)
+    {
+        var error = await Assert.ThrowsAsync<DomainException>(action);
+        Assert.Equal((code, status), (error.Code, error.StatusCode));
+    }
+
     private static async Task<string> ConnectAsync(CoreService service, string sender, string recipient)
     {
-        var request = await service.CreateConnectionRequestAsync(sender, new(recipient), default);
-        return (await service.DecideConnectionRequestAsync(recipient, request.RequestId, new("ACCEPT"), $"accept-{sender}-{recipient}", default)).ConversationId;
+        var request = await service.CreateConnectionRequestAsync(sender, new(recipient), "request-key", default);
+        return (await service.DecideConnectionRequestAsync(recipient, request.RequestId, new("ACCEPT"), $"accept-{sender}-{recipient}", default))!.ConversationId;
     }
 
     [Fact]

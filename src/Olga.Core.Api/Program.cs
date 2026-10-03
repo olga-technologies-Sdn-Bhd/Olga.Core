@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 using Npgsql;
@@ -155,10 +156,18 @@ memberV1.MapDelete("/events/{eventId}/live-mode", async (HttpContext c, string e
     .WithName("StopLiveMode").WithTags("Events").Produces(204);
 memberV1.MapPost("/events/{eventId}/presence", async (HttpContext c, string eventId, PresenceRequest body, ICoreService s, CancellationToken ct) => { await s.RecordPresenceAsync(Member(c), eventId, body, ct); return Results.Accepted(); })
     .WithName("RecordPresence").WithTags("Events").Produces(202);
-memberV1.MapPost("/connection-requests", async (HttpContext c, ConnectionRequestCreate body, ICoreService s, CancellationToken ct) => Results.Created("/v1/connection-requests", await s.CreateConnectionRequestAsync(Member(c), body, ct)))
+memberV1.MapPost("/connection-requests", async (HttpContext c, ConnectionRequestCreate body, ICoreService s, CancellationToken ct) => Results.Created("/v1/connection-requests", await s.CreateConnectionRequestAsync(Member(c), body, Idempotency(c), ct)))
     .WithName("CreateConnectionRequest").WithTags("Social").Produces<ConnectionRequestResponse>(201);
-memberV1.MapPatch("/connection-requests/{requestId}", async (HttpContext c, string requestId, ConnectionDecisionRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.DecideConnectionRequestAsync(Member(c), requestId, body, Idempotency(c), ct)))
-    .WithName("DecideConnectionRequest").WithTags("Social").Produces<ConnectionResponse>(200);
+memberV1.MapPatch("/connection-requests/{requestId}", async (HttpContext c, string requestId, ConnectionDecisionRequest body, ICoreService s, CancellationToken ct) => await s.DecideConnectionRequestAsync(Member(c), requestId, body, Idempotency(c), ct) is { } value ? Results.Ok(value) : Results.NoContent())
+    .WithName("DecideConnectionRequest").WithTags("Social").Produces<ConnectionResponse>(200).Produces(204);
+memberV1.MapGet("/events/{eventId}/commits/quota", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetCommitQuotaAsync(Member(c), eventId, ct)))
+    .WithName("GetCommitQuota").WithTags("Commits").Produces<CommitQuotaResponse>(200);
+memberV1.MapGet("/events/{eventId}/meeting-spots", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMeetingSpotsAsync(Member(c), eventId, ct)))
+    .WithName("ListMeetingSpots").WithTags("Commits").Produces<IReadOnlyList<MeetingSpotResponse>>(200);
+memberV1.MapGet("/me/commits/incoming", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIncomingCommitsAsync(Member(c), eventId, ct)))
+    .WithName("ListIncomingCommits").WithTags("Commits").Produces<IReadOnlyList<IncomingCommitResponse>>(200);
+memberV1.MapGet("/me/commits/outgoing", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetOutgoingCommitsAsync(Member(c), eventId, ct)))
+    .WithName("ListOutgoingCommits").WithTags("Commits").Produces<IReadOnlyList<OutgoingCommitResponse>>(200);
 memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConnectionsAsync(Member(c), ct)))
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
