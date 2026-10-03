@@ -8,6 +8,7 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberAccount> Accounts { get; }
     IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
     IQueryable<MemberConsent> Consents { get; }
@@ -230,7 +231,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        var events = store.Events.Where(x => x.Status == "PUBLISHED" || x.Status == "ACTIVE").OrderBy(x => x.StartsAt).ToArray();
+        var community = memberId is null ? null : MemberCommunity(memberId);
+        var events = store.Events.Where(x => (x.Status == "PUBLISHED" || x.Status == "ACTIVE") && (community == null || x.CommunityId == community)).OrderBy(x => x.StartsAt).ToArray();
         var eventIds = events.Select(x => x.EventId).ToArray();
         var now = DateTimeOffset.UtcNow;
 
@@ -266,7 +268,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        _ = FindEvent(eventId);
+        _ = FindEventFor(memberId, eventId);
         string[] attending = ["REGISTERED", "CHECKED_IN"];
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && attending.Contains(x.Status)))
             throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
@@ -295,7 +297,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct)
     {
-        _ = FindEvent(eventId);
+        _ = FindEventFor(memberId, eventId);
         var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId);
         if (row is null) { row = new EventRegistration { EventId = eventId, MemberId = memberId }; store.Add(row); }
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
@@ -306,13 +308,16 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct)
     {
-        var evt = FindEvent(eventId);
+        var evt = FindEventFor(memberId, eventId);
         if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
+        // Mirror event.enforce_live_mode_session_consent so callers get a specific code, not RESOURCE_STATE_CONFLICT.
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (account is not null && account.Status != "ACTIVE") throw new DomainException("MEMBER_NOT_ACTIVE", 403);
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
-        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
-        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_NOT_ENABLED", 409);
+        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_LIVE", 409);
+        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_DISABLED", 409);
         var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         // A published event becomes ACTIVE once it has started; the database only allows Live Mode
         // sessions (and matching eligibility) for ACTIVE events with an active matching policy.
@@ -341,6 +346,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct)
     {
+        _ = FindEventFor(memberId, eventId);
         if (string.IsNullOrWhiteSpace(request.CoarseCell) || request.CoarseCell.Length > 32 || request.Source is not ("CHECK_IN" or "FOREGROUND_GEO" or "VENUE_ZONE")) throw new DomainException("PRESENCE_INVALID");
         var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE" && x.ActiveUntil > DateTimeOffset.UtcNow)
             ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 403);
@@ -501,9 +507,18 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     }
 
     private MemberProfile FindProfile(string id) => store.Profiles.SingleOrDefault(x => x.MemberId == id && x.Status == "ACTIVE") ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+    // A member only sees events in their own community; others behave as unknown (the database
+    // refuses Live Mode across communities). Unknown accounts (InMemory fixtures) aren't scoped.
+    private string? MemberCommunity(string memberId) => store.Accounts.Where(x => x.MemberId == memberId).Select(x => x.CommunityId).FirstOrDefault();
+    private EventRecord FindEventFor(string memberId, string eventId)
+    {
+        var evt = FindEvent(eventId);
+        var community = MemberCommunity(memberId);
+        return community is null || evt.CommunityId == community ? evt : throw new DomainException("EVENT_NOT_FOUND", 404);
+    }
     private EventRecord FindEvent(string id) => store.Events.SingleOrDefault(x => x.EventId == id && (x.Status == "PUBLISHED" || x.Status == "ACTIVE")) ?? throw new DomainException("EVENT_NOT_FOUND", 404);
     private bool HasConsent(string memberId, string purpose) => LatestGrantedConsent(memberId, purpose) is not null;
-    private MemberConsent? LatestGrantedConsent(string memberId, string purpose) => (from consent in store.Consents join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId where consent.MemberId == memberId && policy.PurposeCode == purpose orderby consent.CapturedAt descending, consent.Id descending select consent).FirstOrDefault() is { Decision: "GRANTED", WithdrawnAt: null } value ? value : null;
+    private MemberConsent? LatestGrantedConsent(string memberId, string purpose) => (from consent in store.Consents join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId where consent.MemberId == memberId && policy.PurposeCode == purpose && policy.EffectiveFrom <= DateTimeOffset.UtcNow && policy.RetiredAt == null orderby consent.CapturedAt descending, consent.Id descending select consent).FirstOrDefault() is { Decision: "GRANTED", WithdrawnAt: null } value ? value : null;
     private bool IsBlocked(string a, string b) => store.Blocks.Any(x => x.RemovedAt == null && ((x.BlockerMemberId == a && x.BlockedMemberId == b) || (x.BlockerMemberId == b && x.BlockedMemberId == a)));
     private bool IsConnected(string a, string b) { var p = Pair(a, b); return store.Connections.Any(x => x.MemberLowId == p.Low && x.MemberHighId == p.High && x.Status == "ACTIVE"); }
     private Connection RequireConversationMember(string memberId, string conversationId) { var c = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404); var link = store.Connections.Single(x => x.ConnectionId == c.ConnectionId); return link.Status == "ACTIVE" && (link.MemberLowId == memberId || link.MemberHighId == memberId) ? link : throw new DomainException("CONVERSATION_FORBIDDEN", 403); }
