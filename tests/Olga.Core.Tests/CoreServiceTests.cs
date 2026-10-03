@@ -298,6 +298,73 @@ public sealed class CoreServiceTests
         Assert.Equal(("CONVERSATION_NOT_FOUND", 404), (missing.Code, missing.StatusCode));
     }
 
+    [Fact]
+    public async Task Marking_a_conversation_read_clears_unread_up_to_the_given_message_and_is_retry_safe()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("r1", "One"), "read-m1", default);
+        var second = await service.SendMessageAsync("A", conversationId, new("r2", "Two"), "read-m2", default);
+        await service.SendMessageAsync("B", conversationId, new("r3", "Mine"), "read-m3", default);
+        await service.SendMessageAsync("A", conversationId, new("r4", "Three"), "read-m4", default);
+
+        var partial = await service.MarkConversationReadAsync("B", conversationId, new(second.MessageId), "read-1", default);
+        var replay = await service.MarkConversationReadAsync("B", conversationId, new(second.MessageId), "read-1", default);
+        var all = await service.MarkConversationReadAsync("B", conversationId, new("r4"), "read-2", default);
+
+        Assert.Equal((1, 1, 0), (partial.UnreadCount, replay.UnreadCount, all.UnreadCount));
+        Assert.Equal(3, db.MessageReceipts.Count(x => x.MemberId == "B" && x.ReadAt != null));
+        Assert.Equal("r4", db.ConversationParticipants.Single(x => x.MemberId == "B").LastReadMessageId);
+        Assert.Equal(1, (await service.GetConversationAsync("A", conversationId, default)).UnreadCount);
+    }
+
+    [Fact]
+    public async Task Marking_read_rejects_unknown_messages_outsiders_and_blank_input()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("x1", "Hi"), "read-x1", default);
+
+        var unknown = await Assert.ThrowsAsync<DomainException>(() => service.MarkConversationReadAsync("B", conversationId, new("nope"), "read-x", default));
+        var outsider = await Assert.ThrowsAsync<DomainException>(() => service.MarkConversationReadAsync("C", conversationId, new("x1"), "read-y", default));
+        var blank = await Assert.ThrowsAsync<DomainException>(() => service.MarkConversationReadAsync("B", conversationId, new(" "), "read-z", default));
+
+        Assert.Equal(("MESSAGE_NOT_FOUND", 404), (unknown.Code, unknown.StatusCode));
+        Assert.Equal(("CONVERSATION_FORBIDDEN", 403), (outsider.Code, outsider.StatusCode));
+        Assert.Equal(("CONVERSATION_READ_INVALID", 400), (blank.Code, blank.StatusCode));
+    }
+
+    [Fact]
+    public async Task Muting_is_per_member_reported_until_it_expires_and_can_be_cleared()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        var until = DateTimeOffset.UtcNow.AddHours(8);
+
+        var muted = await service.MuteConversationAsync("A", conversationId, new(until), default);
+        var otherSide = await service.GetConversationAsync("B", conversationId, default);
+        Assert.Equal(until, muted.MutedUntil);
+        Assert.Null(otherSide.MutedUntil);
+        Assert.Contains(db.Changes,x => x.MemberScopeId == "A" && x.ResourceType == "CONVERSATION" && x.ResourceId == conversationId);
+
+        db.ConversationParticipants.Single(x => x.MemberId == "A").MutedUntil = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Null((await service.GetConversationAsync("A", conversationId, default)).MutedUntil);
+
+        await service.MuteConversationAsync("A", conversationId, new(until), default);
+        var cleared = await service.MuteConversationAsync("A", conversationId, new(null), default);
+        Assert.Null(cleared.MutedUntil);
+        Assert.Null(db.ConversationParticipants.Single(x => x.MemberId == "A").MutedUntil);
+
+        var past = await Assert.ThrowsAsync<DomainException>(() => service.MuteConversationAsync("A", conversationId, new(DateTimeOffset.UtcNow.AddMinutes(-5)), default));
+        Assert.Equal(("CONVERSATION_MUTE_INVALID", 400), (past.Code, past.StatusCode));
+    }
+
     private static async Task<string> ConnectAsync(CoreService service, string sender, string recipient)
     {
         var request = await service.CreateConnectionRequestAsync(sender, new(recipient), default);
