@@ -395,7 +395,7 @@ public sealed class CoreServiceTests
 
         var notStarted = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "E", new(30), default));
 
-        Assert.Equal(("EVENT_NOT_ACTIVE", 409), (notStarted.Code, notStarted.StatusCode));
+        Assert.Equal(("EVENT_NOT_LIVE", 409), (notStarted.Code, notStarted.StatusCode));
         Assert.Equal("PUBLISHED", db.EventRecords.Single(x => x.EventId == "E").Status);
         Assert.Empty(db.EventMatchingPolicies);
     }
@@ -564,6 +564,71 @@ public sealed class CoreServiceTests
         await Service(db).RegisterAsync("A", "E", default);
 
         Assert.Equal("E:A", Assert.Single(db.OutboxEvents.Where(x => x.AggregateType == "EVENT_REGISTRATION")).AggregateId);
+    }
+
+    [Fact]
+    public async Task Member_event_routes_only_see_events_in_the_member_community()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        db.MemberAccounts.Add(new MemberAccount { MemberId = "A", CommunityId = "olga" });
+        db.EventRecords.Single(x => x.EventId == "E").CommunityId = "olga";
+        db.EventRecords.Add(new EventRecord { EventId = "F", CommunityId = "other", Name = "Other", StartsAt = DateTimeOffset.UtcNow.AddHours(-1), EndsAt = DateTimeOffset.UtcNow.AddDays(1), LiveModeEnabled = true });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+
+        var listed = await service.GetEventsAsync("A", default);
+        var register = await Assert.ThrowsAsync<DomainException>(() => service.RegisterAsync("A", "F", default));
+        var attendees = await Assert.ThrowsAsync<DomainException>(() => service.GetEventAttendeesAsync("A", "F", default));
+        var live = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "F", new(30), default));
+        var presence = await Assert.ThrowsAsync<DomainException>(() => service.RecordPresenceAsync("A", "F", new("hall-a", DateTimeOffset.UtcNow), default));
+
+        Assert.Equal("E", Assert.Single(listed).EventId);
+        Assert.Equal(2, (await service.GetEventsAsync(null, default)).Count);
+        Assert.All(new[] { register, attendees, live, presence }, e => Assert.Equal(("EVENT_NOT_FOUND", 404), (e.Code, e.StatusCode)));
+    }
+
+    [Fact]
+    public async Task Live_mode_returns_specific_codes_before_reaching_the_database_rule()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        db.MemberAccounts.AddRange(new MemberAccount { MemberId = "A", CommunityId = "olga" }, new MemberAccount { MemberId = "B", CommunityId = "olga", Status = "SUSPENDED" });
+        var evt = db.EventRecords.Single(x => x.EventId == "E"); evt.CommunityId = "olga";
+        db.EventRecords.Add(new EventRecord { EventId = "OFF", CommunityId = "olga", Name = "No live", StartsAt = DateTimeOffset.UtcNow.AddHours(-1), EndsAt = DateTimeOffset.UtcNow.AddDays(1), LiveModeEnabled = false });
+        db.EventRecords.Add(new EventRecord { EventId = "LATER", CommunityId = "olga", Name = "Later", StartsAt = DateTimeOffset.UtcNow.AddDays(1), EndsAt = DateTimeOffset.UtcNow.AddDays(2), LiveModeEnabled = true });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        foreach (var e in new[] { "E", "OFF", "LATER" }) { await service.RegisterAsync("A", e, default); await service.RegisterAsync("B", e, default); }
+
+        var noConsent = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "E", new(30), default));
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        await service.RecordConsentAsync("B", new("LIVE_MODE", "1", "GRANTED"), default);
+        var disabled = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "OFF", new(30), default));
+        var notLive = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "LATER", new(30), default));
+        var suspended = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("B", "E", new(30), default));
+        db.ConsentPolicies.Single(x => x.PolicyId == "live-mode-v1").RetiredAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        var retired = await Assert.ThrowsAsync<DomainException>(() => service.StartLiveModeAsync("A", "E", new(30), default));
+
+        Assert.Equal(("LIVE_MODE_CONSENT_REQUIRED", 403), (noConsent.Code, noConsent.StatusCode));
+        Assert.Equal(("LIVE_MODE_DISABLED", 409), (disabled.Code, disabled.StatusCode));
+        Assert.Equal(("EVENT_NOT_LIVE", 409), (notLive.Code, notLive.StatusCode));
+        Assert.Equal(("MEMBER_NOT_ACTIVE", 403), (suspended.Code, suspended.StatusCode));
+        Assert.Equal(("LIVE_MODE_CONSENT_REQUIRED", 403), (retired.Code, retired.StatusCode));
+    }
+
+    [Fact]
+    public async Task Live_mode_session_is_clamped_to_the_event_end()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var evt = db.EventRecords.Single(x => x.EventId == "E"); evt.EndsAt = DateTimeOffset.UtcNow.AddMinutes(20);
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterAsync("A", "E", default);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        var session = await service.StartLiveModeAsync("A", "E", new(240), default);
+
+        Assert.True(session.ActiveUntil <= evt.EndsAt);
     }
 
     private static void SeedMembersAndEvent(CoreDbContext db)

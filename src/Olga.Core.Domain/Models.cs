@@ -1,5 +1,13 @@
 namespace Olga.Core.Domain;
 
+// iam.member: the account row the database checks for community and status.
+public sealed class MemberAccount
+{
+    public string MemberId { get; set; } = "";
+    public string CommunityId { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+}
+
 public sealed class MemberProfile
 {
     public string MemberId { get; set; } = "";
