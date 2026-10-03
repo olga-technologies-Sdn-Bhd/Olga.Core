@@ -50,6 +50,7 @@ public interface ICoreService
     // memberId is optional: when supplied, each event carries is_registered for that member.
     Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
+    Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
     Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct);
@@ -246,6 +247,36 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0), registeredEventIds?.Contains(x.EventId)))
             .ToArray();
         return Task.FromResult(result);
+    }
+
+    public Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = FindEvent(eventId);
+        string[] attending = ["REGISTERED", "CHECKED_IN"];
+        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && attending.Contains(x.Status)))
+            throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+
+        var registrations = store.Registrations
+            .Where(x => x.EventId == eventId && x.MemberId != memberId && attending.Contains(x.Status))
+            .OrderBy(x => x.RegisteredAt)
+            .Select(x => new { x.MemberId, x.RegisteredAt })
+            .ToList();
+        var ids = registrations.Select(x => x.MemberId).ToArray();
+        var blocked = store.Blocks
+            .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
+            .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
+            .ToHashSet();
+        var profiles = store.Profiles
+            .Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN")
+            .ToDictionary(x => x.MemberId);
+
+        var visible = registrations
+            .Where(x => !blocked.Contains(x.MemberId) && profiles.ContainsKey(x.MemberId))
+            .Select(x => profiles[x.MemberId])
+            .Select(p => new EventAttendeeResponse(p.MemberId, p.Headline, p.Sector))
+            .ToList();
+        return Task.FromResult(new EventAttendeesResponse(visible.Take(50).ToArray(), visible.Count));
     }
 
     public async Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct)

@@ -400,6 +400,73 @@ public sealed class CoreServiceTests
         Assert.Empty(db.EventMatchingPolicies);
     }
 
+    [Fact]
+    public async Task Event_attendees_are_blinded_ordered_and_exclude_caller_blocked_hidden_and_inactive_members()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        var t0 = DateTimeOffset.UtcNow.AddHours(-3);
+        db.MemberProfiles.AddRange(
+            new MemberProfile { MemberId = "C", DisplayName = "Carol", Headline = "Investor", Sector = "INVESTOR", Status = "ACTIVE" },
+            new MemberProfile { MemberId = "H", DisplayName = "Hidden", Status = "ACTIVE", Visibility = "HIDDEN" },
+            new MemberProfile { MemberId = "D", DisplayName = "Draft", Status = "DRAFT" },
+            new MemberProfile { MemberId = "X", DisplayName = "Blocked by A", Status = "ACTIVE" },
+            new MemberProfile { MemberId = "Y", DisplayName = "Blocked A", Status = "ACTIVE" },
+            new MemberProfile { MemberId = "Z", DisplayName = "Cancelled", Status = "ACTIVE" });
+        db.EventRegistrations.AddRange(
+            new EventRegistration { EventId = "E", MemberId = "A", RegisteredAt = t0 },
+            new EventRegistration { EventId = "E", MemberId = "C", Status = "CHECKED_IN", RegisteredAt = t0.AddMinutes(1) },
+            new EventRegistration { EventId = "E", MemberId = "B", RegisteredAt = t0.AddMinutes(2) },
+            new EventRegistration { EventId = "E", MemberId = "H", RegisteredAt = t0.AddMinutes(3) },
+            new EventRegistration { EventId = "E", MemberId = "D", RegisteredAt = t0.AddMinutes(4) },
+            new EventRegistration { EventId = "E", MemberId = "X", RegisteredAt = t0.AddMinutes(5) },
+            new EventRegistration { EventId = "E", MemberId = "Y", RegisteredAt = t0.AddMinutes(6) },
+            new EventRegistration { EventId = "E", MemberId = "Z", Status = "CANCELLED", RegisteredAt = t0.AddMinutes(7) });
+        db.MemberBlocks.AddRange(
+            new MemberBlock { BlockerMemberId = "A", BlockedMemberId = "X" },
+            new MemberBlock { BlockerMemberId = "Y", BlockedMemberId = "A" });
+        await db.SaveChangesAsync();
+
+        var result = await Service(db).GetEventAttendeesAsync("A", "E", default);
+
+        Assert.Equal(new[] { "C", "B" }, result.Attendees.Select(x => x.MemberId));
+        Assert.Equal(2, result.Total);
+        Assert.Equal(("Investor", "INVESTOR"), (result.Attendees[0].Headline, result.Attendees[0].RoleCategory));
+    }
+
+    [Fact]
+    public async Task Event_attendees_require_the_caller_registration_and_a_known_event()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "B" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+
+        var notRegistered = await Assert.ThrowsAsync<DomainException>(() => service.GetEventAttendeesAsync("A", "E", default));
+        var unknown = await Assert.ThrowsAsync<DomainException>(() => service.GetEventAttendeesAsync("A", "missing", default));
+
+        Assert.Equal(("EVENT_REGISTRATION_REQUIRED", 403), (notRegistered.Code, notRegistered.StatusCode));
+        Assert.Equal(("EVENT_NOT_FOUND", 404), (unknown.Code, unknown.StatusCode));
+    }
+
+    [Fact]
+    public async Task Event_attendees_are_capped_at_fifty_with_the_full_total()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A" });
+        for (var i = 0; i < 55; i++)
+        {
+            db.MemberProfiles.Add(new MemberProfile { MemberId = $"M{i:00}", DisplayName = $"M{i}", Status = "ACTIVE" });
+            db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = $"M{i:00}", RegisteredAt = DateTimeOffset.UtcNow.AddMinutes(-100 + i) });
+        }
+        await db.SaveChangesAsync();
+
+        var result = await Service(db).GetEventAttendeesAsync("A", "E", default);
+
+        Assert.Equal(50, result.Attendees.Count);
+        Assert.Equal(55, result.Total);
+        Assert.Equal("M00", result.Attendees[0].MemberId);
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

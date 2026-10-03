@@ -143,6 +143,8 @@ memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICor
 v1.MapGet("/events", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(OptionalMember(c), ct)))
     .WithMetadata(new OptionalMemberContextMetadata())
     .WithName("ListEvents").WithTags("Events").Produces<IReadOnlyList<EventResponse>>(200);
+memberV1.MapGet("/events/{eventId}/attendees", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventAttendeesAsync(Member(c), eventId, ct)))
+    .WithName("GetEventAttendees").WithTags("Events").Produces<EventAttendeesResponse>(200);
 memberV1.MapPost("/events/{eventId}/register", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.RegisterAsync(Member(c), eventId, ct)))
     .WithName("RegisterForEvent").WithTags("Events").Produces<RegistrationResponse>(200);
 memberV1.MapPost("/events/{eventId}/live-mode", async (HttpContext c, string eventId, LiveModeRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.StartLiveModeAsync(Member(c), eventId, body, ct)))
