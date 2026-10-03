@@ -14,6 +14,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 {
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
+    public DbSet<MemberAccount> MemberAccounts => Set<MemberAccount>();
     public DbSet<MemberIdentity> MemberIdentities => Set<MemberIdentity>();
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
     public DbSet<MemberConsent> MemberConsents => Set<MemberConsent>();
@@ -37,6 +38,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<OutboxEvent> OutboxEvents => Set<OutboxEvent>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
+    IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
     IQueryable<MemberIdentity> ICoreStore.Identities => MemberIdentities;
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
     IQueryable<MemberConsent> ICoreStore.Consents => MemberConsents;
@@ -83,6 +85,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         if (!Database.IsRelational())
         {
             if (await MemberProfiles.AnyAsync(x => x.MemberId == member.MemberId, ct)) return;
+            MemberAccounts.Add(new MemberAccount { MemberId = member.MemberId, CommunityId = member.CommunityId, Status = "ACTIVE" });
             // Mirrors ux_member_identity_provider_subject_hash so local runs reject a taken email/phone like PostgreSQL does.
             foreach (var identity in member.Identities)
             {
@@ -288,6 +291,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     protected override void OnModelCreating(ModelBuilder model)
     {
+        model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
         model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
