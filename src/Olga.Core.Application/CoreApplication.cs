@@ -168,7 +168,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     {
         ct.ThrowIfCancellationRequested();
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
-        return Task.FromResult(Map(profile));
+        return Task.FromResult(WithContactHints(Map(profile)));
     }
 
     public Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct)
@@ -214,7 +214,22 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddChange(memberId, "PROFILE", memberId, "UPSERT", new { profile.DisplayName, profile.Headline, professional_summary = profile.Biography, role_category = profile.Sector, profile.Visibility, profile.Version });
         AddOutbox("MEMBER", memberId, "MemberProfileChanged.v1", new { member_id = memberId, profile.Version });
         await store.SaveAsync(ct);
-        return Map(profile);
+        return WithContactHints(Map(profile));
+    }
+
+    // Own-profile routes only: adds the masked hints stored at registration. Never call this for another member's profile.
+    private ProfileResponse WithContactHints(ProfileResponse profile)
+    {
+        var hints = store.Identities
+            .Where(x => x.MemberId == profile.MemberId && x.Status == "ACTIVE" && x.DisplayHint != null)
+            .OrderByDescending(x => x.IsPrimary)
+            .Select(x => new { x.Provider, x.DisplayHint })
+            .ToList();
+        return profile with
+        {
+            EmailHint = hints.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
+            PhoneHint = hints.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint
+        };
     }
 
     public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct)
