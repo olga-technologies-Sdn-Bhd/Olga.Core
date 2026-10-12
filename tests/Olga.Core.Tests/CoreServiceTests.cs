@@ -85,6 +85,53 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Own_profile_returns_the_masked_contact_hints_from_registration()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "Member@Example.com", "+919876543210"), "register-1", default);
+
+        var own = await service.GetOwnProfileAsync(registered.MemberId, default);
+        var updated = await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), own.ETag, default);
+
+        Assert.Equal("m***@example.com", own.EmailHint);
+        Assert.Equal("*********3210", own.PhoneHint);
+        Assert.Equal((registered.EmailHint, registered.PhoneHint), (own.EmailHint, own.PhoneHint));
+        Assert.Equal((own.EmailHint, own.PhoneHint), (updated.EmailHint, updated.PhoneHint));
+    }
+
+    [Fact]
+    public async Task Own_profile_has_no_phone_hint_when_the_member_has_no_phone()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com"), "register-1", default);
+
+        var own = await service.GetOwnProfileAsync(registered.MemberId, default);
+
+        Assert.Equal("m***@example.com", own.EmailHint);
+        Assert.Null(own.PhoneHint);
+    }
+
+    [Fact]
+    public async Task Member_profile_route_never_returns_contact_hints()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com", "+919876543210"), "register-1", default);
+        var other = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Other member", "other@example.com"), "register-2", default);
+        await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), "\"1\"", default);
+
+        var seenByOther = await service.GetVisibleProfileAsync(other.MemberId, registered.MemberId, default);
+        var seenBySelf = await service.GetVisibleProfileAsync(registered.MemberId, registered.MemberId, default);
+
+        Assert.Null(seenByOther.EmailHint);
+        Assert.Null(seenByOther.PhoneHint);
+        Assert.Null(seenBySelf.EmailHint);
+        Assert.Null(seenBySelf.PhoneHint);
+    }
+
+    [Fact]
     public async Task First_member_request_provisions_private_draft_idempotently()
     {
         await using var db = Db();
