@@ -8,8 +8,8 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 
 - Atomic member registration with encrypted email/phone identities and a private draft profile.
 - Profile reads and optimistic-concurrency updates with ETags.
-- Append-only consent decisions, including immediate Live Mode revocation.
-- Event listing, registration, bounded Live Mode, and expiring coarse presence.
+- Active consent-policy discovery and append-only consent decisions, including immediate Live Mode revocation.
+- Event listing, registration, attendee check-in, configurable matching eligibility, bounded Live Mode, and expiring coarse presence.
 - Connection request, acceptance, canonical connection, conversation creation, and blocking.
 - Idempotent client message IDs and server message ordering.
 - Notification preferences, privacy-request initiation, and authorization-filtered sync changes.
@@ -102,14 +102,39 @@ After profile activation, the client can use the following operations:
 
 | Operation | Purpose and prerequisite |
 | --- | --- |
+| `GET /v1/consent-policies/{purposeCode}` | Read the active policy metadata and the selected member's current decision for that policy version. |
 | `POST /v1/me/consents` | Record a decision against an active consent-policy version. |
-| `GET /v1/events` | List published or active events. No member header is required. |
+| `GET /v1/events` | List published or active events. Supply `X-Member-Id` to include member registration state. |
 | `POST /v1/events/{eventId}/register` | Register the selected member for an event. |
 | `POST /v1/events/{eventId}/live-mode` | Start Live Mode after event registration and Live Mode consent. |
 | `POST /v1/connection-requests` | Create a request from an active, visible profile. |
 | `GET /v1/connections` | List the selected member's active connections. |
 | `GET/POST /v1/conversations/{conversationId}/messages` | Read or send messages after an active connection creates the conversation. |
 | `GET /v1/sync/changes` | Read authorization-scoped mobile changes using the opaque cursor. |
+
+## Matching consent and event check-in
+
+The member UI reads `GET /v1/consent-policies/MATCHING` before requesting matching consent. The response identifies the exact active policy with `policy_id`, `version`, `locale`, `content_hash`, and `effective_from`, and includes `current_decision` and `decision_captured_at` when the selected member has responded to that version. Nullable member-decision fields are omitted until a decision exists. Core stores the policy content hash, not display text, so the client must use versioned localized copy that corresponds to the returned policy metadata.
+
+Record the member's decision through `POST /v1/me/consents` using the returned version:
+
+```json
+{
+  "purpose_code": "MATCHING",
+  "policy_version": "1",
+  "decision": "GRANTED",
+  "capture_channel": "MOBILE"
+}
+```
+
+When `GET /v1/events` receives `X-Member-Id`, each event includes `is_registered` and, for an attending member, `registration_status` (`REGISTERED` or `CHECKED_IN`). Every event also includes `check_in_required` from its active matching-policy version:
+
+- `false`: an event registration can satisfy the registration portion of matching eligibility without physical check-in.
+- `true`: matching eligibility requires the registration to be `CHECKED_IN`.
+
+`check_in_required` does not prevent a registered member from starting Live Mode. The NLP eligibility view combines the active matching policy, registration/check-in state, Live Mode, matching consent, and other Core-owned eligibility rules before returning candidates.
+
+Administrators configure the active event matching policy with `PUT /v1/admin/events/{eventId}/matching-policy` and body `{ "check_in_required": true }` or `{ "check_in_required": false }`. Administrators check in a registered attendee with `POST /v1/admin/events/{eventId}/attendees/{memberId}/check-in`. Check-in is idempotent, returns `checked_in_at`, and publishes the member sync/outbox change. Both mutations require `Idempotency-Key`.
 
 ## Identity protection configuration
 
@@ -131,8 +156,9 @@ The UI or other calling client generates `Idempotency-Key`; identity/onboarding 
 
 ## Endpoint groups
 
-- Member, profile, and consent: `POST /v1/members`, `GET/PATCH /v1/me/profile`, `GET /v1/members/{memberId}`, `POST /v1/me/consents`
+- Member, profile, and consent: `POST /v1/members`, `GET/PATCH /v1/me/profile`, `GET /v1/members/{memberId}`, `GET /v1/consent-policies/{purposeCode}`, `POST /v1/me/consents`
 - Events: `GET /v1/events`, `POST /v1/events/{id}/register`, `POST/DELETE /v1/events/{id}/live-mode`, `POST /v1/events/{id}/presence`
+- Admin event matching and attendance: `PUT /v1/admin/events/{id}/matching-policy`, `GET /v1/admin/events/{id}/attendees`, `POST /v1/admin/events/{id}/attendees/{memberId}/check-in`
 - Social: `POST/PATCH /v1/connection-requests`, `GET /v1/connections`, `POST /v1/members/block`
 - Chat: `GET/POST /v1/conversations/{id}/messages`
 - Preferences and privacy: `PATCH /v1/me/notification-preferences`, `POST /v1/me/privacy-requests`

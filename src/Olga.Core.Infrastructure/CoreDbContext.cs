@@ -14,6 +14,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 {
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
+    public DbSet<MemberAccount> MemberAccounts => Set<MemberAccount>();
     public DbSet<MemberIdentity> MemberIdentities => Set<MemberIdentity>();
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
     public DbSet<MemberConsent> MemberConsents => Set<MemberConsent>();
@@ -34,9 +35,11 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<PrivacyRequest> MemberPrivacyRequests => Set<PrivacyRequest>();
     public DbSet<SyncChange> Changes => Set<SyncChange>();
     public DbSet<ModerationCase> ModerationCases => Set<ModerationCase>();
+    public DbSet<MemberReport> MemberReports => Set<MemberReport>();
     public DbSet<OutboxEvent> OutboxEvents => Set<OutboxEvent>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
+    IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
     IQueryable<MemberIdentity> ICoreStore.Identities => MemberIdentities;
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
     IQueryable<MemberConsent> ICoreStore.Consents => MemberConsents;
@@ -57,6 +60,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<PrivacyRequest> ICoreStore.PrivacyRequests => MemberPrivacyRequests;
     IQueryable<SyncChange> ICoreStore.SyncChanges => Changes;
     IQueryable<ModerationCase> ICoreStore.ModerationCases => ModerationCases;
+    IQueryable<MemberReport> ICoreStore.MemberReports => MemberReports;
 
     void ICoreStore.Add<T>(T entity) => Set<T>().Add(entity);
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
@@ -83,6 +87,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         if (!Database.IsRelational())
         {
             if (await MemberProfiles.AnyAsync(x => x.MemberId == member.MemberId, ct)) return;
+            MemberAccounts.Add(new MemberAccount { MemberId = member.MemberId, CommunityId = member.CommunityId, Status = "ACTIVE" });
             // Mirrors ux_member_identity_provider_subject_hash so local runs reject a taken email/phone like PostgreSQL does.
             foreach (var identity in member.Identities)
             {
@@ -183,7 +188,10 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     {
         if (!Database.IsRelational())
         {
+            // Mirror PostgreSQL: a registered member (identity row, standing in for iam.member) without a
+            // profile gets the private draft; an unknown ID fails like fk_member_profile_member_id.
             if (await MemberProfiles.AnyAsync(x => x.MemberId == memberId, ct)) return;
+            if (!await MemberIdentities.AnyAsync(x => x.MemberId == memberId, ct)) throw new DomainException("MEMBER_NOT_REGISTERED", 404);
             MemberProfiles.Add(new MemberProfile { MemberId = memberId, Status = "DRAFT", Visibility = "HIDDEN" });
             await SaveChangesAsync(ct);
             return;
@@ -248,6 +256,24 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
+    async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
+    {
+        if (!Database.IsRelational() || matchResultIds.Length == 0) return [];
+        await using var command = CreateCommand("SELECT match_result_id, requester_id, candidate_id, final_score FROM nlp.nlp_match_result WHERE match_result_id = ANY(@ids) AND policy_status = 'ELIGIBLE'");
+        command.Parameters.Add(new NpgsqlParameter("ids", NpgsqlDbType.Array | NpgsqlDbType.Bigint) { Value = matchResultIds });
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            var scores = new List<MatchScore>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) scores.Add(new MatchScore(reader.GetInt64(0), reader.GetString(1), reader.GetString(2), reader.GetDecimal(3)));
+            return scores;
+        }
+        // The score is optional; without read access to the NLP schema it is simply left out.
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege) { return []; }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
     async Task<MessageReceipt> ICoreStore.SaveMessageReceiptAsync(string memberId, string messageId, Contracts.MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct)
     {
         await using var command = CreateCommand("SELECT * FROM chat.save_message_receipt(@message_id, @member_id, @delivered_at, @read_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
@@ -288,11 +314,12 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     protected override void OnModelCreating(ModelBuilder model)
     {
+        model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
         model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });
-        model.Entity<EventMatchingPolicy>(e => { e.ToTable("event_matching_policy", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_matching_policy_id").UseIdentityByDefaultColumn(); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.EventId, x.Status }); });
+        model.Entity<EventMatchingPolicy>(e => { e.ToTable("event_matching_policy", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_matching_policy_id").UseIdentityByDefaultColumn(); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); e.Property(x => x.CheckInRequired).HasColumnName("check_in_required"); e.HasIndex(x => new { x.EventId, x.Status }); });
         model.Entity<EventRecord>(e => { e.ToTable("event", "event"); e.HasKey(x => x.EventId); e.Property(x => x.EventId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(250); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.CommunityId, x.Status, x.StartsAt }); });
         model.Entity<Venue>(e => { e.ToTable("venue", "event"); e.HasKey(x => x.VenueId); e.Property(x => x.VenueId).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(200); e.Property(x => x.City).HasMaxLength(120); e.Property(x => x.Region).HasMaxLength(120); e.Property(x => x.CountryCode).HasColumnType("character(2)").IsFixedLength(); e.Property(x => x.TimezoneId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<EventRegistration>(e => { e.ToTable("event_registration", "event"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("event_registration_id").UseIdentityByDefaultColumn(); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.EventId, x.MemberId }).IsUnique(); });
@@ -307,6 +334,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<MessageReceipt>(e => { e.ToTable("message_receipt", "chat"); e.HasKey(x => new { x.MessageId, x.MemberId }); });
         model.Entity<NotificationPreference>(e => { e.ToTable("notification_preference", "notification"); e.HasKey(x => new { x.MemberId, x.PurposeCode }); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<ModerationCase>(e => { e.ToTable("moderation_case", "moderation"); e.HasKey(x => x.ModerationCaseId); e.Property(x => x.ModerationCaseId).HasMaxLength(64); e.Property(x => x.SourceType).HasMaxLength(32); e.Property(x => x.SourceId).HasMaxLength(64); e.Property(x => x.SubjectMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Priority).HasMaxLength(16); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.AssignedTo).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); });
+        model.Entity<MemberReport>(e => { e.ToTable("member_report", "social"); e.HasKey(x => x.ReportId); e.Property(x => x.ReportId).HasMaxLength(64); e.Property(x => x.ReporterMemberId).HasMaxLength(64); e.Property(x => x.ReportedMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Category).HasMaxLength(64); e.Property(x => x.Description).HasMaxLength(2000); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<SyncChange>(e => { e.ToTable("sync_change", "ops"); e.HasKey(x => x.SyncSequence); e.Property(x => x.SyncSequence).ValueGeneratedOnAdd(); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberScopeId, x.SyncSequence }); });
         model.Entity<OutboxEvent>(e => { e.ToTable("outbox_event", "ops"); e.HasKey(x => x.OutboxEventId); e.Property(x => x.OutboxEventId).HasMaxLength(64); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.PublishedAt, x.OccurredAt }); });

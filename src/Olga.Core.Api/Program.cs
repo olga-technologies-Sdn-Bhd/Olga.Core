@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 using Npgsql;
@@ -140,9 +141,13 @@ memberV1.MapGet("/members/{memberId}", async (HttpContext c, string memberId, IC
     .WithName("GetMemberProfile").WithTags("Members").Produces<ProfileResponse>(200);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
+memberV1.MapGet("/consent-policies/{purposeCode}", async (HttpContext c, string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(Member(c), purposeCode, ct)))
+    .WithName("GetActiveConsentPolicy").WithTags("Members").Produces<ActiveConsentPolicyResponse>(200);
 v1.MapGet("/events", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(OptionalMember(c), ct)))
     .WithMetadata(new OptionalMemberContextMetadata())
     .WithName("ListEvents").WithTags("Events").Produces<IReadOnlyList<EventResponse>>(200);
+memberV1.MapGet("/events/{eventId}/attendees", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetEventAttendeesAsync(Member(c), eventId, ct)))
+    .WithName("GetEventAttendees").WithTags("Events").Produces<EventAttendeesResponse>(200);
 memberV1.MapPost("/events/{eventId}/register", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.RegisterAsync(Member(c), eventId, ct)))
     .WithName("RegisterForEvent").WithTags("Events").Produces<RegistrationResponse>(200);
 memberV1.MapPost("/events/{eventId}/live-mode", async (HttpContext c, string eventId, LiveModeRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.StartLiveModeAsync(Member(c), eventId, body, ct)))
@@ -151,20 +156,40 @@ memberV1.MapDelete("/events/{eventId}/live-mode", async (HttpContext c, string e
     .WithName("StopLiveMode").WithTags("Events").Produces(204);
 memberV1.MapPost("/events/{eventId}/presence", async (HttpContext c, string eventId, PresenceRequest body, ICoreService s, CancellationToken ct) => { await s.RecordPresenceAsync(Member(c), eventId, body, ct); return Results.Accepted(); })
     .WithName("RecordPresence").WithTags("Events").Produces(202);
-memberV1.MapPost("/connection-requests", async (HttpContext c, ConnectionRequestCreate body, ICoreService s, CancellationToken ct) => Results.Created("/v1/connection-requests", await s.CreateConnectionRequestAsync(Member(c), body, ct)))
+memberV1.MapPost("/connection-requests", async (HttpContext c, ConnectionRequestCreate body, ICoreService s, CancellationToken ct) => Results.Created("/v1/connection-requests", await s.CreateConnectionRequestAsync(Member(c), body, Idempotency(c), ct)))
     .WithName("CreateConnectionRequest").WithTags("Social").Produces<ConnectionRequestResponse>(201);
-memberV1.MapPatch("/connection-requests/{requestId}", async (HttpContext c, string requestId, ConnectionDecisionRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.DecideConnectionRequestAsync(Member(c), requestId, body, Idempotency(c), ct)))
-    .WithName("DecideConnectionRequest").WithTags("Social").Produces<ConnectionResponse>(200);
+memberV1.MapPatch("/connection-requests/{requestId}", async (HttpContext c, string requestId, ConnectionDecisionRequest body, ICoreService s, CancellationToken ct) => await s.DecideConnectionRequestAsync(Member(c), requestId, body, Idempotency(c), ct) is { } value ? Results.Ok(value) : Results.NoContent())
+    .WithName("DecideConnectionRequest").WithTags("Social").Produces<ConnectionResponse>(200).Produces(204);
+memberV1.MapGet("/events/{eventId}/commits/quota", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetCommitQuotaAsync(Member(c), eventId, ct)))
+    .WithName("GetCommitQuota").WithTags("Commits").Produces<CommitQuotaResponse>(200);
+memberV1.MapGet("/events/{eventId}/meeting-spots", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMeetingSpotsAsync(Member(c), eventId, ct)))
+    .WithName("ListMeetingSpots").WithTags("Commits").Produces<IReadOnlyList<MeetingSpotResponse>>(200);
+memberV1.MapGet("/me/commits/incoming", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIncomingCommitsAsync(Member(c), eventId, ct)))
+    .WithName("ListIncomingCommits").WithTags("Commits").Produces<IReadOnlyList<IncomingCommitResponse>>(200);
+memberV1.MapGet("/me/commits/outgoing", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetOutgoingCommitsAsync(Member(c), eventId, ct)))
+    .WithName("ListOutgoingCommits").WithTags("Commits").Produces<IReadOnlyList<OutgoingCommitResponse>>(200);
 memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConnectionsAsync(Member(c), ct)))
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
     .WithName("BlockMember").WithTags("Social").Produces(204);
+memberV1.MapGet("/conversations", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationsAsync(Member(c), cursor, limit ?? 20, ct)))
+    .WithName("ListConversations").WithTags("Chat").Produces<ConversationListResponse>(200);
+memberV1.MapGet("/conversations/{conversationId}", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationAsync(Member(c), conversationId, ct)))
+    .WithName("GetConversation").WithTags("Chat").Produces<ConversationResponse>(200);
+memberV1.MapPost("/conversations/{conversationId}/read", async (HttpContext c, string conversationId, ConversationReadRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.MarkConversationReadAsync(Member(c), conversationId, body, Idempotency(c), ct)))
+    .WithName("MarkConversationRead").WithTags("Chat").Produces<ConversationResponse>(200);
+memberV1.MapPut("/conversations/{conversationId}/mute", async (HttpContext c, string conversationId, ConversationMuteRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.MuteConversationAsync(Member(c), conversationId, body, ct)))
+    .WithName("MuteConversation").WithTags("Chat").Produces<ConversationResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, long? after, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMessagesAsync(Member(c), conversationId, after ?? 0, limit ?? 50, ct)))
     .WithName("ListMessages").WithTags("Chat").Produces<IReadOnlyList<MessageResponse>>(200);
 memberV1.MapPost("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, MessageCreateRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/conversations/{conversationId}/messages/{body.MessageId}", await s.SendMessageAsync(Member(c), conversationId, body, Idempotency(c), ct)))
     .WithName("SendMessage").WithTags("Chat").Produces<MessageResponse>(201);
 memberV1.MapPut("/messages/{messageId}/receipt", async (HttpContext c, string messageId, MessageReceiptRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SaveMessageReceiptAsync(Member(c), messageId, body, Idempotency(c), ct)))
     .WithName("SaveMessageReceipt").WithTags("Chat").Produces<MessageReceiptResponse>(200);
+memberV1.MapDelete("/messages/{messageId}", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) => { await s.DeleteMessageAsync(Member(c), messageId, ct); return Results.NoContent(); })
+    .WithName("DeleteMessage").WithTags("Chat").Produces(204);
+memberV1.MapPost("/messages/{messageId}/report", async (HttpContext c, string messageId, MessageReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/messages/{messageId}/report", await s.ReportMessageAsync(Member(c), messageId, body, ct)))
+    .WithName("ReportMessage").WithTags("Chat").Produces<MessageReportResponse>(201);
 memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, NotificationPreferenceRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SetNotificationPreferenceAsync(Member(c), body, ct)))
     .WithName("SetNotificationPreference").WithTags("Preferences and privacy").Produces<NotificationPreferenceResponse>(200);
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)))
@@ -186,6 +211,8 @@ adminV1.MapPost("/events/{eventId}/publish", async (string eventId, IAdminEventS
     .WithName("AdminPublishEvent").WithTags("Admin events").Produces<AdminEventResponse>(200);
 adminV1.MapPost("/events/{eventId}/cancel", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CancelEventAsync(eventId, ct)))
     .WithName("AdminCancelEvent").WithTags("Admin events").Produces<AdminEventResponse>(200);
+adminV1.MapPut("/events/{eventId}/matching-policy", async (string eventId, AdminEventMatchingPolicyUpdateRequest body, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.UpdateMatchingPolicyAsync(eventId, body, ct)))
+    .WithName("AdminUpdateEventMatchingPolicy").WithTags("Admin events").Produces<AdminEventResponse>(200);
 adminV1.MapGet("/stats", async (IAdminService s, CancellationToken ct) => Results.Ok(await s.GetStatsAsync(ct)))
     .WithName("AdminGetStats").WithTags("Admin stats").Produces<AdminStatsResponse>(200);
 adminV1.MapGet("/members", async (string? status, string? search, IAdminService s, CancellationToken ct) => Results.Ok(await s.GetMembersAsync(status, search, ct)))
@@ -200,8 +227,16 @@ adminV1.MapGet("/privacy-requests", async (string? status, IAdminService s, Canc
     .WithName("AdminListPrivacyRequests").WithTags("Admin privacy").Produces<IReadOnlyList<AdminPrivacyRequestResponse>>(200);
 adminV1.MapPatch("/privacy-requests/{privacyRequestId}", async (string privacyRequestId, AdminStatusRequest body, IAdminService s, CancellationToken ct) => Results.Ok(await s.SetPrivacyRequestStatusAsync(privacyRequestId, body, ct)))
     .WithName("AdminSetPrivacyRequestStatus").WithTags("Admin privacy").Produces<AdminPrivacyRequestResponse>(200);
+adminV1.MapGet("/consent-policies", async (IAdminService s, CancellationToken ct) => Results.Ok(await s.GetConsentPoliciesAsync(ct)))
+    .WithName("AdminListConsentPolicies").WithTags("Admin").Produces<IReadOnlyList<AdminConsentPolicyResponse>>(200);
+adminV1.MapPost("/consent-policies", async (HttpContext c, AdminConsentPolicyCreateRequest body, IAdminService s, CancellationToken ct) => { var value = await s.CreateConsentPolicyAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/consent-policies/{value.PolicyId}", value); })
+    .WithName("AdminCreateConsentPolicy").WithTags("Admin").Produces<AdminConsentPolicyResponse>(201);
+adminV1.MapPost("/consent-policies/{policyId}/retire", async (string policyId, IAdminService s, CancellationToken ct) => Results.Ok(await s.RetireConsentPolicyAsync(policyId, ct)))
+    .WithName("AdminRetireConsentPolicy").WithTags("Admin").Produces<AdminConsentPolicyResponse>(200);
 adminV1.MapGet("/events/{eventId}/attendees", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetAttendeesAsync(eventId, ct)))
     .WithName("AdminListEventAttendees").WithTags("Admin events").Produces<IReadOnlyList<AdminAttendeeResponse>>(200);
+adminV1.MapPost("/events/{eventId}/attendees/{memberId}/check-in", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CheckInAsync(eventId, memberId, ct)))
+    .WithName("AdminCheckInEventAttendee").WithTags("Admin events").Produces<RegistrationResponse>(200);
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)))
     .WithName("AdminListVenues").WithTags("Admin venues").Produces<IReadOnlyList<AdminVenueResponse>>(200);
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); })

@@ -1,5 +1,13 @@
 namespace Olga.Core.Domain;
 
+// iam.member: the account row the database checks for community and status.
+public sealed class MemberAccount
+{
+    public string MemberId { get; set; } = "";
+    public string CommunityId { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+}
+
 public sealed class MemberProfile
 {
     public string MemberId { get; set; } = "";
@@ -58,13 +66,15 @@ public sealed class EventRecord
     public long RowVersion { get; set; } = 1;
 }
 
-// Per-event matching rules (event.event_matching_policy). Unmapped columns use their database defaults.
+// Per-event matching rules (event.event_matching_policy). Other columns use their database defaults.
 public sealed class EventMatchingPolicy
 {
     public long Id { get; set; }
     public string EventId { get; set; } = "";
     public short PolicyVersion { get; set; } = 1;
     public string Status { get; set; } = "ACTIVE";
+    // When true, eligibility requires CHECKED_IN instead of merely REGISTERED.
+    public bool CheckInRequired { get; set; }
     public DateTimeOffset EffectiveFrom { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -280,6 +290,21 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
 {
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
+}
+
+public sealed class MemberReport
+{
+    public string ReportId { get; set; } = Guid.NewGuid().ToString("N");
+    public string ReporterMemberId { get; set; } = "";
+    public string ReportedMemberId { get; set; } = "";
+    public string? ResourceType { get; set; }
+    public string? ResourceId { get; set; }
+    public string Category { get; set; } = "";
+    public string? Description { get; set; }
+    public string Status { get; set; } = "OPEN";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class ModerationCase

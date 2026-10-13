@@ -8,6 +8,7 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberAccount> Accounts { get; }
     IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
     IQueryable<MemberConsent> Consents { get; }
@@ -28,6 +29,7 @@ public interface ICoreStore
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
     IQueryable<ModerationCase> ModerationCases { get; }
+    IQueryable<MemberReport> MemberReports { get; }
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
@@ -36,7 +38,11 @@ public interface ICoreStore
     Task<(string ConnectionId, string ConversationId)> AcceptConnectionRequestAsync(string requestId, string recipientId, string connectionId, string conversationId, string idempotencyKey, string requestHash, CancellationToken ct);
     Task<Message> SaveMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
     Task<MessageReceipt> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
+    // Reads nlp.nlp_match_result scores; empty when the store has no NLP data.
+    Task<IReadOnlyList<MatchScore>> GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct);
 }
+
+public sealed record MatchScore(long MatchResultId, string RequesterId, string CandidateId, decimal Score);
 
 public interface ICoreService
 {
@@ -47,18 +53,33 @@ public interface ICoreService
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
-    // memberId is optional: when supplied, each event carries is_registered for that member.
+    Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct);
+    // memberId is optional: when supplied, each event carries registration state for that member.
     Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct);
     Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct);
+    Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
     Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct);
-    Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, CancellationToken ct);
-    Task<ConnectionResponse> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct);
+    // With context_id set the request is a Commit for that event.
+    Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct);
+    // Null when a Commit is declined: nothing is returned or observable to the sender.
+    Task<ConnectionResponse?> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct);
+    Task<CommitQuotaResponse> GetCommitQuotaAsync(string memberId, string eventId, CancellationToken ct);
+    Task<IReadOnlyList<MeetingSpotResponse>> GetMeetingSpotsAsync(string memberId, string eventId, CancellationToken ct);
+    Task<IReadOnlyList<IncomingCommitResponse>> GetIncomingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
+    Task<IReadOnlyList<OutgoingCommitResponse>> GetOutgoingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
     Task BlockAsync(string memberId, BlockRequest request, CancellationToken ct);
     Task<IReadOnlyList<ConnectionResponse>> GetConnectionsAsync(string memberId, CancellationToken ct);
+    // Newest activity first; cursor is the opaque next_cursor from the previous page.
+    Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct);
+    Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct);
+    Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct);
+    Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
+    Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
+    Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
@@ -134,7 +155,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
         var mapped = Map(profile);
-        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, mapped.DisplayName, mapped.ProfileStatus, mapped.ETag));
+        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
     }
 
     public Task ProvisionMemberAsync(string memberId, CancellationToken ct)
@@ -147,7 +168,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     {
         ct.ThrowIfCancellationRequested();
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
-        return Task.FromResult(Map(profile));
+        return Task.FromResult(WithContactHints(Map(profile)));
     }
 
     public Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct)
@@ -156,7 +177,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var profile = FindProfile(memberId);
         if ((profile.Visibility == "HIDDEN" || profile.Visibility == "CONNECTED" && !IsConnected(actorId, memberId)) && actorId != memberId)
             throw new DomainException("PROFILE_NOT_FOUND", 404);
-        return Task.FromResult(Map(profile));
+        // Names stay hidden until members connect (a Commit is accepted).
+        var mapped = Map(profile);
+        return Task.FromResult(actorId == memberId || IsConnected(actorId, memberId) ? mapped : mapped with { DisplayName = null });
     }
 
     public async Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct)
@@ -191,7 +214,42 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddChange(memberId, "PROFILE", memberId, "UPSERT", new { profile.DisplayName, profile.Headline, professional_summary = profile.Biography, role_category = profile.Sector, profile.Visibility, profile.Version });
         AddOutbox("MEMBER", memberId, "MemberProfileChanged.v1", new { member_id = memberId, profile.Version });
         await store.SaveAsync(ct);
-        return Map(profile);
+        return WithContactHints(Map(profile));
+    }
+
+    // Own-profile routes only: adds the masked hints stored at registration. Never call this for another member's profile.
+    private ProfileResponse WithContactHints(ProfileResponse profile)
+    {
+        var hints = store.Identities
+            .Where(x => x.MemberId == profile.MemberId && x.Status == "ACTIVE" && x.DisplayHint != null)
+            .OrderByDescending(x => x.IsPrimary)
+            .Select(x => new { x.Provider, x.DisplayHint })
+            .ToList();
+        return profile with
+        {
+            EmailHint = hints.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
+            PhoneHint = hints.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint
+        };
+    }
+
+    public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var purpose = purposeCode.Trim().ToUpperInvariant();
+        var now = DateTimeOffset.UtcNow;
+        // Same rule RecordConsentAsync uses to accept a policy version.
+        var policy = store.ConsentPolicies
+            .Where(x => x.PurposeCode == purpose && x.EffectiveFrom <= now && (x.RetiredAt == null || x.RetiredAt > now))
+            .OrderByDescending(x => x.EffectiveFrom)
+            .FirstOrDefault() ?? throw new DomainException("CONSENT_POLICY_NOT_ACTIVE", 404);
+        var decision = store.Consents
+            .Where(x => x.MemberId == memberId && x.PolicyId == policy.PolicyId)
+            .OrderByDescending(x => x.CapturedAt)
+            .ThenByDescending(x => x.Id)
+            .FirstOrDefault();
+        return Task.FromResult(new ActiveConsentPolicyResponse(
+            policy.PolicyId, policy.PurposeCode, policy.Version, policy.Locale, policy.ContentHash,
+            policy.EffectiveFrom, decision?.Decision, decision?.CapturedAt));
     }
 
     public async Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct)
@@ -215,7 +273,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<IReadOnlyList<EventResponse>> GetEventsAsync(string? memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
-        var events = store.Events.Where(x => x.Status == "PUBLISHED" || x.Status == "ACTIVE").OrderBy(x => x.StartsAt).ToArray();
+        var community = memberId is null ? null : MemberCommunity(memberId);
+        var events = store.Events.Where(x => (x.Status == "PUBLISHED" || x.Status == "ACTIVE") && (community == null || x.CommunityId == community)).OrderBy(x => x.StartsAt).ToArray();
         var eventIds = events.Select(x => x.EventId).ToArray();
         var now = DateTimeOffset.UtcNow;
 
@@ -236,38 +295,84 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var venueIds = events.Where(x => x.VenueId != null).Select(x => x.VenueId!).Distinct().ToArray();
         var venueNames = store.Venues.Where(x => venueIds.Contains(x.VenueId)).ToDictionary(x => x.VenueId, x => x.Name);
 
-        // Same statuses that allow Live Mode, so is_registered matches what the member can do next.
-        HashSet<string>? registeredEventIds = memberId is null ? null : store.Registrations
+        var matchingPolicies = store.MatchingPolicies
+            .Where(x => eventIds.Contains(x.EventId) && x.Status == "ACTIVE")
+            .OrderByDescending(x => x.PolicyVersion)
+            .ToList()
+            .GroupBy(x => x.EventId)
+            .ToDictionary(x => x.Key, x => x.First());
+
+        Dictionary<string, string>? registrationStatuses = memberId is null ? null : store.Registrations
             .Where(x => eventIds.Contains(x.EventId) && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))
-            .Select(x => x.EventId)
-            .ToHashSet();
+            .ToDictionary(x => x.EventId, x => x.Status);
 
         IReadOnlyList<EventResponse> result = events
-            .Select(x => Map(x, x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null, attendeeCounts.GetValueOrDefault(x.EventId, 0), liveCounts.GetValueOrDefault(x.EventId, 0), registeredEventIds?.Contains(x.EventId)))
+            .Select(x => Map(
+                x,
+                matchingPolicies.GetValueOrDefault(x.EventId)?.CheckInRequired ?? false,
+                x.VenueId is not null ? venueNames.GetValueOrDefault(x.VenueId) : null,
+                attendeeCounts.GetValueOrDefault(x.EventId, 0),
+                liveCounts.GetValueOrDefault(x.EventId, 0),
+                memberId is null ? null : registrationStatuses!.ContainsKey(x.EventId),
+                registrationStatuses?.GetValueOrDefault(x.EventId)))
             .ToArray();
         return Task.FromResult(result);
     }
 
+    public Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = FindEventFor(memberId, eventId);
+        string[] attending = ["REGISTERED", "CHECKED_IN"];
+        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && attending.Contains(x.Status)))
+            throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+
+        var registrations = store.Registrations
+            .Where(x => x.EventId == eventId && x.MemberId != memberId && attending.Contains(x.Status))
+            .OrderBy(x => x.RegisteredAt)
+            .Select(x => new { x.MemberId, x.RegisteredAt })
+            .ToList();
+        var ids = registrations.Select(x => x.MemberId).ToArray();
+        var blocked = store.Blocks
+            .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
+            .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
+            .ToHashSet();
+        var profiles = store.Profiles
+            .Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN")
+            .ToDictionary(x => x.MemberId);
+
+        var visible = registrations
+            .Where(x => !blocked.Contains(x.MemberId) && profiles.ContainsKey(x.MemberId))
+            .Select(x => profiles[x.MemberId])
+            .Select(p => new EventAttendeeResponse(p.MemberId, p.Headline, p.Sector))
+            .ToList();
+        return Task.FromResult(new EventAttendeesResponse(visible.Take(50).ToArray(), visible.Count));
+    }
+
     public async Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct)
     {
-        _ = FindEvent(eventId);
+        _ = FindEventFor(memberId, eventId);
         var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId);
         if (row is null) { row = new EventRegistration { EventId = eventId, MemberId = memberId }; store.Add(row); }
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
-        AddOutbox("EVENT_REGISTRATION", $"{eventId}:{memberId}", "EventRegistrationChanged.v1", new { event_id = eventId, member_id = memberId, status = row.Status });
+        AddOutbox("EVENT_REGISTRATION", AggregateKey(eventId, memberId), "EventRegistrationChanged.v1", new { event_id = eventId, member_id = memberId, status = row.Status });
         await store.SaveAsync(ct);
-        return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt);
+        return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt, row.CheckedInAt);
     }
 
     public async Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct)
     {
-        var evt = FindEvent(eventId);
+        var evt = FindEventFor(memberId, eventId);
         if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
-        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"))) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+        // Mirror event.enforce_live_mode_session_consent so callers get a specific code, not RESOURCE_STATE_CONFLICT.
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (account is not null && account.Status != "ACTIVE") throw new DomainException("MEMBER_NOT_ACTIVE", 403);
+        if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN")))
+            throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
-        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_ACTIVE", 409);
-        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_NOT_ENABLED", 409);
+        if (now < evt.StartsAt || evt.EndsAt <= now) throw new DomainException("EVENT_NOT_LIVE", 409);
+        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_DISABLED", 409);
         var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
         // A published event becomes ACTIVE once it has started; the database only allows Live Mode
         // sessions (and matching eligibility) for ACTIVE events with an active matching policy.
@@ -276,7 +381,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (evt.Status == "PUBLISHED") { evt.Status = "ACTIVE"; evt.UpdatedAt = now; activated = true; }
         if (EventMatchingPolicies.EnsureDefault(store, evt.EventId, now) || activated) await store.SaveAsync(ct);
         var existing = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE");
-        if (existing is not null) { existing.ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt); await store.SaveAsync(ct); return Map(existing); }
+        // Extending also moves the session to the latest grant: the database rejects an active
+        // session that points at an older LIVE_MODE consent (the app records one before each Go Live).
+        if (existing is not null) { existing.ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt); existing.ConsentRecordId = consent.Id; await store.SaveAsync(ct); return Map(existing); }
         var row = new LiveModeSession { EventId = eventId, MemberId = memberId, ConsentRecordId = consent.Id, ActiveUntil = Min(now.AddMinutes(request.DurationMinutes), evt.EndsAt) };
         store.Add(row);
         AddChange(memberId, "LIVE_MODE", eventId, "UPSERT", new { row.SessionId, event_id = eventId, row.Status, row.ActiveUntil });
@@ -296,6 +403,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct)
     {
+        _ = FindEventFor(memberId, eventId);
         if (string.IsNullOrWhiteSpace(request.CoarseCell) || request.CoarseCell.Length > 32 || request.Source is not ("CHECK_IN" or "FOREGROUND_GEO" or "VENUE_ZONE")) throw new DomainException("PRESENCE_INVALID");
         var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE" && x.ActiveUntil > DateTimeOffset.UtcNow)
             ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 403);
@@ -306,9 +414,10 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         await store.SaveAsync(ct);
     }
 
-    public async Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, CancellationToken ct)
+    public async Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct)
     {
         if (senderId == request.RecipientMemberId) throw new DomainException("SELF_CONNECTION_INVALID");
+        if (request.ContextId is not null) return await CreateCommitAsync(senderId, request, idempotencyKey, ct);
         _ = FindProfile(senderId);
         _ = FindProfile(request.RecipientMemberId);
         if (IsBlocked(senderId, request.RecipientMemberId)) throw new DomainException("CONNECTION_NOT_ALLOWED", 403);
@@ -324,12 +433,139 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Map(row);
     }
 
-    public async Task<ConnectionResponse> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct)
+    private async Task<ConnectionRequestResponse> CreateCommitAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        // The ID comes from the sender's Idempotency-Key, so a retry finds and returns the same Commit.
+        var requestId = $"cmt_{Hash("social.commit", senderId, idempotencyKey)[..32]}";
+        var replay = store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId);
+        if (replay is not null)
+        {
+            if (replay.RecipientMemberId != request.RecipientMemberId || replay.ContextId != request.ContextId) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return Map(replay, CommitPlans.LimitPerEvent - CommitsUsed(senderId, replay.ContextId!));
+        }
+
+        var plan = CommitPlans.Validate(request.Plan);
+        var evt = FindEventFor(senderId, request.ContextId!);
+        // No meeting spots exist yet, so any SPOT is unknown.
+        if (plan.WhereType == "SPOT") throw new DomainException("MEETING_SPOT_NOT_FOUND", 404);
+        _ = FindProfile(senderId);
+        // A blocked or hidden recipient looks like an unknown one, so a block is never revealed.
+        if (!store.Profiles.Any(x => x.MemberId == request.RecipientMemberId && x.Status == "ACTIVE") || IsBlocked(senderId, request.RecipientMemberId))
+            throw new DomainException("PROFILE_NOT_FOUND", 404);
+        if (!IsAttending(evt.EventId, senderId)) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+        var now = DateTimeOffset.UtcNow;
+        if (!store.LiveSessions.Any(x => x.EventId == evt.EventId && x.MemberId == senderId && x.Status == "ACTIVE" && x.ActiveUntil > now))
+            throw new DomainException("COMMIT_SENDER_NOT_LIVE", 403);
+        if (!IsAttending(evt.EventId, request.RecipientMemberId)) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
+        if (IsConnected(senderId, request.RecipientMemberId)) throw new DomainException("CONNECTION_EXISTS", 409);
+
+        var toRecipient = store.ConnectionRequests.Where(x => x.SenderMemberId == senderId && x.RecipientMemberId == request.RecipientMemberId).ToArray();
+        // A declined Commit still counts as sent until it expires, so the sender can't tell.
+        if (toRecipient.Any(x => x.ExpiresAt > now && (x.Status == "PENDING" || (x.Status == "DECLINED" && x.ContextId == evt.EventId))))
+            throw new DomainException("COMMIT_ALREADY_SENT", 409);
+        var used = CommitsUsed(senderId, evt.EventId);
+        if (used >= CommitPlans.LimitPerEvent) throw new DomainException("COMMIT_LIMIT_REACHED", 409);
+        var note = CommitPlans.Encode(plan, request.Note);
+        if (note.Length > 500) throw new DomainException("CONNECTION_NOTE_INVALID");
+
+        // Expired requests are only filtered at read time; mark them so the open-pair index frees up.
+        foreach (var stale in toRecipient.Where(x => x.Status == "PENDING" && x.ExpiresAt <= now)) { stale.Status = "EXPIRED"; stale.UpdatedAt = now; }
+        var row = new ConnectionRequest { RequestId = requestId, SenderMemberId = senderId, RecipientMemberId = request.RecipientMemberId, ContextId = evt.EventId, MatchResultId = request.MatchResultId, Note = note, ExpiresAt = evt.EndsAt };
+        store.Add(row);
+        AddChange(request.RecipientMemberId, "CONNECTION_REQUEST", row.RequestId, "UPSERT", new { request_id = row.RequestId, event_id = evt.EventId, row.Status, row.ExpiresAt });
+        AddOutbox("CONNECTION_REQUEST", row.RequestId, "ConnectionRequestCreated.v1", new { request_id = row.RequestId, sender_member_id = senderId, recipient_member_id = request.RecipientMemberId, context_id = evt.EventId });
+        await store.SaveAsync(ct);
+        return Map(row, CommitPlans.LimitPerEvent - used - 1);
+    }
+
+    public Task<CommitQuotaResponse> GetCommitQuotaAsync(string memberId, string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var evt = FindEventFor(memberId, eventId);
+        var used = CommitsUsed(memberId, evt.EventId);
+        return Task.FromResult(new CommitQuotaResponse(CommitPlans.LimitPerEvent, used, Math.Max(0, CommitPlans.LimitPerEvent - used)));
+    }
+
+    public Task<IReadOnlyList<MeetingSpotResponse>> GetMeetingSpotsAsync(string memberId, string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = FindEventFor(memberId, eventId);
+        // The database has no meeting-spot table yet; the app always offers "Their choice".
+        return Task.FromResult<IReadOnlyList<MeetingSpotResponse>>([]);
+    }
+
+    public async Task<IReadOnlyList<IncomingCommitResponse>> GetIncomingCommitsAsync(string memberId, string? eventId, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var rows = store.ConnectionRequests
+            .Where(x => x.RecipientMemberId == memberId && x.Status == "PENDING" && x.ExpiresAt > now && x.ContextId != null && (eventId == null || x.ContextId == eventId))
+            .OrderByDescending(x => x.CreatedAt).Take(100).ToArray();
+        var blocked = BlockedAmong(memberId, rows.Select(x => x.SenderMemberId).Distinct().ToArray());
+        rows = rows.Where(x => !blocked.Contains(x.SenderMemberId)).ToArray();
+        var events = CommitEvents(rows);
+        var profiles = ActiveProfiles(rows.Select(x => x.SenderMemberId));
+        var matchIds = rows.Where(x => x.MatchResultId != null).Select(x => x.MatchResultId!.Value).Distinct().ToArray();
+        var scores = matchIds.Length == 0 ? new Dictionary<long, MatchScore>() : (await store.GetMatchScoresAsync(matchIds, ct)).ToDictionary(x => x.MatchResultId);
+
+        return rows.Select(x =>
+        {
+            var profile = profiles.GetValueOrDefault(x.SenderMemberId);
+            // A score counts only when it is this sender's match for this recipient.
+            var score = x.MatchResultId is { } id && scores.TryGetValue(id, out var s) && s.RequesterId == x.SenderMemberId && s.CandidateId == memberId ? s.Score : (decimal?)null;
+            return new IncomingCommitResponse(x.RequestId, events[x.ContextId!], PlanOf(x), new CommitSenderSummary(profile?.Headline, profile?.Sector, Score: score), x.ExpiresAt, x.CreatedAt);
+        }).ToArray();
+    }
+
+    public Task<IReadOnlyList<OutgoingCommitResponse>> GetOutgoingCommitsAsync(string memberId, string? eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var now = DateTimeOffset.UtcNow;
+        var rows = store.ConnectionRequests
+            .Where(x => x.SenderMemberId == memberId && x.ContextId != null && (eventId == null || x.ContextId == eventId))
+            .OrderByDescending(x => x.CreatedAt).Take(100).ToArray();
+        var events = CommitEvents(rows);
+        var profiles = ActiveProfiles(rows.Select(x => x.RecipientMemberId));
+        var acceptedIds = rows.Where(x => x.Status == "ACCEPTED").Select(x => x.RequestId).ToArray();
+        var conversations = (from connection in store.Connections
+                             join conversation in store.Conversations on connection.ConnectionId equals conversation.ConnectionId
+                             where acceptedIds.Contains(connection.AcceptedRequestId)
+                             select new { connection.AcceptedRequestId, conversation.ConversationId }).ToDictionary(x => x.AcceptedRequestId, x => x.ConversationId);
+
+        IReadOnlyList<OutgoingCommitResponse> result = rows.Select(x =>
+        {
+            var profile = profiles.GetValueOrDefault(x.RecipientMemberId);
+            var accepted = x.Status == "ACCEPTED";
+            // DECLINED is reported exactly like PENDING, then EXPIRED once the room closes.
+            var status = accepted ? "ACCEPTED" : x.Status is "PENDING" or "DECLINED" && x.ExpiresAt > now ? "PENDING" : "EXPIRED";
+            return new OutgoingCommitResponse(x.RequestId, events[x.ContextId!], PlanOf(x), new CommitRecipientSummary(profile?.Headline, profile?.Sector, accepted ? profile?.DisplayName : null),
+                status, x.ExpiresAt, x.CreatedAt, accepted ? conversations.GetValueOrDefault(x.RequestId) : null);
+        }).ToArray();
+        return Task.FromResult(result);
+    }
+
+    public async Task<ConnectionResponse?> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct)
     {
         var row = store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId && x.RecipientMemberId == memberId) ?? throw new DomainException("CONNECTION_REQUEST_NOT_FOUND", 404);
+        var isCommit = row.ContextId is not null;
+        if (isCommit && row.Status != "PENDING") throw new DomainException("COMMIT_NOT_PENDING", 409);
+        if (isCommit && row.ExpiresAt <= DateTimeOffset.UtcNow) throw new DomainException("COMMIT_EXPIRED", 409);
         if (row.Status != "PENDING" || row.ExpiresAt <= DateTimeOffset.UtcNow) throw new DomainException("CONNECTION_REQUEST_NOT_PENDING", 409);
         if (request.Decision is not ("ACCEPT" or "DECLINE")) throw new DomainException("CONNECTION_DECISION_INVALID");
-        if (request.Decision == "DECLINE") { row.Status = "DECLINED"; row.RespondedAt = DateTimeOffset.UtcNow; await store.SaveAsync(ct); return new("", row.SenderMemberId, row.Status, ""); }
+        if (request.Decision == "DECLINE")
+        {
+            row.Status = "DECLINED"; row.RespondedAt = DateTimeOffset.UtcNow; row.UpdatedAt = row.RespondedAt.Value;
+            await store.SaveAsync(ct);
+            return isCommit ? null : new("", row.SenderMemberId, row.Status, "");
+        }
+        var accepted = await AcceptAsync(memberId, row, requestId, idempotencyKey, ct);
+        // Names are revealed from the moment of Accept.
+        return accepted with { DisplayName = store.Profiles.Where(x => x.MemberId == row.SenderMemberId).Select(x => x.DisplayName).FirstOrDefault() };
+    }
+
+    private async Task<ConnectionResponse> AcceptAsync(string memberId, ConnectionRequest row, string requestId, string idempotencyKey, CancellationToken ct)
+    {
+        var request = new ConnectionDecisionRequest("ACCEPT");
         if (IsBlocked(row.SenderMemberId, row.RecipientMemberId)) throw new DomainException("CONNECTION_NOT_ALLOWED", 403);
         if (store.IsRelational)
         {
@@ -358,7 +594,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (!store.Blocks.Any(x => x.BlockerMemberId == memberId && x.BlockedMemberId == request.MemberId && x.RemovedAt == null)) store.Add(new MemberBlock { BlockerMemberId = memberId, BlockedMemberId = request.MemberId });
         foreach (var connection in store.Connections.Where(x => x.Status == "ACTIVE" && ((x.MemberLowId == memberId && x.MemberHighId == request.MemberId) || (x.MemberLowId == request.MemberId && x.MemberHighId == memberId))).ToArray()) { connection.Status = "DISCONNECTED"; connection.DisconnectedAt = DateTimeOffset.UtcNow; }
         foreach (var id in new[] { memberId, request.MemberId }) AddChange(id, "CONNECTION", PairKey(memberId, request.MemberId), "DELETE", null);
-        AddOutbox("MEMBER_RELATIONSHIP", PairKey(memberId, request.MemberId), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
+        AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, request.MemberId).Low, Pair(memberId, request.MemberId).High), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
         await store.SaveAsync(ct);
     }
 
@@ -367,6 +603,77 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         ct.ThrowIfCancellationRequested();
         var result = store.Connections.Where(x => x.Status == "ACTIVE" && (x.MemberLowId == memberId || x.MemberHighId == memberId)).AsEnumerable().Select(x => new ConnectionResponse(x.ConnectionId, x.MemberLowId == memberId ? x.MemberHighId : x.MemberLowId, x.Status, store.Conversations.Single(c => c.ConnectionId == x.ConnectionId).ConversationId)).ToArray();
         return Task.FromResult<IReadOnlyList<ConnectionResponse>>(result);
+    }
+
+    public Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var bounded = Math.Clamp(limit, 1, 50);
+        var after = DecodeConversationCursor(cursor);
+        var connections = store.Connections.Where(x => x.Status == "ACTIVE" && (x.MemberLowId == memberId || x.MemberHighId == memberId)).ToArray();
+        var blocked = BlockedAmong(memberId, connections.Select(x => OtherMember(x, memberId)).ToArray());
+        // A member's active connections are bounded, so the page is cut after building every summary.
+        var ordered = BuildConversations(memberId, connections.Where(x => !blocked.Contains(OtherMember(x, memberId))).ToArray())
+            .OrderByDescending(x => x.LastActivityAt).ThenByDescending(x => x.ConversationId, StringComparer.Ordinal);
+        var remaining = after is null ? ordered : ordered.Where(x => x.LastActivityAt < after.Value.At || (x.LastActivityAt == after.Value.At && string.CompareOrdinal(x.ConversationId, after.Value.Id) < 0));
+        var rows = remaining.Take(bounded + 1).ToArray();
+        var page = rows.Take(bounded).ToArray();
+        var hasMore = rows.Length > bounded;
+        return Task.FromResult(new ConversationListResponse(page, hasMore ? EncodeConversationCursor(page[^1]) : null, hasMore));
+    }
+
+    public Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var connection = RequireConversationMember(memberId, conversationId);
+        return Task.FromResult(BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId));
+    }
+
+    public async Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.LastReadMessageId) || request.LastReadMessageId.Length > 64) throw new DomainException("CONVERSATION_READ_INVALID");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        var connection = RequireConversationMember(memberId, conversationId);
+        var upTo = store.Messages.SingleOrDefault(x => x.MessageId == request.LastReadMessageId && x.ConversationId == conversationId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        // Only messages still unread are touched, so a retry after success does nothing.
+        var unread = store.Messages
+            .Where(x => x.ConversationId == conversationId && x.SenderMemberId != memberId && x.DeletedAt == null && x.ServerSequence <= upTo.ServerSequence
+                && !store.MessageReceipts.Any(r => r.MessageId == x.MessageId && r.MemberId == memberId && r.ReadAt != null))
+            .OrderBy(x => x.ServerSequence)
+            .ToArray();
+        var readAt = DateTimeOffset.UtcNow;
+        if (store.IsRelational)
+        {
+            // chat.save_message_receipt writes the receipt, the read cursor, the outbox event and sync changes.
+            // Per-message keys and hashes leave out readAt so a retry of the same request replays cleanly.
+            foreach (var message in unread)
+                await store.SaveMessageReceiptAsync(memberId, message.MessageId, new(ReadAt: readAt), $"read:{Hash(idempotencyKey, message.MessageId)[..59]}", Hash("chat.conversation_read", memberId, message.MessageId, idempotencyKey), ct);
+        }
+        else if (unread.Length > 0)
+        {
+            foreach (var message in unread)
+            {
+                var row = store.MessageReceipts.SingleOrDefault(x => x.MessageId == message.MessageId && x.MemberId == memberId);
+                if (row is null) { row = new MessageReceipt { MessageId = message.MessageId, MemberId = memberId }; store.Add(row); }
+                row.DeliveredAt ??= readAt; row.ReadAt = readAt; row.UpdatedAt = readAt;
+            }
+            var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId);
+            var current = participant?.LastReadMessageId is null ? 0 : store.Messages.Where(x => x.MessageId == participant.LastReadMessageId).Select(x => x.ServerSequence).SingleOrDefault();
+            if (participant is not null && unread[^1].ServerSequence > current) participant.LastReadMessageId = unread[^1].MessageId;
+            await store.SaveAsync(ct);
+        }
+        return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
+    }
+
+    public async Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct)
+    {
+        if (request.MutedUntil is { } until && until <= DateTimeOffset.UtcNow) throw new DomainException("CONVERSATION_MUTE_INVALID");
+        var connection = RequireConversationMember(memberId, conversationId);
+        var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId) ?? throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        participant.MutedUntil = request.MutedUntil?.ToUniversalTime();
+        AddChange(memberId, "CONVERSATION", conversationId, "UPSERT", new { conversation_id = conversationId, muted_until = participant.MutedUntil });
+        await store.SaveAsync(ct);
+        return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
     }
 
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
@@ -414,6 +721,38 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return new(row.MessageId, row.MemberId, row.DeliveredAt, row.ReadAt, row.UpdatedAt);
     }
 
+    public async Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct)
+    {
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        var connection = RequireConversationMember(memberId, message.ConversationId);
+        if (message.SenderMemberId != memberId) throw new DomainException("MESSAGE_DELETE_FORBIDDEN", 403);
+        if (message.DeletedAt is not null) return;
+        // Soft delete: the body stays in the database for moderation but is never returned again.
+        var now = DateTimeOffset.UtcNow;
+        message.DeletedAt = now; message.UpdatedAt = now;
+        foreach (var id in new[] { memberId, OtherMember(connection, memberId) }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        await store.SaveAsync(ct);
+    }
+
+    public async Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct)
+    {
+        var category = request.Category?.Trim().ToUpperInvariant();
+        if (category is not ("SPAM" or "HARASSMENT" or "INAPPROPRIATE" or "SCAM" or "OTHER") || request.Description?.Length > 2000) throw new DomainException("MESSAGE_REPORT_INVALID");
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        // Either participant may still report after a block or disconnect, so only membership is checked.
+        var conversation = store.Conversations.SingleOrDefault(x => x.ConversationId == message.ConversationId) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        if (!store.Connections.Any(x => x.ConnectionId == conversation.ConnectionId && (x.MemberLowId == memberId || x.MemberHighId == memberId))) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        if (message.SenderMemberId == memberId) throw new DomainException("MESSAGE_REPORT_FORBIDDEN", 403);
+        var existing = store.MemberReports.FirstOrDefault(x => x.ReporterMemberId == memberId && x.ResourceType == "MESSAGE" && x.ResourceId == messageId);
+        if (existing is not null) return new(existing.ReportId, messageId, existing.Category, existing.Status, existing.CreatedAt);
+        var report = new MemberReport { ReporterMemberId = memberId, ReportedMemberId = message.SenderMemberId, ResourceType = "MESSAGE", ResourceId = messageId, Category = category, Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim() };
+        store.Add(report);
+        // The admin reports list reads moderation cases, so each member report opens one.
+        store.Add(new ModerationCase { SourceType = "MEMBER_REPORT", SourceId = report.ReportId, SubjectMemberId = message.SenderMemberId, ResourceType = "MESSAGE", ResourceId = messageId });
+        await store.SaveAsync(ct);
+        return new(report.ReportId, messageId, report.Category, report.Status, report.CreatedAt);
+    }
+
     public Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -456,24 +795,130 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     }
 
     private MemberProfile FindProfile(string id) => store.Profiles.SingleOrDefault(x => x.MemberId == id && x.Status == "ACTIVE") ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+    // A member only sees events in their own community; others behave as unknown (the database
+    // refuses Live Mode across communities). Unknown accounts (InMemory fixtures) aren't scoped.
+    private string? MemberCommunity(string memberId) => store.Accounts.Where(x => x.MemberId == memberId).Select(x => x.CommunityId).FirstOrDefault();
+    private EventRecord FindEventFor(string memberId, string eventId)
+    {
+        var evt = FindEvent(eventId);
+        var community = MemberCommunity(memberId);
+        return community is null || evt.CommunityId == community ? evt : throw new DomainException("EVENT_NOT_FOUND", 404);
+    }
     private EventRecord FindEvent(string id) => store.Events.SingleOrDefault(x => x.EventId == id && (x.Status == "PUBLISHED" || x.Status == "ACTIVE")) ?? throw new DomainException("EVENT_NOT_FOUND", 404);
     private bool HasConsent(string memberId, string purpose) => LatestGrantedConsent(memberId, purpose) is not null;
-    private MemberConsent? LatestGrantedConsent(string memberId, string purpose) => (from consent in store.Consents join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId where consent.MemberId == memberId && policy.PurposeCode == purpose orderby consent.CapturedAt descending, consent.Id descending select consent).FirstOrDefault() is { Decision: "GRANTED", WithdrawnAt: null } value ? value : null;
+    private MemberConsent? LatestGrantedConsent(string memberId, string purpose) => (from consent in store.Consents join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId where consent.MemberId == memberId && policy.PurposeCode == purpose && policy.EffectiveFrom <= DateTimeOffset.UtcNow && policy.RetiredAt == null orderby consent.CapturedAt descending, consent.Id descending select consent).FirstOrDefault() is { Decision: "GRANTED", WithdrawnAt: null } value ? value : null;
     private bool IsBlocked(string a, string b) => store.Blocks.Any(x => x.RemovedAt == null && ((x.BlockerMemberId == a && x.BlockedMemberId == b) || (x.BlockerMemberId == b && x.BlockedMemberId == a)));
     private bool IsConnected(string a, string b) { var p = Pair(a, b); return store.Connections.Any(x => x.MemberLowId == p.Low && x.MemberHighId == p.High && x.Status == "ACTIVE"); }
     private Connection RequireConversationMember(string memberId, string conversationId) { var c = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404); var link = store.Connections.Single(x => x.ConnectionId == c.ConnectionId); return link.Status == "ACTIVE" && (link.MemberLowId == memberId || link.MemberHighId == memberId) ? link : throw new DomainException("CONVERSATION_FORBIDDEN", 403); }
+    // Every Commit sent in the event counts, whatever happened to it.
+    private int CommitsUsed(string senderId, string eventId) => store.ConnectionRequests.Count(x => x.SenderMemberId == senderId && x.ContextId == eventId);
+    private bool IsAttending(string eventId, string memberId) => store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"));
+    private Dictionary<string, CommitEventSummary> CommitEvents(ConnectionRequest[] rows)
+    {
+        var ids = rows.Select(x => x.ContextId!).Distinct().ToArray();
+        var names = store.Events.Where(x => ids.Contains(x.EventId)).ToDictionary(x => x.EventId, x => x.Name);
+        return ids.ToDictionary(id => id, id => new CommitEventSummary(id, names.GetValueOrDefault(id, "")));
+    }
+    private Dictionary<string, MemberProfile> ActiveProfiles(IEnumerable<string> memberIds)
+    {
+        var ids = memberIds.Distinct().ToArray();
+        return store.Profiles.Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE").ToDictionary(x => x.MemberId);
+    }
+    // Commits sent before plans existed default to "their choice, now".
+    private static CommitPlanResponse PlanOf(ConnectionRequest x) => CommitPlans.ToResponse(CommitPlans.Decode(x.Note) ?? new(CommitPlans.TheirChoice, null, "NOW"), x.ContextId);
+
+    private static string OtherMember(Connection x, string memberId) => x.MemberLowId == memberId ? x.MemberHighId : x.MemberLowId;
+    private HashSet<string> BlockedAmong(string memberId, string[] ids) => store.Blocks
+        .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
+        .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
+        .ToHashSet();
+
+    private ConversationResponse[] BuildConversations(string memberId, Connection[] connections)
+    {
+        var byConnection = connections.ToDictionary(x => x.ConnectionId);
+        var connectionIds = byConnection.Keys.ToArray();
+        var conversations = store.Conversations.Where(x => connectionIds.Contains(x.ConnectionId)).ToArray();
+        var conversationIds = conversations.Select(x => x.ConversationId).ToArray();
+        var otherIds = connections.Select(x => OtherMember(x, memberId)).ToArray();
+        var profiles = store.Profiles.Where(x => otherIds.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN").ToDictionary(x => x.MemberId);
+        var blocked = BlockedAmong(memberId, otherIds);
+        var lastSequences = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.DeletedAt == null)
+            .GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) })
+            .ToDictionary(x => x.ConversationId, x => x.Sequence);
+        var sequences = lastSequences.Values.ToArray();
+        var lastMessages = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && sequences.Contains(x.ServerSequence))
+            .AsEnumerable()
+            .Where(x => lastSequences.GetValueOrDefault(x.ConversationId) == x.ServerSequence)
+            .ToDictionary(x => x.ConversationId);
+        // Unread means a non-deleted message from the other member with no read receipt from this member.
+        var unread = store.Messages
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.SenderMemberId != memberId && x.DeletedAt == null
+                && !store.MessageReceipts.Any(r => r.MessageId == x.MessageId && r.MemberId == memberId && r.ReadAt != null))
+            .GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Count = g.Count() })
+            .ToDictionary(x => x.ConversationId, x => x.Count);
+        // An expired mute is reported as not muted.
+        var now = DateTimeOffset.UtcNow;
+        var mutedUntil = store.ConversationParticipants
+            .Where(x => conversationIds.Contains(x.ConversationId) && x.MemberId == memberId && x.MutedUntil > now)
+            .ToDictionary(x => x.ConversationId, x => x.MutedUntil);
+        var requestIds = connections.Select(x => x.AcceptedRequestId).ToArray();
+        var plans = store.ConnectionRequests.Where(x => requestIds.Contains(x.RequestId) && x.ContextId != null).AsEnumerable().ToDictionary(x => x.RequestId, PlanOf);
+
+        return conversations.Select(c =>
+        {
+            var connection = byConnection[c.ConnectionId];
+            var otherId = OtherMember(connection, memberId);
+            var profile = profiles.GetValueOrDefault(otherId);
+            var last = lastMessages.GetValueOrDefault(c.ConversationId);
+            return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
+                last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
+                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId));
+        }).ToArray();
+    }
+
+    private static string EncodeConversationCursor(ConversationResponse x) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{x.LastActivityAt.UtcTicks}:{x.ConversationId}")));
+    private static (DateTimeOffset At, string Id)? DecodeConversationCursor(string? cursor)
+    {
+        if (string.IsNullOrWhiteSpace(cursor)) return null;
+        try
+        {
+            var parts = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor)).Split(':', 2);
+            if (parts.Length == 2 && long.TryParse(parts[0], System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var ticks)
+                && ticks <= DateTimeOffset.MaxValue.UtcTicks && parts[1].Length is > 0 and <= 64)
+                return (new DateTimeOffset(ticks, TimeSpan.Zero), parts[1]);
+        }
+        catch (FormatException) { }
+        throw new DomainException("CONVERSATION_CURSOR_INVALID");
+    }
+
     private void AddChange(string? memberId, string type, string id, string change, object? payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = change, PayloadJson = payload is null ? null : JsonSerializer.Serialize(payload, JsonOptions) });
     private void AddOutbox(string aggregateType, string aggregateId, string eventType, object payload) => store.Add(new OutboxEvent { AggregateType = aggregateType, AggregateId = aggregateId, EventType = eventType, PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
     private static (string Low, string High) Pair(string a, string b) => string.CompareOrdinal(a, b) < 0 ? (a, b) : (b, a);
+    // ops.outbox_event.aggregate_id is varchar(64). Keep the readable "a:b" key when it fits;
+    // otherwise use a deterministic hash so real 36-character event/member IDs still fit.
+    private static string AggregateKey(string a, string b)
+    {
+        var key = $"{a}:{b}";
+        return key.Length <= 64 ? key : $"agg_{Hash("outbox.aggregate", a, b)[..60]}";
+    }
+
     private static string PairKey(string a, string b) { var p = Pair(a, b); return $"{p.Low}:{p.High}"; }
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
-    private static EventResponse Map(EventRecord x, string? venue, int attendeeCount, int liveCount, bool? isRegistered) => new(x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, venue, attendeeCount, liveCount, isRegistered);
+    private static EventResponse Map(EventRecord x, bool checkInRequired, string? venue, int attendeeCount, int liveCount, bool? isRegistered, string? registrationStatus) => new(
+        x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, checkInRequired, venue,
+        attendeeCount, liveCount, isRegistered, registrationStatus);
     private static LiveModeResponse Map(LiveModeSession x) => new(x.SessionId, x.EventId, x.Status, x.ActiveUntil);
     private static ConnectionRequestResponse Map(ConnectionRequest x) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status, x.ExpiresAt);
-    private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.Body, x.ServerSequence, x.ModerationStatus, x.CreatedAt);
+    // The sender sees a declined Commit as PENDING.
+    private static ConnectionRequestResponse Map(ConnectionRequest x, int commitsRemaining) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status == "DECLINED" ? "PENDING" : x.Status, x.ExpiresAt, Math.Max(0, commitsRemaining));
+    private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.ServerSequence, x.ModerationStatus, x.CreatedAt, x.DeletedAt);
     private static PrivacyRequestResponse Map(PrivacyRequest x) => new(x.PrivacyRequestId, x.RequestType, x.Status, x.CreatedAt, x.DueAt);
 }
