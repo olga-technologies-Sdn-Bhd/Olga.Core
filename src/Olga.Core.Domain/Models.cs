@@ -6,6 +6,8 @@ public sealed class MemberAccount
     public string MemberId { get; set; } = "";
     public string CommunityId { get; set; } = "";
     public string Status { get; set; } = "ACTIVE";
+    // Set when the member asks to delete their account (the erasure workflow start); NLP matching excludes them from then on.
+    public DateTimeOffset? DeletedAt { get; set; }
 }
 
 public sealed class MemberProfile

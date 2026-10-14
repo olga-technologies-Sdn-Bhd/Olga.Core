@@ -632,6 +632,65 @@ public sealed class CoreServiceTests
         Assert.Equal(latest.MemberConsentId, db.LiveModeSessions.Single().ConsentRecordId);
     }
 
+    [Fact]
+    public async Task Delete_request_takes_the_member_out_of_the_product_straight_away()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var commit = await service.CreateConnectionRequestAsync("A", Commit("B"), "commit-1", default);
+
+        var request = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        Assert.Equal(("DELETE", "OPEN"), (request.RequestType, request.Status));
+        Assert.NotNull(db.MemberAccounts.Single(x => x.MemberId == "A").DeletedAt);
+        Assert.Equal("DISABLED", db.LiveModeSessions.Single(x => x.MemberId == "A").Status);
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.GetVisibleProfileAsync("B", "A", default));
+        Assert.Empty((await service.GetEventAttendeesAsync("B", "E", default)).Attendees);
+        Assert.Empty(await service.GetIncomingCommitsAsync("B", null, default));
+        await AssertCode("CONNECTION_REQUEST_NOT_FOUND", 404, () => service.DecideConnectionRequestAsync("B", commit.RequestId, new("ACCEPT"), "accept-1", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.StartLiveModeAsync("A", "E", new(), default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.CreateConnectionRequestAsync("A", Commit("B"), "commit-2", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.UpdateProfileAsync("A", new("A", null, null, null), "\"1\"", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
+        Assert.Equal("A", (await service.GetOwnProfileAsync("A", default)).MemberId);
+    }
+
+    [Fact]
+    public async Task Member_can_read_their_privacy_requests_and_cannot_open_a_second_deletion()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var first = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        await AssertCode("PRIVACY_REQUEST_ALREADY_OPEN", 409, () => service.CreatePrivacyRequestAsync("A", new("DELETE"), default));
+        var listed = await service.GetPrivacyRequestsAsync("A", default);
+
+        Assert.Equal(first.PrivacyRequestId, Assert.Single(listed).PrivacyRequestId);
+        Assert.Empty(await service.GetPrivacyRequestsAsync("B", default));
+    }
+
+    [Fact]
+    public async Task Rejecting_a_deletion_request_restores_the_member()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var request = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        await new AdminService(db).SetPrivacyRequestStatusAsync(request.PrivacyRequestId, new("REJECTED"), default);
+
+        Assert.Null(db.MemberAccounts.Single(x => x.MemberId == "A").DeletedAt);
+        Assert.Equal("A", (await service.GetVisibleProfileAsync("B", "A", default)).MemberId);
+        Assert.Equal("OPEN", (await service.CreatePrivacyRequestAsync("A", new("DELETE"), default)).Status);
+    }
+
+    private static async Task<CoreService> DeletionSetupAsync(CoreDbContext db)
+    {
+        var service = await CommitSetupAsync(db);
+        db.MemberAccounts.AddRange(new MemberAccount { MemberId = "A", CommunityId = "olga" }, new MemberAccount { MemberId = "B", CommunityId = "olga" });
+        await db.SaveChangesAsync();
+        return service;
+    }
+
     private static async Task<CoreService> CommitSetupAsync(CoreDbContext db, params string[] others)
     {
         SeedMembersAndEvent(db);

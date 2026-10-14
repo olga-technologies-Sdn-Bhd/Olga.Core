@@ -83,6 +83,7 @@ public interface ICoreService
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
+    Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct);
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
 }
 
@@ -186,6 +187,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     {
         if (string.IsNullOrWhiteSpace(request.DisplayName) || request.DisplayName.Length > 200) throw new DomainException("PROFILE_INVALID");
         if (request.Visibility is not ("PUBLIC" or "MEMBERS" or "CONNECTED" or "HIDDEN")) throw new DomainException("PROFILE_VISIBILITY_INVALID");
+        EnsureNotDeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId);
         if (profile is null)
         {
@@ -257,6 +259,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (request.Decision is not ("GRANTED" or "WITHDRAWN" or "DENIED") || string.IsNullOrWhiteSpace(request.PurposeCode))
             throw new DomainException("CONSENT_INVALID");
         if (request.CaptureChannel is not ("MOBILE" or "WEB_ADMIN" or "SUPPORT")) throw new DomainException("CONSENT_CAPTURE_CHANNEL_INVALID");
+        // Withdrawing stays possible after a deletion request; granting doesn't.
+        if (request.Decision == "GRANTED") EnsureNotDeletionPending(memberId);
         var now = DateTimeOffset.UtcNow;
         var policy = store.ConsentPolicies.Where(x => x.PurposeCode == request.PurposeCode && x.Version == request.PolicyVersion && x.EffectiveFrom <= now && (x.RetiredAt == null || x.RetiredAt > now)).OrderByDescending(x => x.EffectiveFrom).FirstOrDefault()
             ?? throw new DomainException("CONSENT_POLICY_NOT_ACTIVE", 409);
@@ -337,8 +341,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
             .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
             .ToHashSet();
-        var profiles = store.Profiles
-            .Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN")
+        var profiles = ActiveProfileRows
+            .Where(x => ids.Contains(x.MemberId) && x.Visibility != "HIDDEN")
             .ToDictionary(x => x.MemberId);
 
         var visible = registrations
@@ -352,6 +356,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct)
     {
         _ = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
         var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId);
         if (row is null) { row = new EventRegistration { EventId = eventId, MemberId = memberId }; store.Add(row); }
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
@@ -366,7 +371,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
         // Mirror event.enforce_live_mode_session_consent so callers get a specific code, not RESOURCE_STATE_CONFLICT.
         var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
-        if (account is not null && account.Status != "ACTIVE") throw new DomainException("MEMBER_NOT_ACTIVE", 403);
+        if (account is not null && (account.Status != "ACTIVE" || account.DeletedAt is not null)) throw new DomainException("MEMBER_NOT_ACTIVE", 403);
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN")))
             throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
@@ -404,6 +409,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct)
     {
         _ = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
         if (string.IsNullOrWhiteSpace(request.CoarseCell) || request.CoarseCell.Length > 32 || request.Source is not ("CHECK_IN" or "FOREGROUND_GEO" or "VENUE_ZONE")) throw new DomainException("PRESENCE_INVALID");
         var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE" && x.ActiveUntil > DateTimeOffset.UtcNow)
             ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 403);
@@ -417,6 +423,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct)
     {
         if (senderId == request.RecipientMemberId) throw new DomainException("SELF_CONNECTION_INVALID");
+        EnsureNotDeletionPending(senderId);
         if (request.ContextId is not null) return await CreateCommitAsync(senderId, request, idempotencyKey, ct);
         _ = FindProfile(senderId);
         _ = FindProfile(request.RecipientMemberId);
@@ -451,7 +458,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (plan.WhereType == "SPOT") throw new DomainException("MEETING_SPOT_NOT_FOUND", 404);
         _ = FindProfile(senderId);
         // A blocked or hidden recipient looks like an unknown one, so a block is never revealed.
-        if (!store.Profiles.Any(x => x.MemberId == request.RecipientMemberId && x.Status == "ACTIVE") || IsBlocked(senderId, request.RecipientMemberId))
+        if (!ActiveProfileRows.Any(x => x.MemberId == request.RecipientMemberId) || IsBlocked(senderId, request.RecipientMemberId))
             throw new DomainException("PROFILE_NOT_FOUND", 404);
         if (!IsAttending(evt.EventId, senderId)) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
@@ -501,7 +508,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var rows = store.ConnectionRequests
             .Where(x => x.RecipientMemberId == memberId && x.Status == "PENDING" && x.ExpiresAt > now && x.ContextId != null && (eventId == null || x.ContextId == eventId))
             .OrderByDescending(x => x.CreatedAt).Take(100).ToArray();
-        var blocked = BlockedAmong(memberId, rows.Select(x => x.SenderMemberId).Distinct().ToArray());
+        var senders = rows.Select(x => x.SenderMemberId).Distinct().ToArray();
+        var blocked = BlockedAmong(memberId, senders);
+        blocked.UnionWith(store.Accounts.Where(x => senders.Contains(x.MemberId) && x.DeletedAt != null).Select(x => x.MemberId));
         rows = rows.Where(x => !blocked.Contains(x.SenderMemberId)).ToArray();
         var events = CommitEvents(rows);
         var profiles = ActiveProfiles(rows.Select(x => x.SenderMemberId));
@@ -546,7 +555,10 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<ConnectionResponse?> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct)
     {
+        EnsureNotDeletionPending(memberId);
         var row = store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId && x.RecipientMemberId == memberId) ?? throw new DomainException("CONNECTION_REQUEST_NOT_FOUND", 404);
+        // A request from a member who is deleting their account is gone, as it is in the incoming list.
+        if (IsDeletionPending(row.SenderMemberId)) throw new DomainException("CONNECTION_REQUEST_NOT_FOUND", 404);
         var isCommit = row.ContextId is not null;
         if (isCommit && row.Status != "PENDING") throw new DomainException("COMMIT_NOT_PENDING", 409);
         if (isCommit && row.ExpiresAt <= DateTimeOffset.UtcNow) throw new DomainException("COMMIT_EXPIRED", 409);
@@ -679,6 +691,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))) throw new DomainException("MESSAGE_INVALID");
+        EnsureNotDeletionPending(memberId);
         if (store.IsRelational)
             return Map(await store.SaveMessageAsync(memberId, conversationId, request, idempotencyKey, Hash(memberId, conversationId, request.MessageId, request.MessageType, request.Body, request.ClientSentAt?.ToString("O")), ct));
         var conversation = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404);
@@ -775,12 +788,39 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct)
     {
         if (request.RequestType is not ("ACCESS" or "CORRECT" or "DELETE" or "EXPORT" or "CONSENT_SUPPORT")) throw new DomainException("PRIVACY_REQUEST_INVALID");
+        var isDelete = request.RequestType == "DELETE";
+        if (isDelete && store.PrivacyRequests.Any(x => x.MemberId == memberId && x.RequestType == "DELETE" && OpenPrivacyStatuses.Contains(x.Status)))
+            throw new DomainException("PRIVACY_REQUEST_ALREADY_OPEN", 409);
         var row = new PrivacyRequest { MemberId = memberId, RequestType = request.RequestType, DueAt = DateTimeOffset.UtcNow.AddDays(30) };
         store.Add(row);
+        if (isDelete) StartDeletion(memberId);
         AddChange(memberId, "PRIVACY_REQUEST", row.PrivacyRequestId, "UPSERT", new { row.PrivacyRequestId, row.RequestType, row.Status, row.CreatedAt, row.DueAt });
         AddOutbox("PRIVACY_REQUEST", row.PrivacyRequestId, "PrivacyRequestCreated.v1", new { privacy_request_id = row.PrivacyRequestId, member_id = memberId, row.RequestType });
         await store.SaveAsync(ct);
         return Map(row);
+    }
+
+    public Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        IReadOnlyList<PrivacyRequestResponse> result = store.PrivacyRequests.Where(x => x.MemberId == memberId).OrderByDescending(x => x.CreatedAt).Take(50).AsEnumerable().Select(Map).ToArray();
+        return Task.FromResult(result);
+    }
+
+    // A deletion request starts the erasure workflow (iam.member.deleted_at). From then on the member is out of
+    // matching (NLP excludes deleted_at), profiles, attendee lists and Commits, and can't go live, send Commits or
+    // messages. The data itself is erased when the request is completed; rejecting the request restores the member.
+    private void StartDeletion(string memberId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (account is not null) account.DeletedAt ??= now;
+        foreach (var session in store.LiveSessions.Where(x => x.MemberId == memberId && x.Status == "ACTIVE").ToArray())
+        {
+            session.Status = "DISABLED"; session.RevokedAt = now;
+            AddChange(memberId, "LIVE_MODE", session.EventId, "DELETE", null);
+            AddOutbox("LIVE_MODE", session.SessionId, "LiveModeChanged.v1", new { session_id = session.SessionId, event_id = session.EventId, member_id = memberId, session.Status });
+        }
     }
 
     public Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct)
@@ -794,7 +834,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(new SyncResponse(page, page.Length == 0 ? null : EncodeCursor(page[^1].Sequence), hasMore));
     }
 
-    private MemberProfile FindProfile(string id) => store.Profiles.SingleOrDefault(x => x.MemberId == id && x.Status == "ACTIVE") ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+    private static readonly string[] OpenPrivacyStatuses = ["OPEN", "VERIFIED", "PROCESSING"];
+    // Active profiles of members who haven't asked to delete their account.
+    private IQueryable<MemberProfile> ActiveProfileRows => store.Profiles.Where(p => p.Status == "ACTIVE" && !store.Accounts.Any(a => a.MemberId == p.MemberId && a.DeletedAt != null));
+    private bool IsDeletionPending(string memberId) => store.Accounts.Any(x => x.MemberId == memberId && x.DeletedAt != null);
+    private void EnsureNotDeletionPending(string memberId) { if (IsDeletionPending(memberId)) throw new DomainException("MEMBER_NOT_ACTIVE", 403); }
+    private MemberProfile FindProfile(string id) => ActiveProfileRows.SingleOrDefault(x => x.MemberId == id) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
     // A member only sees events in their own community; others behave as unknown (the database
     // refuses Live Mode across communities). Unknown accounts (InMemory fixtures) aren't scoped.
     private string? MemberCommunity(string memberId) => store.Accounts.Where(x => x.MemberId == memberId).Select(x => x.CommunityId).FirstOrDefault();
@@ -822,7 +867,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private Dictionary<string, MemberProfile> ActiveProfiles(IEnumerable<string> memberIds)
     {
         var ids = memberIds.Distinct().ToArray();
-        return store.Profiles.Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE").ToDictionary(x => x.MemberId);
+        return ActiveProfileRows.Where(x => ids.Contains(x.MemberId)).ToDictionary(x => x.MemberId);
     }
     // Commits sent before plans existed default to "their choice, now".
     private static CommitPlanResponse PlanOf(ConnectionRequest x) => CommitPlans.ToResponse(CommitPlans.Decode(x.Note) ?? new(CommitPlans.TheirChoice, null, "NOW"), x.ContextId);

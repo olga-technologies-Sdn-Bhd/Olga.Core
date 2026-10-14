@@ -194,6 +194,8 @@ memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, Notifica
     .WithName("SetNotificationPreference").WithTags("Preferences and privacy").Produces<NotificationPreferenceResponse>(200);
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)))
     .WithName("CreatePrivacyRequest").WithTags("Preferences and privacy").Produces<PrivacyRequestResponse>(202);
+memberV1.MapGet("/me/privacy-requests", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(Member(c), ct)))
+    .WithName("ListPrivacyRequests").WithTags("Preferences and privacy").Produces<IReadOnlyList<PrivacyRequestResponse>>(200);
 memberV1.MapGet("/sync/changes", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetChangesAsync(Member(c), DecodeCursor(cursor), limit ?? 100, ct)))
     .WithName("GetSyncChanges").WithTags("Offline sync").Produces<SyncResponse>(200);
 
