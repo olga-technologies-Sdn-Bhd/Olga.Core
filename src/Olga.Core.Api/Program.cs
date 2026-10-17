@@ -16,9 +16,25 @@ builder.Services.ConfigureHttpJsonOptions(o => { o.SerializerOptions.PropertyNam
 const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
+const string adminCorsPolicy = "AdminPortal";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
 var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
+var adminOrigins = builder.Configuration
+    .GetSection("Cors:AdminOrigins")
+    .GetChildren()
+    .Select(section => section.Value)
+    .Where(value => !string.IsNullOrWhiteSpace(value))
+    .Cast<string>()
+    .ToArray();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(adminCorsPolicy, policy => policy
+        .WithOrigins(adminOrigins)
+        .AllowAnyMethod()
+        .AllowAnyHeader()
+        .WithExposedHeaders("ETag", "X-Correlation-Id"));
+});
 builder.Services.AddOpenApi(options =>
 {
     options.AddDocumentTransformer((document, _, _) =>
@@ -63,6 +79,7 @@ builder.Services.AddScoped<IAdminService, AdminService>();
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
+app.UseCors(adminCorsPolicy);
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
