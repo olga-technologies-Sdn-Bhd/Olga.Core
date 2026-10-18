@@ -616,6 +616,44 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Admin_lists_who_is_live_and_can_end_a_session_like_the_member_would()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.AddRange(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" }, new EventRegistration { EventId = "E", MemberId = "B", Status = "REGISTERED" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var admin = new AdminEventService(db);
+        foreach (var id in new[] { "A", "B" }) await service.RecordConsentAsync(id, new("LIVE_MODE", "1", "GRANTED"), default);
+        var a = await service.StartLiveModeAsync("A", "E", new(60), default);
+        await service.StartLiveModeAsync("B", "E", new(30), default);
+
+        var live = await admin.GetLiveSessionsAsync("E", default);
+        Assert.Equal(new[] { "B", "A" }, live.Select(x => x.MemberId));
+        Assert.Equal(("A", a.SessionId, a.ActiveUntil), (live[1].DisplayName, live[1].SessionId, live[1].ActiveUntil));
+
+        await admin.EndLiveSessionAsync("E", "A", default);
+
+        var ended = db.LiveModeSessions.Single(x => x.MemberId == "A");
+        Assert.Equal("DISABLED", ended.Status);
+        Assert.NotNull(ended.RevokedAt);
+        var change = db.Changes.OrderByDescending(x => x.SyncSequence).First();
+        Assert.Equal(("A", "LIVE_MODE", "E", "DELETE"), (change.MemberScopeId, change.ResourceType, change.ResourceId, change.ChangeType));
+        Assert.Equal("B", Assert.Single(await admin.GetLiveSessionsAsync("E", default)).MemberId);
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "A", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => service.StopLiveModeAsync("A", "E", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "nobody", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => admin.EndLiveSessionAsync("nope", "B", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => admin.GetLiveSessionsAsync("nope", default));
+        // An expired session isn't live: it's left out and can't be ended.
+        db.LiveModeSessions.Single(x => x.MemberId == "B").ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Empty(await admin.GetLiveSessionsAsync("E", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "B", default));
+        // The member can go live again after an admin end.
+        Assert.Equal("ACTIVE", (await service.StartLiveModeAsync("A", "E", new(30), default)).Status);
+    }
+
+    [Fact]
     public async Task Going_live_again_extends_the_session_onto_the_latest_consent()
     {
         await using var db = Db(); SeedMembersAndEvent(db);

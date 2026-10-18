@@ -256,6 +256,10 @@ adminV1.MapGet("/events/{eventId}/attendees", async (string eventId, IAdminEvent
     .WithName("AdminListEventAttendees").WithTags("Admin events").Produces<IReadOnlyList<AdminAttendeeResponse>>(200);
 adminV1.MapPost("/events/{eventId}/attendees/{memberId}/check-in", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CheckInAsync(eventId, memberId, ct)))
     .WithName("AdminCheckInEventAttendee").WithTags("Admin events").Produces<RegistrationResponse>(200);
+adminV1.MapGet("/events/{eventId}/live-sessions", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetLiveSessionsAsync(eventId, ct)))
+    .WithName("AdminListLiveSessions").WithTags("Admin events").Produces<IReadOnlyList<AdminLiveSessionResponse>>(200);
+adminV1.MapPost("/events/{eventId}/live-sessions/{memberId}/end", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => { await s.EndLiveSessionAsync(eventId, memberId, ct); return Results.NoContent(); })
+    .WithName("AdminEndLiveSession").WithTags("Admin events").Produces(204);
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)))
     .WithName("AdminListVenues").WithTags("Admin venues").Produces<IReadOnlyList<AdminVenueResponse>>(200);
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); })
