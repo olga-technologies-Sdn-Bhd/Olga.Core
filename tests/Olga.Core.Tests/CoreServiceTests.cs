@@ -323,6 +323,56 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Reporting_a_member_opens_a_report_and_an_admin_case_next_to_message_reports()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("B", conversationId, new("r1", "Spam link"), "rep-m1", default);
+
+        var report = await service.ReportMemberAsync("A", "B", new("fake_profile", "  Not a real person  "), default);
+        await service.ReportMessageAsync("A", "r1", new("SPAM"), default);
+
+        Assert.Equal(("FAKE_PROFILE", "OPEN"), (report.Category, report.Status));
+        var row = db.MemberReports.Single(x => x.ReportId == report.ReportId);
+        Assert.Equal(("A", "B", "PROFILE", "B", "Not a real person"), (row.ReporterMemberId, row.ReportedMemberId, row.ResourceType, row.ResourceId, row.Description));
+        var reports = await new AdminService(db).GetReportsAsync(null, default);
+        Assert.Equal(2, reports.Count);
+        Assert.Contains(reports, x => x.SubjectMemberId == "B" && x.ResourceType == "PROFILE");
+        Assert.Contains(reports, x => x.SubjectMemberId == "B" && x.ResourceType == "MESSAGE");
+    }
+
+    [Fact]
+    public async Task Member_report_rules_self_duplicate_resource_and_reopen_after_closing()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("B", conversationId, new("r1", "Hi"), "rep-m1", default);
+        await service.BlockAsync("B", new("A"), default);
+
+        await AssertCode("SELF_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "A", new("SPAM"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("RUDE"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", new string('x', 2001)), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceType: "ATTACHMENT"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceId: "r1"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("C", "B", new("SPAM", ResourceType: "MESSAGE", ResourceId: "r1"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceType: "PROFILE", ResourceId: "C"), default));
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.ReportMemberAsync("A", "nobody", new("SPAM"), default));
+
+        // B blocked A, but A can still report B's message, and the response names no one.
+        var report = await service.ReportMemberAsync("A", "B", new("HARASSMENT", ResourceType: "message", ResourceId: "r1"), default);
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportMemberAsync("A", "B", new("SPAM"), default));
+        Assert.Equal("OPEN", (await service.ReportMemberAsync("C", "B", new("SPAM"), default)).Status);
+
+        var caseId = db.ModerationCases.Single(x => x.SourceId == report.ReportId).ModerationCaseId;
+        await new AdminService(db).SetReportStatusAsync(caseId, new("CLOSED"), default);
+        Assert.Equal("OPEN", (await service.ReportMemberAsync("A", "B", new("SPAM"), default)).Status);
+    }
+
+    [Fact]
     public async Task Message_receipt_is_monotonic_and_updates_participant_cursor()
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();

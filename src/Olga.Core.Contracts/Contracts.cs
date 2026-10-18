@@ -66,6 +66,10 @@ public sealed record MessageCreateRequest(string MessageId, string? Body, string
 public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt = null);
 // Category: SPAM, HARASSMENT, INAPPROPRIATE, SCAM or OTHER.
 public sealed record MessageReportRequest(string Category, string? Description = null);
+// Category: SPAM, HARASSMENT, INAPPROPRIATE, FAKE_PROFILE or OTHER. resource_type: PROFILE, REQUEST or MESSAGE (optional).
+public sealed record MemberReportRequest(string Category, string? Description = null, string? ResourceType = null, string? ResourceId = null);
+// Never carries the reported member's name or other details.
+public sealed record MemberReportResponse(string ReportId, string Category, string Status, DateTimeOffset CreatedAt);
 public sealed record MessageReportResponse(string ReportId, string MessageId, string Category, string Status, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
 // plan is the accepted Commit's meeting plan, when the conversation came from a Commit.

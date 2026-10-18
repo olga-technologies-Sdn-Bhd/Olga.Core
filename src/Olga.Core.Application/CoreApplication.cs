@@ -84,6 +84,7 @@ public interface ICoreService
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
     Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
+    Task<MemberReportResponse> ReportMemberAsync(string memberId, string reportedMemberId, MemberReportRequest request, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
@@ -797,6 +798,38 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         store.Add(new ModerationCase { SourceType = "MEMBER_REPORT", SourceId = report.ReportId, SubjectMemberId = message.SenderMemberId, ResourceType = "MESSAGE", ResourceId = messageId });
         await store.SaveAsync(ct);
         return new(report.ReportId, messageId, report.Category, report.Status, report.CreatedAt);
+    }
+
+    public async Task<MemberReportResponse> ReportMemberAsync(string memberId, string reportedMemberId, MemberReportRequest request, CancellationToken ct)
+    {
+        if (memberId == reportedMemberId) throw new DomainException("SELF_REPORT_INVALID");
+        var category = request.Category?.Trim().ToUpperInvariant();
+        var resourceType = string.IsNullOrWhiteSpace(request.ResourceType) ? null : request.ResourceType.Trim().ToUpperInvariant();
+        var resourceId = string.IsNullOrWhiteSpace(request.ResourceId) ? null : request.ResourceId.Trim();
+        if (category is not ("SPAM" or "HARASSMENT" or "INAPPROPRIATE" or "FAKE_PROFILE" or "OTHER") || request.Description?.Length > 2000
+            || resourceType is not (null or "PROFILE" or "REQUEST" or "MESSAGE") || resourceId?.Length > 64 || (resourceId is not null && resourceType is null))
+            throw new DomainException("MEMBER_REPORT_INVALID");
+        // Any profile row counts, so a member who blocked or hid from the reporter can still be reported without revealing it.
+        if (!store.Profiles.Any(x => x.MemberId == reportedMemberId)) throw new DomainException("PROFILE_NOT_FOUND", 404);
+        // A named resource must belong to the reported member and involve the reporter.
+        var resourceValid = (resourceType, resourceId) switch
+        {
+            (_, null) => true,
+            ("PROFILE", _) => resourceId == reportedMemberId,
+            ("REQUEST", _) => store.ConnectionRequests.Any(x => x.RequestId == resourceId && ((x.SenderMemberId == reportedMemberId && x.RecipientMemberId == memberId) || (x.SenderMemberId == memberId && x.RecipientMemberId == reportedMemberId))),
+            _ => store.Messages.Any(x => x.MessageId == resourceId && x.SenderMemberId == reportedMemberId
+                && store.Conversations.Any(c => c.ConversationId == x.ConversationId && store.Connections.Any(n => n.ConnectionId == c.ConnectionId && (n.MemberLowId == memberId || n.MemberHighId == memberId))))
+        };
+        if (!resourceValid) throw new DomainException("MEMBER_REPORT_INVALID");
+        // One open report per reporter and member: open until admin actions or closes its case.
+        var open = store.MemberReports.Any(x => x.ReporterMemberId == memberId && x.ReportedMemberId == reportedMemberId && x.Status == "OPEN"
+            && store.ModerationCases.Any(c => c.SourceType == "MEMBER_REPORT" && c.SourceId == x.ReportId && (c.Status == "OPEN" || c.Status == "TRIAGED")));
+        if (open) throw new DomainException("REPORT_ALREADY_OPEN", 409);
+        var report = new MemberReport { ReporterMemberId = memberId, ReportedMemberId = reportedMemberId, ResourceType = resourceType ?? "PROFILE", ResourceId = resourceId ?? reportedMemberId, Category = category, Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim() };
+        store.Add(report);
+        store.Add(new ModerationCase { SourceType = "MEMBER_REPORT", SourceId = report.ReportId, SubjectMemberId = reportedMemberId, ResourceType = report.ResourceType, ResourceId = report.ResourceId });
+        await store.SaveAsync(ct);
+        return new(report.ReportId, report.Category, report.Status, report.CreatedAt);
     }
 
     public Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct)
