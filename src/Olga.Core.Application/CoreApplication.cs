@@ -40,6 +40,8 @@ public interface ICoreStore
     Task<MessageReceipt> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
     // Reads nlp.nlp_match_result scores; empty when the store has no NLP data.
     Task<IReadOnlyList<MatchScore>> GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct);
+    // Reads the member's own nlp.nlp_intent rows; empty when the store has no NLP data.
+    Task<IReadOnlyList<ExportIntent>> GetMemberIntentsAsync(string memberId, CancellationToken ct);
 }
 
 public sealed record MatchScore(long MatchResultId, string RequesterId, string CandidateId, decimal Score);
@@ -84,6 +86,8 @@ public interface ICoreService
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
     Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct);
+    // Also records a completed EXPORT privacy request so admin can see it happened.
+    Task<DataExportResponse> ExportMyDataAsync(string memberId, CancellationToken ct);
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
 }
 
@@ -805,6 +809,67 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         ct.ThrowIfCancellationRequested();
         IReadOnlyList<PrivacyRequestResponse> result = store.PrivacyRequests.Where(x => x.MemberId == memberId).OrderByDescending(x => x.CreatedAt).Take(50).AsEnumerable().Select(Map).ToArray();
         return Task.FromResult(result);
+    }
+
+    // What GET /v1/me/export covers: IAM (consents, privacy requests), profile, event registrations, social (Commits, connections), chat and NLP intents.
+    private static readonly string[] ExportDomains = ["IAM", "PROFILE", "EVENT", "SOCIAL", "CHAT", "NLP"];
+
+    public async Task<DataExportResponse> ExportMyDataAsync(string memberId, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var profileRow = store.Profiles.SingleOrDefault(x => x.MemberId == memberId);
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (profileRow is null && account is null) throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var profile = profileRow is null ? null : WithContactHints(Map(profileRow));
+        var intents = await store.GetMemberIntentsAsync(memberId, ct);
+
+        var registrations = store.Registrations.Where(x => x.MemberId == memberId).OrderByDescending(x => x.RegisteredAt).ToArray();
+        var eventIds = registrations.Select(x => x.EventId).ToArray();
+        var eventNames = store.Events.Where(x => eventIds.Contains(x.EventId)).ToDictionary(x => x.EventId, x => x.Name);
+
+        // Another member is named only while connected; before that they stay anonymous, as in the app.
+        var connections = store.Connections.Where(x => x.MemberLowId == memberId || x.MemberHighId == memberId).OrderByDescending(x => x.ConnectedAt).ToArray();
+        var connectedIds = connections.Where(x => x.Status == "ACTIVE").Select(x => OtherMember(x, memberId)).ToHashSet();
+        var names = store.Profiles.Where(x => connectedIds.Contains(x.MemberId)).ToDictionary(x => x.MemberId, x => x.DisplayName);
+        string? NameOf(string id) => connectedIds.Contains(id) ? names.GetValueOrDefault(id) : null;
+
+        var requests = store.ConnectionRequests.Where(x => x.SenderMemberId == memberId || x.RecipientMemberId == memberId).OrderByDescending(x => x.CreatedAt).ToArray();
+        ExportRequest Request(ConnectionRequest x, bool sent)
+        {
+            var other = sent ? x.RecipientMemberId : x.SenderMemberId;
+            var isCommit = x.ContextId is not null;
+            var status = sent && isCommit && x.Status != "ACCEPTED" ? (x.Status is "PENDING" or "DECLINED" && x.ExpiresAt > now ? "PENDING" : "EXPIRED") : x.Status;
+            var known = connectedIds.Contains(other) || (sent && !isCommit);
+            return new ExportRequest(x.RequestId, x.ContextId, status, isCommit ? PlanOf(x) : null, sent && !isCommit ? x.Note : null, known ? other : null, NameOf(other), x.CreatedAt, x.ExpiresAt);
+        }
+
+        var messages = store.Messages.Where(x => x.SenderMemberId == memberId).OrderBy(x => x.CreatedAt).AsEnumerable()
+            .Select(x => new ExportMessage(x.MessageId, x.ConversationId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.CreatedAt, x.DeletedAt)).ToArray();
+        var consents = (from consent in store.Consents
+                        join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId
+                        where consent.MemberId == memberId
+                        orderby consent.CapturedAt descending
+                        select new ExportConsent(policy.PurposeCode, policy.Version, consent.Decision, consent.CapturedAt, consent.WithdrawnAt)).ToArray();
+
+        // The export itself is recorded as a completed EXPORT request, so it is part of this file too. The database
+        // completes a request only once each domain task is completed with evidence, so the tasks are saved first.
+        var record = new PrivacyRequest { MemberId = memberId, RequestType = "EXPORT", Status = "PROCESSING", VerifiedAt = now, DueAt = now };
+        store.Add(record);
+        foreach (var domain in ExportDomains)
+            store.Add(new PrivacyRequestTask { PrivacyRequestId = record.PrivacyRequestId, DomainCode = domain, ActionType = "EXPORT", Status = "COMPLETED", AttemptCount = 1, EvidenceCode = "CORE_SELF_SERVICE_EXPORT", StartedAt = now, CompletedAt = now });
+        AddOutbox("PRIVACY_REQUEST", record.PrivacyRequestId, "PrivacyRequestCreated.v1", new { privacy_request_id = record.PrivacyRequestId, member_id = memberId, record.RequestType });
+        await store.SaveAsync(ct);
+        record.Status = "COMPLETED"; record.CompletedAt = now; record.UpdatedAt = now;
+        AddChange(memberId, "PRIVACY_REQUEST", record.PrivacyRequestId, "UPSERT", new { record.PrivacyRequestId, record.RequestType, record.Status, record.CreatedAt, record.DueAt });
+        await store.SaveAsync(ct);
+        var privacy = store.PrivacyRequests.Where(x => x.MemberId == memberId).OrderByDescending(x => x.CreatedAt).AsEnumerable().Select(Map).ToArray();
+
+        return new DataExportResponse(now, memberId, profile, intents,
+            registrations.Select(x => new ExportRegistration(x.EventId, eventNames.GetValueOrDefault(x.EventId), x.Status, x.RegisteredAt, x.CheckedInAt)).ToArray(),
+            requests.Where(x => x.SenderMemberId == memberId).Select(x => Request(x, true)).ToArray(),
+            requests.Where(x => x.RecipientMemberId == memberId).Select(x => Request(x, false)).ToArray(),
+            connections.Select(x => { var other = OtherMember(x, memberId); return new ExportConnection(x.ConnectionId, x.Status, connectedIds.Contains(other) ? other : null, NameOf(other), x.ConnectedAt, x.DisconnectedAt); }).ToArray(),
+            messages, consents, privacy);
     }
 
     // A deletion request starts the erasure workflow (iam.member.deleted_at). From then on the member is out of

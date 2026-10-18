@@ -213,6 +213,14 @@ memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCre
     .WithName("CreatePrivacyRequest").WithTags("Preferences and privacy").Produces<PrivacyRequestResponse>(202);
 memberV1.MapGet("/me/privacy-requests", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(Member(c), ct)))
     .WithName("ListPrivacyRequests").WithTags("Preferences and privacy").Produces<IReadOnlyList<PrivacyRequestResponse>>(200);
+memberV1.MapGet("/me/export", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.ExportMyDataAsync(Member(c), ct);
+    c.Response.Headers.ContentDisposition = $"attachment; filename=\"olga-export-{value.ExportedAt:yyyy-MM-dd}.json\"";
+    c.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(value);
+})
+    .WithName("ExportMyData").WithTags("Preferences and privacy").Produces<DataExportResponse>(200);
 memberV1.MapGet("/sync/changes", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetChangesAsync(Member(c), DecodeCursor(cursor), limit ?? 100, ct)))
     .WithName("GetSyncChanges").WithTags("Offline sync").Produces<SyncResponse>(200);
 

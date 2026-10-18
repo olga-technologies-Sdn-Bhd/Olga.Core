@@ -261,6 +261,23 @@ public sealed class PrivacyRequest
     public long RowVersion { get; set; } = 1;
 }
 
+// consent.privacy_request_task: one domain's work for a privacy request. The database lets a request complete
+// only when every task is COMPLETED or EXEMPTED with completed_at and evidence_code.
+public sealed class PrivacyRequestTask
+{
+    public long Id { get; set; }
+    public string PrivacyRequestId { get; set; } = "";
+    public string DomainCode { get; set; } = "";
+    public string ActionType { get; set; } = "";
+    public string Status { get; set; } = "PENDING";
+    public short AttemptCount { get; set; }
+    public string? EvidenceCode { get; set; }
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class SyncChange
 {
     public long SyncSequence { get; set; }

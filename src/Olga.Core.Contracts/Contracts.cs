@@ -76,6 +76,27 @@ public sealed record NotificationPreferenceRequest(string PurposeCode, bool Push
 public sealed record NotificationPreferenceResponse(string PurposeCode, bool PushEnabled, bool EmailEnabled, TimeOnly? QuietStartLocal, TimeOnly? QuietEndLocal, string? TimezoneId, string ETag, DateTimeOffset UpdatedAt);
 public sealed record PrivacyRequestCreate(string RequestType);
 public sealed record PrivacyRequestResponse(string PrivacyRequestId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt);
+// GET /v1/me/export: the member's own data only. Another member is named only while connected; contact details are masked hints.
+public sealed record DataExportResponse(
+    DateTimeOffset ExportedAt,
+    string MemberId,
+    ProfileResponse? Profile,
+    IReadOnlyList<ExportIntent> Intents,
+    IReadOnlyList<ExportRegistration> EventRegistrations,
+    IReadOnlyList<ExportRequest> CommitsSent,
+    IReadOnlyList<ExportRequest> CommitsReceived,
+    IReadOnlyList<ExportConnection> Connections,
+    IReadOnlyList<ExportMessage> Messages,
+    IReadOnlyList<ExportConsent> Consents,
+    IReadOnlyList<PrivacyRequestResponse> PrivacyRequests);
+public sealed record ExportIntent(string IntentId, string ContextId, string IntentType, string Text, string Status, string? Category, string? Industry, string? Geography, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt);
+public sealed record ExportRegistration(string EventId, string? EventName, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt);
+// event_id is set for Commits and null for plain connection requests. A sent Commit's DECLINED shows as PENDING, then EXPIRED, as in the app.
+public sealed record ExportRequest(string RequestId, string? EventId, string Status, CommitPlanResponse? Plan, string? Note, string? MemberId, string? DisplayName, DateTimeOffset CreatedAt, DateTimeOffset ExpiresAt);
+public sealed record ExportConnection(string ConnectionId, string Status, string? MemberId, string? DisplayName, DateTimeOffset ConnectedAt, DateTimeOffset? DisconnectedAt);
+// Only messages the member sent; a deleted message has a null body.
+public sealed record ExportMessage(string MessageId, string ConversationId, string MessageType, string? Body, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt);
+public sealed record ExportConsent(string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
 public sealed record SyncItem(long Sequence, string ResourceType, string ResourceId, string ChangeType, long? ResourceVersion, object? Payload, DateTimeOffset OccurredAt);
 public sealed record SyncResponse(IReadOnlyList<SyncItem> Items, string? NextCursor, bool HasMore);
 public sealed record AdminEventCreateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true, bool Publish = false);

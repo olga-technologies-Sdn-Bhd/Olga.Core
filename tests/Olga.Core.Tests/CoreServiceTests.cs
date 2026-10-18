@@ -683,6 +683,51 @@ public sealed class CoreServiceTests
         Assert.Equal("OPEN", (await service.CreatePrivacyRequestAsync("A", new("DELETE"), default)).Status);
     }
 
+    [Fact]
+    public async Task Data_export_has_my_data_names_only_connected_members_and_is_recorded()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C");
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("x1", "Mine"), "exp-m1", default);
+        await service.SendMessageAsync("A", conversationId, new("x2", "Deleted"), "exp-m2", default);
+        await service.SendMessageAsync("B", conversationId, new("x3", "Theirs"), "exp-m3", default);
+        await service.DeleteMessageAsync("A", "x2", default);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("C"), "exp-c1", default);
+        await service.DecideConnectionRequestAsync("C", sent.RequestId, new("DECLINE"), "exp-d1", default);
+        db.LiveModeSessions.Add(new LiveModeSession { EventId = "E", MemberId = "C", ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(30) });
+        await db.SaveChangesAsync();
+        var received = await service.CreateConnectionRequestAsync("C", Commit("A"), "exp-c2", default);
+
+        var export = await service.ExportMyDataAsync("A", default);
+
+        Assert.Equal(("A", "A"), (export.MemberId, export.Profile!.DisplayName));
+        Assert.Equal("E", Assert.Single(export.EventRegistrations).EventId);
+        Assert.Equal(("GRANTED", "LIVE_MODE"), (Assert.Single(export.Consents).Decision, export.Consents[0].PurposeCode));
+        Assert.Equal(new[] { "Mine", null }, export.Messages.Select(x => x.Body));
+        var connection = Assert.Single(export.Connections);
+        Assert.Equal(("B", "B"), (connection.MemberId, connection.DisplayName));
+        // The declined Commit to C still reads as PENDING and C stays anonymous, in both directions.
+        var commit = export.CommitsSent.Single(x => x.RequestId == sent.RequestId);
+        Assert.Equal(("PENDING", null, null, "E"), (commit.Status, commit.MemberId, commit.DisplayName, commit.EventId));
+        var incoming = export.CommitsReceived.Single(x => x.RequestId == received.RequestId);
+        Assert.Equal(((string?)null, (string?)null), (incoming.MemberId, incoming.DisplayName));
+        var record = Assert.Single(export.PrivacyRequests);
+        Assert.Equal(("EXPORT", "COMPLETED"), (record.RequestType, record.Status));
+        Assert.NotNull(db.MemberPrivacyRequests.Single().CompletedAt);
+        Assert.Equal(6, db.PrivacyRequestTasks.Count(x => x.PrivacyRequestId == record.PrivacyRequestId && x.Status == "COMPLETED" && x.EvidenceCode != null && x.CompletedAt != null));
+        Assert.Empty(export.Intents);
+    }
+
+    [Fact]
+    public async Task Data_export_for_an_unknown_member_is_not_registered()
+    {
+        await using var db = Db();
+        await AssertCode("MEMBER_NOT_REGISTERED", 404, () => Service(db).ExportMyDataAsync("nobody", default));
+        Assert.Empty(db.MemberPrivacyRequests);
+    }
+
     private static async Task<CoreService> DeletionSetupAsync(CoreDbContext db)
     {
         var service = await CommitSetupAsync(db);
