@@ -211,6 +211,8 @@ memberV1.MapDelete("/messages/{messageId}", async (HttpContext c, string message
     .WithName("DeleteMessage").WithTags("Chat").Produces(204);
 memberV1.MapPost("/messages/{messageId}/report", async (HttpContext c, string messageId, MessageReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/messages/{messageId}/report", await s.ReportMessageAsync(Member(c), messageId, body, ct)))
     .WithName("ReportMessage").WithTags("Chat").Produces<MessageReportResponse>(201);
+memberV1.MapPost("/members/{memberId}/report", async (HttpContext c, string memberId, MemberReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/members/{memberId}/report", await s.ReportMemberAsync(Member(c), memberId, body, ct)))
+    .WithName("ReportMember").WithTags("Social").Produces<MemberReportResponse>(201);
 memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, NotificationPreferenceRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SetNotificationPreferenceAsync(Member(c), body, ct)))
     .WithName("SetNotificationPreference").WithTags("Preferences and privacy").Produces<NotificationPreferenceResponse>(200);
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)))
