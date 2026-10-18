@@ -652,7 +652,54 @@ public sealed class CoreServiceTests
         await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.CreateConnectionRequestAsync("A", Commit("B"), "commit-2", default));
         await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.UpdateProfileAsync("A", new("A", null, null, null), "\"1\"", default));
         await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
-        Assert.Equal("A", (await service.GetOwnProfileAsync("A", default)).MemberId);
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.GetOwnProfileAsync("A", default));
+        Assert.Single(await service.GetPrivacyRequestsAsync("A", default));
+    }
+
+    [Fact]
+    public async Task Member_waiting_for_deletion_cannot_sign_in_or_sign_up_again()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default);
+        var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+
+        var lookup = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new(" ASHA@example.com"), default));
+        var byEmail = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", "asha@example.com"), "register-del-2", default));
+        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789"), "register-del-3", default));
+        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default));
+
+        foreach (var error in new[] { lookup, byEmail, byPhone, replay })
+        {
+            Assert.Equal(("MEMBER_DELETION_PENDING", 409), (error.Code, error.StatusCode));
+            Assert.Equal(request.DueAt, Assert.IsType<DeletionPendingDetails>(error.Details).DueAt);
+        }
+        Assert.Single(db.MemberAccounts);
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.GetOwnProfileAsync(member.MemberId, default));
+    }
+
+    [Fact]
+    public async Task Sign_in_works_again_after_a_rejected_deletion_and_the_email_is_free_after_erasure()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com"), "register-del", default);
+        var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+
+        await new AdminService(db).SetPrivacyRequestStatusAsync(request.PrivacyRequestId, new("REJECTED"), default);
+        Assert.Equal(member.MemberId, (await service.LookupMemberByEmailAsync(new("asha@example.com"), default)).MemberId);
+        Assert.Equal(member.MemberId, (await service.GetOwnProfileAsync(member.MemberId, default)).MemberId);
+
+        // Erasure (not built yet) removes the identity rows, since the database's unique index covers revoked ones too.
+        await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+        db.MemberIdentities.RemoveRange(db.MemberIdentities.Where(x => x.MemberId == member.MemberId));
+        db.MemberAccounts.Single(x => x.MemberId == member.MemberId).Status = "DELETED";
+        await db.SaveChangesAsync();
+
+        await AssertCode("MEMBER_NOT_REGISTERED", 404, () => service.LookupMemberByEmailAsync(new("asha@example.com"), default));
+        var fresh = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com"), "register-new", default);
+        Assert.NotEqual(member.MemberId, fresh.MemberId);
+        Assert.Equal(fresh.MemberId, (await service.LookupMemberByEmailAsync(new("asha@example.com"), default)).MemberId);
     }
 
     [Fact]
