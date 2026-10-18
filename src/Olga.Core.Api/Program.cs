@@ -189,6 +189,10 @@ memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, Cancellati
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
     .WithName("BlockMember").WithTags("Social").Produces(204);
+memberV1.MapDelete("/members/block/{memberId}", async (HttpContext c, string memberId, ICoreService s, CancellationToken ct) => { await s.UnblockAsync(Member(c), memberId, ct); return Results.NoContent(); })
+    .WithName("UnblockMember").WithTags("Social").Produces(204);
+memberV1.MapGet("/me/blocks", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetBlocksAsync(Member(c), ct)))
+    .WithName("ListBlockedMembers").WithTags("Social").Produces<IReadOnlyList<BlockedMemberResponse>>(200);
 memberV1.MapGet("/conversations", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationsAsync(Member(c), cursor, limit ?? 20, ct)))
     .WithName("ListConversations").WithTags("Chat").Produces<ConversationListResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationAsync(Member(c), conversationId, ct)))
