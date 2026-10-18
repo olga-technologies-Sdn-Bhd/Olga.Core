@@ -33,6 +33,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<MessageReceipt> MessageReceipts => Set<MessageReceipt>();
     public DbSet<NotificationPreference> Preferences => Set<NotificationPreference>();
     public DbSet<PrivacyRequest> MemberPrivacyRequests => Set<PrivacyRequest>();
+    public DbSet<PrivacyRequestTask> PrivacyRequestTasks => Set<PrivacyRequestTask>();
     public DbSet<SyncChange> Changes => Set<SyncChange>();
     public DbSet<ModerationCase> ModerationCases => Set<ModerationCase>();
     public DbSet<MemberReport> MemberReports => Set<MemberReport>();
@@ -276,6 +277,27 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
+    async Task<IReadOnlyList<Contracts.ExportIntent>> ICoreStore.GetMemberIntentsAsync(string memberId, CancellationToken ct)
+    {
+        if (!Database.IsRelational()) return [];
+        await using var command = CreateCommand("""
+            SELECT intent_id, context_id, intent_type, original_text, status, category, industry, geography, expires_at, created_at
+            FROM nlp.nlp_intent WHERE member_id = @member_id ORDER BY created_at DESC
+            """);
+        AddVarchar(command, "member_id", memberId, 64);
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            var intents = new List<Contracts.ExportIntent>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                intents.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4),
+                    GetNullableString(reader, "category"), GetNullableString(reader, "industry"), GetNullableString(reader, "geography"), GetInstant(reader, "expires_at"), GetInstant(reader, "created_at")));
+            return intents;
+        }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
     async Task<MessageReceipt> ICoreStore.SaveMessageReceiptAsync(string memberId, string messageId, Contracts.MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct)
     {
         await using var command = CreateCommand("SELECT * FROM chat.save_message_receipt(@message_id, @member_id, @delivered_at, @read_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
@@ -338,6 +360,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<ModerationCase>(e => { e.ToTable("moderation_case", "moderation"); e.HasKey(x => x.ModerationCaseId); e.Property(x => x.ModerationCaseId).HasMaxLength(64); e.Property(x => x.SourceType).HasMaxLength(32); e.Property(x => x.SourceId).HasMaxLength(64); e.Property(x => x.SubjectMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Priority).HasMaxLength(16); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.AssignedTo).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberReport>(e => { e.ToTable("member_report", "social"); e.HasKey(x => x.ReportId); e.Property(x => x.ReportId).HasMaxLength(64); e.Property(x => x.ReporterMemberId).HasMaxLength(64); e.Property(x => x.ReportedMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Category).HasMaxLength(64); e.Property(x => x.Description).HasMaxLength(2000); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
+        // The foreign key makes EF insert the request before its tasks in one save.
+        model.Entity<PrivacyRequestTask>(e => { e.ToTable("privacy_request_task", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("privacy_request_task_id").UseIdentityByDefaultColumn(); e.HasOne<PrivacyRequest>().WithMany().HasForeignKey(x => x.PrivacyRequestId); });
         model.Entity<SyncChange>(e => { e.ToTable("sync_change", "ops"); e.HasKey(x => x.SyncSequence); e.Property(x => x.SyncSequence).ValueGeneratedOnAdd(); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberScopeId, x.SyncSequence }); });
         model.Entity<IdempotencyRecord>(e => { e.ToTable("idempotency_record", "ops"); e.HasKey(x => new { x.Scope, x.ActorId, x.IdempotencyKey }); e.Property(x => x.RequestHash).HasMaxLength(64).IsFixedLength(); });
         model.Entity<OutboxEvent>(e => { e.ToTable("outbox_event", "ops"); e.HasKey(x => x.OutboxEventId); e.Property(x => x.OutboxEventId).HasMaxLength(64); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.PublishedAt, x.OccurredAt }); });
