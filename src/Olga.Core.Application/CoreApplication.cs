@@ -30,6 +30,7 @@ public interface ICoreStore
     IQueryable<SyncChange> SyncChanges { get; }
     IQueryable<ModerationCase> ModerationCases { get; }
     IQueryable<MemberReport> MemberReports { get; }
+    IQueryable<IdempotencyRecord> IdempotencyRecords { get; }
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
@@ -60,6 +61,8 @@ public interface ICoreService
     Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
+    // A retry with the same Idempotency-Key returns the session without extending it again.
+    Task<LiveModeResponse> ExtendLiveModeAsync(string memberId, string eventId, LiveModeExtendRequest request, string idempotencyKey, CancellationToken ct);
     Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct);
     // With context_id set the request is a Commit for that event.
     Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct);
@@ -395,6 +398,36 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddOutbox("LIVE_MODE", row.SessionId, "LiveModeChanged.v1", new { session_id = row.SessionId, event_id = eventId, member_id = memberId, row.Status, row.ActiveUntil });
         await store.SaveAsync(ct);
         return Map(row);
+    }
+
+    public async Task<LiveModeResponse> ExtendLiveModeAsync(string memberId, string eventId, LiveModeExtendRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
+        var evt = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
+        var now = DateTimeOffset.UtcNow;
+        var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE");
+        const string scope = "event.extend_live_mode";
+        var requestHash = Hash(scope, memberId, eventId, request.DurationMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var replay = store.IdempotencyRecords.SingleOrDefault(x => x.Scope == scope && x.ActorId == memberId && x.IdempotencyKey == idempotencyKey);
+        if (replay is not null)
+        {
+            if (replay.RequestHash != requestHash) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return session?.SessionId == replay.ResponseRef ? Map(session!) : throw new DomainException("LIVE_MODE_NOT_ACTIVE", 409);
+        }
+        if (session is null || session.ActiveUntil <= now || evt.EndsAt <= now) throw new DomainException("LIVE_MODE_NOT_ACTIVE", 409);
+        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_DISABLED", 409);
+        // Same rule as Go Live: the database rejects an active session on an older or withdrawn LIVE_MODE consent.
+        var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
+        // Only active_until moves: no new match request, so the member keeps the same matches.
+        session.ActiveUntil = Min(session.ActiveUntil.AddMinutes(request.DurationMinutes), evt.EndsAt);
+        session.ConsentRecordId = consent.Id;
+        store.Add(new IdempotencyRecord { Scope = scope, IdempotencyKey = idempotencyKey, ActorId = memberId, RequestHash = requestHash, StatusCode = 200, ResponseRef = session.SessionId, ExpiresAt = now.AddHours(24) });
+        AddChange(memberId, "LIVE_MODE", eventId, "UPSERT", new { session.SessionId, event_id = eventId, session.Status, session.ActiveUntil });
+        AddOutbox("LIVE_MODE", session.SessionId, "LiveModeChanged.v1", new { session_id = session.SessionId, event_id = eventId, member_id = memberId, session.Status, session.ActiveUntil });
+        await store.SaveAsync(ct);
+        return Map(session);
     }
 
     public async Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct)

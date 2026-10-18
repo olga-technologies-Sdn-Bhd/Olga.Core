@@ -275,6 +275,19 @@ public sealed class SyncChange
     public DateTimeOffset ExpiresAt { get; set; } = DateTimeOffset.UtcNow.AddDays(30);
 }
 
+// ops.idempotency_record: replay boundary for writes that aren't naturally idempotent.
+public sealed class IdempotencyRecord
+{
+    public string Scope { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+    public string ActorId { get; set; } = "";
+    public string RequestHash { get; set; } = "";
+    public short? StatusCode { get; set; }
+    public string? ResponseRef { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ExpiresAt { get; set; }
+}
+
 public sealed class OutboxEvent
 {
     public string OutboxEventId { get; set; } = Guid.NewGuid().ToString("N");
