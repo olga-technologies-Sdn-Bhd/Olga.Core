@@ -128,6 +128,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var identities = new List<ProtectedIdentity>(2);
         if (!string.IsNullOrWhiteSpace(request.Email)) identities.Add(identityProtector.ProtectEmail(memberId, request.Email, true));
         if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0));
+        // An email or phone whose member is waiting for deletion can't come back as that member or a new one.
+        foreach (var identity in identities)
+        {
+            var existing = store.Identities.Where(x => x.Provider == identity.Provider && x.ProviderSubjectHash == identity.SubjectHash).Select(x => x.MemberId).FirstOrDefault();
+            if (existing is not null && IsDeletionPending(existing)) throw DeletionPending(existing);
+        }
 
         var member = new NewMemberRegistration(
             memberId,
@@ -154,6 +160,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Where(x => x.Provider == "EMAIL" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE")
             .Select(x => x.MemberId)
             .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        if (IsDeletionPending(memberId)) throw DeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
         var mapped = Map(profile);
         return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
@@ -168,6 +175,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        EnsureNotDeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
         return Task.FromResult(WithContactHints(Map(profile)));
     }
@@ -839,6 +847,16 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private IQueryable<MemberProfile> ActiveProfileRows => store.Profiles.Where(p => p.Status == "ACTIVE" && !store.Accounts.Any(a => a.MemberId == p.MemberId && a.DeletedAt != null));
     private bool IsDeletionPending(string memberId) => store.Accounts.Any(x => x.MemberId == memberId && x.DeletedAt != null);
     private void EnsureNotDeletionPending(string memberId) { if (IsDeletionPending(memberId)) throw new DomainException("MEMBER_NOT_ACTIVE", 403); }
+    // Sign-in and sign-up answer for a member waiting for deletion; due_at comes from their latest deletion request still in force.
+    private DomainException DeletionPending(string memberId)
+    {
+        var dueAt = store.PrivacyRequests
+            .Where(x => x.MemberId == memberId && x.RequestType == "DELETE" && x.Status != "REJECTED")
+            .OrderByDescending(x => x.CreatedAt)
+            .Select(x => x.DueAt)
+            .FirstOrDefault();
+        return new DomainException("MEMBER_DELETION_PENDING", 409) { Details = new DeletionPendingDetails(dueAt) };
+    }
     private MemberProfile FindProfile(string id) => ActiveProfileRows.SingleOrDefault(x => x.MemberId == id) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
     // A member only sees events in their own community; others behave as unknown (the database
     // refuses Live Mode across communities). Unknown accounts (InMemory fixtures) aren't scoped.

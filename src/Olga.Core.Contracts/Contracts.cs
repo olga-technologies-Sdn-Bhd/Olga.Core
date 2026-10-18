@@ -5,7 +5,10 @@ public sealed record ApiError(
     string Message,
     string CorrelationId,
     IReadOnlyDictionary<string, string[]>? FieldErrors = null,
-    string? StackTrace = null);
+    string? StackTrace = null,
+    object? Details = null);
+// details of 409 MEMBER_DELETION_PENDING: when the open deletion request is due to complete.
+public sealed record DeletionPendingDetails(DateTimeOffset? DueAt);
 public sealed record MemberCreateRequest(
     string DisplayName,
     string? Email = null,

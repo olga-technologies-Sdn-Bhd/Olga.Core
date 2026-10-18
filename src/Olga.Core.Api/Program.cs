@@ -94,7 +94,7 @@ app.Use(async (context, next) =>
         }
         await next();
     }
-    catch (DomainException ex) { await Error(context, ex.StatusCode, ex.Code); }
+    catch (DomainException ex) { await Error(context, ex.StatusCode, ex.Code, details: ex.Details); }
     catch (DbUpdateConcurrencyException) { await Error(context, 409, "RESOURCE_VERSION_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsUniqueViolation(ex)) { await Error(context, 409, "RESOURCE_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsForeignKeyViolation(ex)) { await Error(context, 409, "RESOURCE_REFERENCE_NOT_FOUND"); }
@@ -313,7 +313,7 @@ static long DecodeCursor(string? cursor)
     catch (FormatException) { throw new DomainException("SYNC_CURSOR_INVALID"); }
 }
 
-static async Task Error(HttpContext context, int status, string code, Exception? exception = null, bool includeStackTrace = false)
+static async Task Error(HttpContext context, int status, string code, Exception? exception = null, bool includeStackTrace = false, object? details = null)
 {
     if (context.Response.HasStarted) return;
     context.Response.StatusCode = status; context.Response.ContentType = "application/problem+json";
@@ -327,7 +327,7 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         "INTERNAL_ERROR" => "The request could not be completed.",
         _ => "The request is invalid or cannot be completed in its current state."
     };
-    await context.Response.WriteAsJsonAsync(new ApiError(code, message, context.TraceIdentifier, StackTrace: includeStackTrace ? exception?.ToString() : null));
+    await context.Response.WriteAsJsonAsync(new ApiError(code, message, context.TraceIdentifier, StackTrace: includeStackTrace ? exception?.ToString() : null, Details: details));
 }
 
 static byte[] ReadIdentityMasterKey(IConfiguration configuration)

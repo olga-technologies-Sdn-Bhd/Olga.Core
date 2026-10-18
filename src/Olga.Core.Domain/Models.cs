@@ -292,6 +292,8 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
 {
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
+    // Extra fields for the client, returned as "details" in the error body.
+    public object? Details { get; init; }
 }
 
 public sealed class MemberReport
