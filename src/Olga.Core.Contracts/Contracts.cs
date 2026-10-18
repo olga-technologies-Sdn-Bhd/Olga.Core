@@ -125,4 +125,6 @@ public sealed record AdminConsentPolicyCreateRequest(string PurposeCode, string 
 public sealed record AdminConsentPolicyResponse(string PolicyId, string PurposeCode, string Version, string Locale, string ContentHash, DateTimeOffset EffectiveFrom, DateTimeOffset? RetiredAt, string Status);
 public sealed record ActiveConsentPolicyResponse(string PolicyId, string PurposeCode, string Version, string Locale, string ContentHash, DateTimeOffset EffectiveFrom, string? CurrentDecision, DateTimeOffset? DecisionCapturedAt);
 public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);
+// Live-ops: a member live in the event now. activated_at is when the session started.
+public sealed record AdminLiveSessionResponse(string MemberId, string? DisplayName, string SessionId, DateTimeOffset ActivatedAt, DateTimeOffset ActiveUntil);
 public sealed record AdminAttendeeResponse(string MemberId, string DisplayName, string? Headline, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt, bool IsLive);
