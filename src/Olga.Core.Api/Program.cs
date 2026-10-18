@@ -169,6 +169,8 @@ memberV1.MapPost("/events/{eventId}/register", async (HttpContext c, string even
     .WithName("RegisterForEvent").WithTags("Events").Produces<RegistrationResponse>(200);
 memberV1.MapPost("/events/{eventId}/live-mode", async (HttpContext c, string eventId, LiveModeRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.StartLiveModeAsync(Member(c), eventId, body, ct)))
     .WithName("StartLiveMode").WithTags("Events").Produces<LiveModeResponse>(200);
+memberV1.MapPost("/events/{eventId}/live-mode/extend", async (HttpContext c, string eventId, LiveModeExtendRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.ExtendLiveModeAsync(Member(c), eventId, body, Idempotency(c), ct)))
+    .WithName("ExtendLiveMode").WithTags("Events").Produces<LiveModeResponse>(200);
 memberV1.MapDelete("/events/{eventId}/live-mode", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => { await s.StopLiveModeAsync(Member(c), eventId, ct); return Results.NoContent(); })
     .WithName("StopLiveMode").WithTags("Events").Produces(204);
 memberV1.MapPost("/events/{eventId}/presence", async (HttpContext c, string eventId, PresenceRequest body, ICoreService s, CancellationToken ct) => { await s.RecordPresenceAsync(Member(c), eventId, body, ct); return Results.Accepted(); })

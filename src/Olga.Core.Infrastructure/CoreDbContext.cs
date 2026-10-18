@@ -37,6 +37,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<ModerationCase> ModerationCases => Set<ModerationCase>();
     public DbSet<MemberReport> MemberReports => Set<MemberReport>();
     public DbSet<OutboxEvent> OutboxEvents => Set<OutboxEvent>();
+    public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
     IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
@@ -61,6 +62,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<SyncChange> ICoreStore.SyncChanges => Changes;
     IQueryable<ModerationCase> ICoreStore.ModerationCases => ModerationCases;
     IQueryable<MemberReport> ICoreStore.MemberReports => MemberReports;
+    IQueryable<IdempotencyRecord> ICoreStore.IdempotencyRecords => IdempotencyRecords;
 
     void ICoreStore.Add<T>(T entity) => Set<T>().Add(entity);
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
@@ -337,6 +339,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<MemberReport>(e => { e.ToTable("member_report", "social"); e.HasKey(x => x.ReportId); e.Property(x => x.ReportId).HasMaxLength(64); e.Property(x => x.ReporterMemberId).HasMaxLength(64); e.Property(x => x.ReportedMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Category).HasMaxLength(64); e.Property(x => x.Description).HasMaxLength(2000); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<SyncChange>(e => { e.ToTable("sync_change", "ops"); e.HasKey(x => x.SyncSequence); e.Property(x => x.SyncSequence).ValueGeneratedOnAdd(); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberScopeId, x.SyncSequence }); });
+        model.Entity<IdempotencyRecord>(e => { e.ToTable("idempotency_record", "ops"); e.HasKey(x => new { x.Scope, x.ActorId, x.IdempotencyKey }); e.Property(x => x.RequestHash).HasMaxLength(64).IsFixedLength(); });
         model.Entity<OutboxEvent>(e => { e.ToTable("outbox_event", "ops"); e.HasKey(x => x.OutboxEventId); e.Property(x => x.OutboxEventId).HasMaxLength(64); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.PublishedAt, x.OccurredAt }); });
 
         foreach (var entity in model.Model.GetEntityTypes())

@@ -34,6 +34,8 @@ public sealed record EventAttendeeResponse(string MemberId, string? Headline, st
 public sealed record EventAttendeesResponse(IReadOnlyList<EventAttendeeResponse> Attendees, int Total);
 public sealed record RegistrationResponse(string EventId, string MemberId, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt = null);
 public sealed record LiveModeRequest(int DurationMinutes = 60);
+// Adds duration_minutes (5-240) to the current active_until, capped at the event's end.
+public sealed record LiveModeExtendRequest(int DurationMinutes);
 public sealed record LiveModeResponse(string SessionId, string EventId, string Status, DateTimeOffset ActiveUntil);
 public sealed record PresenceRequest(string CoarseCell, DateTimeOffset ObservedAt, string Source = "FOREGROUND_GEO");
 // A Commit is a connection request with context_id = event_id: a short meeting in that room.

@@ -728,6 +728,62 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Extending_live_mode_adds_time_once_per_key_and_stops_at_the_event_end()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var started = await service.StartLiveModeAsync("A", "E", new(30), default);
+        var changesBefore = db.Changes.Count();
+
+        var extended = await service.ExtendLiveModeAsync("A", "E", new(45), "extend-1", default);
+        var replay = await service.ExtendLiveModeAsync("A", "E", new(45), "extend-1", default);
+
+        Assert.Equal(started.SessionId, extended.SessionId);
+        Assert.Equal(started.ActiveUntil.AddMinutes(45), extended.ActiveUntil);
+        Assert.Equal(extended.ActiveUntil, replay.ActiveUntil);
+        Assert.Equal(changesBefore + 1, db.Changes.Count());
+        Assert.Equal("LIVE_MODE", db.Changes.OrderByDescending(x => x.SyncSequence).First().ResourceType);
+        await AssertCode("IDEMPOTENCY_KEY_REUSED", 409, () => service.ExtendLiveModeAsync("A", "E", new(60), "extend-1", default));
+
+        var ends = DateTimeOffset.UtcNow.AddMinutes(90);
+        db.EventRecords.Single().EndsAt = ends;
+        await db.SaveChangesAsync();
+        Assert.Equal(ends, (await service.ExtendLiveModeAsync("A", "E", new(240), "extend-2", default)).ActiveUntil);
+    }
+
+    [Fact]
+    public async Task Extending_live_mode_needs_an_active_session_and_a_valid_duration()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" });
+        db.MemberAccounts.Add(new MemberAccount { MemberId = "A", CommunityId = "olga" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        await AssertCode("LIVE_MODE_DURATION_INVALID", 400, () => service.ExtendLiveModeAsync("A", "E", new(4), "x-1", default));
+        await AssertCode("LIVE_MODE_DURATION_INVALID", 400, () => service.ExtendLiveModeAsync("A", "E", new(241), "x-2", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => service.ExtendLiveModeAsync("A", "nope", new(30), "x-3", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-4", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        db.LiveModeSessions.Single().ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-5", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.StopLiveModeAsync("A", "E", default);
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-6", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-7", default));
+    }
+
+    [Fact]
     public async Task Delete_request_takes_the_member_out_of_the_product_straight_away()
     {
         await using var db = Db();
