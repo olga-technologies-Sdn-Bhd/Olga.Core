@@ -278,6 +278,51 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Block_list_shows_my_active_blocks_newest_first_with_names()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "Cara", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.BlockAsync("A", new("B"), default);
+        db.MemberBlocks.Single().CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await db.SaveChangesAsync();
+        await service.BlockAsync("A", new("C"), default);
+        await service.BlockAsync("B", new("A"), default);
+
+        var list = await service.GetBlocksAsync("A", default);
+
+        Assert.Equal(new[] { "C", "B" }, list.Select(x => x.MemberId));
+        Assert.Equal("Cara", list[0].DisplayName);
+        Assert.Equal("A", Assert.Single(await service.GetBlocksAsync("B", default)).MemberId);
+        Assert.Empty(await service.GetBlocksAsync("C", default));
+    }
+
+    [Fact]
+    public async Task Unblock_lifts_the_block_but_restores_no_connection_or_chat()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await ConnectAsync(service, "A", "B");
+        await service.BlockAsync("A", new("B"), default);
+
+        await service.UnblockAsync("A", "B", default);
+
+        Assert.NotNull(db.MemberBlocks.Single().RemovedAt);
+        Assert.Empty(await service.GetBlocksAsync("A", default));
+        Assert.Empty(await service.GetConnectionsAsync("A", default));
+        Assert.Empty((await service.GetConversationsAsync("B", null, 20, default)).Items);
+        Assert.Equal("PENDING", (await service.CreateConnectionRequestAsync("B", new("A"), "after-unblock", default)).Status);
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("A", "B", default));
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("A", "nobody", default));
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("B", "A", default));
+        // Blocking again after an unblock works and the member is hidden again.
+        await service.BlockAsync("A", new("B"), default);
+        Assert.Equal("B", Assert.Single(await service.GetBlocksAsync("A", default)).MemberId);
+        await AssertCode("CONNECTION_NOT_ALLOWED", 403, () => service.CreateConnectionRequestAsync("A", new("B"), "after-reblock", default));
+    }
+
+    [Fact]
     public async Task Message_receipt_is_monotonic_and_updates_participant_cursor()
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();

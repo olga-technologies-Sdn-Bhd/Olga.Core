@@ -56,6 +56,8 @@ public sealed record OutgoingCommitResponse(string RequestId, CommitEventSummary
 public sealed record CommitQuotaResponse(int Limit, int Used, int Remaining);
 public sealed record MeetingSpotResponse(string SpotId, string Label);
 public sealed record BlockRequest(string MemberId);
+// A member's own block list: the blocker knows who they blocked, so the name is included.
+public sealed record BlockedMemberResponse(string MemberId, string? DisplayName, DateTimeOffset BlockedAt);
 public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null);
 // A deleted message keeps its place in the conversation with a null body and deleted_at set.
 public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt = null);

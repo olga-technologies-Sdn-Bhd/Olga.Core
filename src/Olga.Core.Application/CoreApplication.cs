@@ -70,6 +70,10 @@ public interface ICoreService
     Task<IReadOnlyList<IncomingCommitResponse>> GetIncomingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
     Task<IReadOnlyList<OutgoingCommitResponse>> GetOutgoingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
     Task BlockAsync(string memberId, BlockRequest request, CancellationToken ct);
+    // Members I blocked and haven't unblocked, newest first.
+    Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct);
+    // Restores nothing: a connection or chat ended by the block stays ended.
+    Task UnblockAsync(string memberId, string blockedMemberId, CancellationToken ct);
     Task<IReadOnlyList<ConnectionResponse>> GetConnectionsAsync(string memberId, CancellationToken ct);
     // Newest activity first; cursor is the opaque next_cursor from the previous page.
     Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct);
@@ -607,6 +611,27 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         foreach (var connection in store.Connections.Where(x => x.Status == "ACTIVE" && ((x.MemberLowId == memberId && x.MemberHighId == request.MemberId) || (x.MemberLowId == request.MemberId && x.MemberHighId == memberId))).ToArray()) { connection.Status = "DISCONNECTED"; connection.DisconnectedAt = DateTimeOffset.UtcNow; }
         foreach (var id in new[] { memberId, request.MemberId }) AddChange(id, "CONNECTION", PairKey(memberId, request.MemberId), "DELETE", null);
         AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, request.MemberId).Low, Pair(memberId, request.MemberId).High), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
+        await store.SaveAsync(ct);
+    }
+
+    public Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var blocks = store.Blocks.Where(x => x.BlockerMemberId == memberId && x.RemovedAt == null).OrderByDescending(x => x.CreatedAt).ThenByDescending(x => x.Id).ToArray();
+        var ids = blocks.Select(x => x.BlockedMemberId).ToArray();
+        // Any profile row, not only active ones, so a hidden member can still be found and unblocked.
+        var names = store.Profiles.Where(x => ids.Contains(x.MemberId)).ToDictionary(x => x.MemberId, x => x.DisplayName);
+        IReadOnlyList<BlockedMemberResponse> result = blocks
+            .Select(x => new BlockedMemberResponse(x.BlockedMemberId, string.IsNullOrWhiteSpace(names.GetValueOrDefault(x.BlockedMemberId)) ? null : names[x.BlockedMemberId], x.CreatedAt))
+            .ToArray();
+        return Task.FromResult(result);
+    }
+
+    public async Task UnblockAsync(string memberId, string blockedMemberId, CancellationToken ct)
+    {
+        var block = store.Blocks.FirstOrDefault(x => x.BlockerMemberId == memberId && x.BlockedMemberId == blockedMemberId && x.RemovedAt == null) ?? throw new DomainException("BLOCK_NOT_FOUND", 404);
+        block.RemovedAt = DateTimeOffset.UtcNow;
+        AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, blockedMemberId).Low, Pair(memberId, blockedMemberId).High), "MemberUnblocked.v1", new { actor_member_id = memberId, target_member_id = blockedMemberId });
         await store.SaveAsync(ct);
     }
 
