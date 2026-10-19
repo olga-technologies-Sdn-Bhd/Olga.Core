@@ -687,6 +687,73 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Recipient_reports_a_commit_sender_by_request_without_learning_who_they_are()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "crep-1", default);
+
+        var report = await service.ReportIncomingCommitAsync("B", sent.RequestId, new("harassment", "  Pushy  "), default);
+
+        Assert.Equal(("HARASSMENT", "OPEN"), (report.Category, report.Status));
+        Assert.DoesNotContain("\"A\"", System.Text.Json.JsonSerializer.Serialize(report));
+        var row = db.MemberReports.Single();
+        Assert.Equal(("B", "A", "REQUEST", sent.RequestId, "Pushy"), (row.ReporterMemberId, row.ReportedMemberId, row.ResourceType, row.ResourceId, row.Description));
+        var admin = Assert.Single(await new AdminService(db).GetReportsAsync(null, default));
+        Assert.Equal(("A", "REQUEST", sent.RequestId), (admin.SubjectMemberId, admin.ResourceType, admin.ResourceId));
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM"), default));
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportMemberAsync("B", "A", new("SPAM"), default));
+    }
+
+    [Fact]
+    public async Task Commit_report_rules_category_note_and_only_the_recipient()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C");
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "crep-2", default);
+        var plain = await service.CreateConnectionRequestAsync("C", new("B"), "crep-plain", default);
+
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("RUDE"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM", new string('x', 2001)), default));
+        foreach (var (who, id) in new[] { ("A", sent.RequestId), ("C", sent.RequestId), ("B", "missing"), ("B", plain.RequestId) })
+        {
+            await AssertCode("COMMIT_NOT_FOUND", 404, () => service.ReportIncomingCommitAsync(who, id, new("SPAM"), default));
+            await AssertCode("COMMIT_NOT_FOUND", 404, () => service.BlockIncomingCommitSenderAsync(who, id, default));
+        }
+        Assert.Empty(db.MemberReports);
+        Assert.Empty(db.MemberBlocks);
+
+        // Declined and expired Commits can still be reported.
+        await service.DecideConnectionRequestAsync("B", sent.RequestId, new("DECLINE"), "crep-3", default);
+        db.SocialConnectionRequests.Single(x => x.RequestId == sent.RequestId).ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Equal("SPAM", (await service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM"), default)).Category);
+    }
+
+    [Fact]
+    public async Task Blocking_a_commit_sender_declines_it_silently_and_hides_them_everywhere()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "cblk-1", default);
+        Assert.Contains((await service.GetEventAttendeesAsync("B", "E", default)).Attendees, x => x.MemberId == "A");
+
+        await service.BlockIncomingCommitSenderAsync("B", sent.RequestId, default);
+        await service.BlockIncomingCommitSenderAsync("B", sent.RequestId, default);
+
+        Assert.Empty(await service.GetIncomingCommitsAsync("B", null, default));
+        Assert.DoesNotContain((await service.GetEventAttendeesAsync("B", "E", default)).Attendees, x => x.MemberId == "A");
+        Assert.Equal("DECLINED", db.SocialConnectionRequests.Single().Status);
+        Assert.Equal("PENDING", Assert.Single(await service.GetOutgoingCommitsAsync("A", "E", default)).Status);
+        var block = Assert.Single(db.MemberBlocks);
+        Assert.Equal(("B", "A"), (block.BlockerMemberId, block.BlockedMemberId));
+        // NLP drops the sender from my matches on this event.
+        Assert.Contains(db.OutboxEvents, x => x.EventType == "MemberBlocked.v1");
+        Assert.Equal("A", Assert.Single(await service.GetBlocksAsync("B", default)).MemberId);
+        await AssertCode("COMMIT_NOT_PENDING", 409, () => service.DecideConnectionRequestAsync("B", sent.RequestId, new("ACCEPT"), "cblk-2", default));
+    }
+
+    [Fact]
     public async Task Accepting_a_commit_reveals_names_and_pins_the_plan_on_the_conversation()
     {
         await using var db = Db();

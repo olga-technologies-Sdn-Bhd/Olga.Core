@@ -71,6 +71,8 @@ public sealed record MessageReportRequest(string Category, string? Description =
 // Category: SPAM, HARASSMENT, INAPPROPRIATE, FAKE_PROFILE or OTHER. resource_type: PROFILE, REQUEST or MESSAGE (optional).
 public sealed record MemberReportRequest(string Category, string? Description = null, string? ResourceType = null, string? ResourceId = null);
 // Never carries the reported member's name or other details.
+// Reports the sender of an incoming Commit without naming them.
+public sealed record CommitReportRequest(string Category, string? Description = null);
 public sealed record MemberReportResponse(string ReportId, string Category, string Status, DateTimeOffset CreatedAt);
 public sealed record MessageReportResponse(string ReportId, string MessageId, string Category, string Status, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
