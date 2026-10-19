@@ -185,6 +185,10 @@ memberV1.MapGet("/events/{eventId}/meeting-spots", async (HttpContext c, string 
     .WithName("ListMeetingSpots").WithTags("Commits").Produces<IReadOnlyList<MeetingSpotResponse>>(200);
 memberV1.MapGet("/me/commits/incoming", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIncomingCommitsAsync(Member(c), eventId, ct)))
     .WithName("ListIncomingCommits").WithTags("Commits").Produces<IReadOnlyList<IncomingCommitResponse>>(200);
+memberV1.MapPost("/me/commits/incoming/{requestId}/report", async (HttpContext c, string requestId, CommitReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/me/commits/incoming/{requestId}/report", await s.ReportIncomingCommitAsync(Member(c), requestId, body, ct)))
+    .WithName("ReportIncomingCommitSender").WithTags("Commits").Produces<MemberReportResponse>(201);
+memberV1.MapPost("/me/commits/incoming/{requestId}/block", async (HttpContext c, string requestId, ICoreService s, CancellationToken ct) => { await s.BlockIncomingCommitSenderAsync(Member(c), requestId, ct); return Results.NoContent(); })
+    .WithName("BlockIncomingCommitSender").WithTags("Commits").Produces(204);
 memberV1.MapGet("/me/commits/outgoing", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetOutgoingCommitsAsync(Member(c), eventId, ct)))
     .WithName("ListOutgoingCommits").WithTags("Commits").Produces<IReadOnlyList<OutgoingCommitResponse>>(200);
 memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConnectionsAsync(Member(c), ct)))

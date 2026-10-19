@@ -74,6 +74,9 @@ public interface ICoreService
     Task<IReadOnlyList<MeetingSpotResponse>> GetMeetingSpotsAsync(string memberId, string eventId, CancellationToken ct);
     Task<IReadOnlyList<IncomingCommitResponse>> GetIncomingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
     Task<IReadOnlyList<OutgoingCommitResponse>> GetOutgoingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
+    // Report or block the sender of a Commit sent to me, by request ID, so the sender is never revealed. 404 COMMIT_NOT_FOUND unless I am the recipient.
+    Task<MemberReportResponse> ReportIncomingCommitAsync(string memberId, string requestId, CommitReportRequest request, CancellationToken ct);
+    Task BlockIncomingCommitSenderAsync(string memberId, string requestId, CancellationToken ct);
     Task BlockAsync(string memberId, BlockRequest request, CancellationToken ct);
     // Members I blocked and haven't unblocked, newest first.
     Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct);
@@ -659,6 +662,24 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, request.MemberId).Low, Pair(memberId, request.MemberId).High), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
         await store.SaveAsync(ct);
     }
+
+    public Task<MemberReportResponse> ReportIncomingCommitAsync(string memberId, string requestId, CommitReportRequest request, CancellationToken ct)
+    {
+        var commit = RequireIncomingCommit(memberId, requestId);
+        return ReportMemberAsync(memberId, commit.SenderMemberId, new(request.Category, request.Description, "REQUEST", requestId), ct);
+    }
+
+    public Task BlockIncomingCommitSenderAsync(string memberId, string requestId, CancellationToken ct)
+    {
+        var commit = RequireIncomingCommit(memberId, requestId);
+        // Declined silently: the sender's outgoing list shows a decline exactly like a pending Commit.
+        if (commit.Status == "PENDING") { commit.Status = "DECLINED"; commit.RespondedAt = DateTimeOffset.UtcNow; commit.UpdatedAt = commit.RespondedAt.Value; }
+        return BlockAsync(memberId, new(commit.SenderMemberId), ct);
+    }
+
+    // Any status counts, so a declined, expired or accepted Commit can still be reported or blocked.
+    private ConnectionRequest RequireIncomingCommit(string memberId, string requestId) =>
+        store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId && x.RecipientMemberId == memberId && x.ContextId != null) ?? throw new DomainException("COMMIT_NOT_FOUND", 404);
 
     public Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct)
     {
