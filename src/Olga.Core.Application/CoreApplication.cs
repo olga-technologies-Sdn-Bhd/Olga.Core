@@ -8,6 +8,7 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberProfileImage> ProfileImages { get; }
     IQueryable<MemberAccount> Accounts { get; }
     IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
@@ -55,6 +56,9 @@ public interface ICoreService
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
+    Task<ProfileImageUploadResponse> UploadProfileImageAsync(string memberId, Stream content, long contentLength, string declaredContentType, string idempotencyKey, string? ifMatch, CancellationToken ct);
+    Task<ProfileResponse> DeleteProfileImageAsync(string memberId, string idempotencyKey, string? ifMatch, CancellationToken ct);
+    Task<ProfileImageContent> GetVisibleProfileImageAsync(string actorId, string memberId, string size, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
     Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct);
     // memberId is optional: when supplied, each event carries registration state for that member.
@@ -102,6 +106,15 @@ public interface ICoreService
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
 }
 
+public sealed record ProfileImageContent(Stream Content, string ContentType, string ETag);
+
+public interface IProfileImageStorage
+{
+    Task UploadAsync(string blobPath, Stream content, string contentType, CancellationToken ct);
+    Task<Stream> OpenReadAsync(string blobPath, CancellationToken ct);
+    Task DeleteIfExistsAsync(string blobPath, CancellationToken ct);
+}
+
 public sealed record ProtectedIdentity(string Provider, string SubjectHash, byte[] SubjectCiphertext, string DisplayHint, bool IsPrimary, bool IsVerified);
 public sealed record NewMemberRegistration(
     string MemberId,
@@ -124,7 +137,7 @@ public interface IIdentityProtector
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
-public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector) : ICoreService
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -206,6 +219,86 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(actorId == memberId || IsConnected(actorId, memberId) ? mapped : mapped with { DisplayName = null });
     }
 
+    public async Task<ProfileImageUploadResponse> UploadProfileImageAsync(string memberId, Stream content, long contentLength, string declaredContentType, string idempotencyKey, string? ifMatch, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (contentLength is <= 0 or > 5 * 1024 * 1024) throw new DomainException("PROFILE_IMAGE_SIZE_INVALID", 413);
+        var contentType = declaredContentType.Trim().ToLowerInvariant();
+        if (contentType is not ("image/jpeg" or "image/png" or "image/webp")) throw new DomainException("PROFILE_IMAGE_TYPE_INVALID", 415);
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        var imageId = $"img_{Hash("core.profile_image", memberId, idempotencyKey)[..32]}";
+        var existing = store.ProfileImages.SingleOrDefault(x => x.ImageId == imageId);
+        if (existing is not null)
+        {
+            if (existing.ContentLength != contentLength || !string.Equals(existing.DeclaredContentType, contentType, StringComparison.Ordinal))
+                throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return new(existing.ImageId, existing.Status, $"\"{profile.Version}\"");
+        }
+        EnsureProfileEtag(profile, ifMatch);
+
+        var blobPath = OriginalImagePath(memberId, imageId);
+        await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
+            .UploadAsync(blobPath, content, contentType, ct);
+        store.Add(new MemberProfileImage
+        {
+            ImageId = imageId,
+            MemberId = memberId,
+            OriginalBlobPath = blobPath,
+            DeclaredContentType = contentType,
+            ContentLength = contentLength
+        });
+        TouchProfile(profile);
+        AddOutbox("PROFILE_IMAGE", imageId, "ProfileImageUploaded.v1", new { image_id = imageId, member_id = memberId });
+        await store.SaveAsync(ct);
+        return new(imageId, "PENDING", $"\"{profile.Version}\"");
+    }
+
+    public async Task<ProfileResponse> DeleteProfileImageAsync(string memberId, string idempotencyKey, string? ifMatch, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        const string scope = "core.profile_image.delete";
+        var requestHash = Hash(scope, memberId);
+        var replay = store.IdempotencyRecords.SingleOrDefault(x => x.Scope == scope && x.ActorId == memberId && x.IdempotencyKey == idempotencyKey);
+        if (replay is not null)
+        {
+            if (!string.Equals(replay.RequestHash, requestHash, StringComparison.Ordinal)) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return WithContactHints(Map(profile));
+        }
+        EnsureProfileEtag(profile, ifMatch);
+        var now = DateTimeOffset.UtcNow;
+        var affected = store.ProfileImages.Where(x => x.MemberId == memberId && x.Status != "DELETED").ToList();
+        foreach (var image in affected)
+        {
+            image.Status = "DELETED";
+            image.DeleteAfter = now.AddDays(7);
+            image.UpdatedAt = now;
+            if (!store.IsRelational) image.RowVersion++;
+        }
+        profile.ProfileImageId = null;
+        TouchProfile(profile);
+        AddOutbox("MEMBER", memberId, "ProfileImageRemoved.v1", new { member_id = memberId, image_ids = affected.Select(x => x.ImageId).ToArray() });
+        store.Add(new IdempotencyRecord { Scope = scope, ActorId = memberId, IdempotencyKey = idempotencyKey, RequestHash = requestHash, StatusCode = 200, ExpiresAt = now.AddHours(24) });
+        await store.SaveAsync(ct);
+        return WithContactHints(Map(profile));
+    }
+
+    public async Task<ProfileImageContent> GetVisibleProfileImageAsync(string actorId, string memberId, string size, CancellationToken ct)
+    {
+        _ = await GetVisibleProfileAsync(actorId, memberId, ct);
+        var normalizedSize = size.Trim().ToLowerInvariant();
+        var pixels = normalizedSize switch { "thumbnail" => 64, "small" => 256, "large" => 512, _ => throw new DomainException("PROFILE_IMAGE_SIZE_INVALID") };
+        var profile = FindProfile(memberId);
+        if (profile.ProfileImageId is null) throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
+        var image = store.ProfileImages.SingleOrDefault(x => x.ImageId == profile.ProfileImageId && x.MemberId == memberId && x.Status == "READY")
+            ?? throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
+        var stream = await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
+            .OpenReadAsync(DerivativeImagePath(memberId, image.ImageId, pixels), ct);
+        return new(stream, "image/webp", $"\"{image.RowVersion}\"");
+    }
+
     public async Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.DisplayName) || request.DisplayName.Length > 200) throw new DomainException("PROFILE_INVALID");
@@ -255,6 +348,20 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             EmailHint = hints.FirstOrDefault(x => x.Provider == "EMAIL")?.DisplayHint,
             PhoneHint = hints.FirstOrDefault(x => x.Provider == "PHONE")?.DisplayHint
         };
+    }
+
+    private void EnsureProfileEtag(MemberProfile profile, string? ifMatch)
+    {
+        var isInitialDraft = profile.Status == "DRAFT" && profile.PublishedAt is null && string.IsNullOrWhiteSpace(profile.DisplayName);
+        if (string.IsNullOrWhiteSpace(ifMatch) && !isInitialDraft) throw new DomainException("IF_MATCH_REQUIRED", 428);
+        if (!string.IsNullOrWhiteSpace(ifMatch) && !string.Equals(ifMatch.Trim('"'), profile.Version.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
+            throw new DomainException("RESOURCE_VERSION_CONFLICT", 409);
+    }
+
+    private void TouchProfile(MemberProfile profile)
+    {
+        profile.UpdatedAt = DateTimeOffset.UtcNow;
+        if (!store.IsRelational) profile.Version++;
     }
 
     public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct)
@@ -1151,7 +1258,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
-    private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
+    private ProfileResponse Map(MemberProfile x)
+    {
+        var latest = store.ProfileImages.Where(i => i.MemberId == x.MemberId).OrderByDescending(i => i.CreatedAt).FirstOrDefault();
+        var imageUrl = x.ProfileImageId is null ? null : $"/v1/members/{Uri.EscapeDataString(x.MemberId)}/profile-picture?size=thumbnail";
+        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, latest?.Status);
+    }
+    public static string OriginalImagePath(string memberId, string imageId) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/original";
+    public static string DerivativeImagePath(string memberId, string imageId, int pixels) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/avatar-{pixels}.webp";
     private static EventResponse Map(EventRecord x, bool checkInRequired, string? venue, int attendeeCount, int liveCount, bool? isRegistered, string? registrationStatus) => new(
         x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, checkInRequired, venue,
         attendeeCount, liveCount, isRegistered, registrationStatus);

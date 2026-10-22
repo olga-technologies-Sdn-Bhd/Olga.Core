@@ -52,6 +52,18 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(profileUpdate, "Idempotency-Key", required: true, maxLength: 128);
         AssertHeader(profileUpdate, "If-Match", required: false);
 
+        var profileImageUpload = Operation(document, "/v1/me/profile-picture", "put");
+        AssertHeader(profileImageUpload, "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(profileImageUpload, "If-Match", required: false);
+        Assert.Equal("multipart/form-data", profileImageUpload.GetProperty("requestBody").GetProperty("content").EnumerateObject().Single().Name);
+
+        var profileImageDelete = Operation(document, "/v1/me/profile-picture", "delete");
+        AssertHeader(profileImageDelete, "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(profileImageDelete, "If-Match", required: false);
+
+        var profileImageGet = Operation(document, "/v1/members/{memberId}/profile-picture", "get");
+        AssertNoHeader(profileImageGet, "Idempotency-Key");
+
         var lookupByEmail = Operation(document, "/v1/members/lookup", "post");
         AssertHeader(lookupByEmail, "Idempotency-Key", required: true, maxLength: 128);
         AssertNoHeader(lookupByEmail, "X-Member-Id");

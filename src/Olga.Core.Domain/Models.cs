@@ -21,9 +21,26 @@ public sealed class MemberProfile
     public string Status { get; set; } = "DRAFT";
     public decimal CompletenessScore { get; set; }
     public DateTimeOffset? PublishedAt { get; set; }
+    public string? ProfileImageId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public long Version { get; set; } = 1;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class MemberProfileImage
+{
+    public long Id { get; set; }
+    public string ImageId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public string OriginalBlobPath { get; set; } = "";
+    public string DeclaredContentType { get; set; } = "";
+    public long ContentLength { get; set; }
+    public string Status { get; set; } = "PENDING";
+    public string? FailureCode { get; set; }
+    public DateTimeOffset? DeleteAfter { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class ConsentPolicy

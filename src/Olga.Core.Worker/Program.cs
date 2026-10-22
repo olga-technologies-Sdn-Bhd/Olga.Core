@@ -2,12 +2,14 @@ using Azure.Identity;
 using Azure.Messaging.ServiceBus;
 using Microsoft.EntityFrameworkCore;
 using Olga.Core.Infrastructure;
+using Olga.Core.Application;
 using Olga.Core.Worker;
 
 var builder = Host.CreateApplicationBuilder(args);
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 if (string.IsNullOrWhiteSpace(connection)) throw new InvalidOperationException("ConnectionStrings:PostgreSql is required by the Core worker.");
 builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection, enableRetryOnFailure: false));
+builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddSingleton(sp =>
 {
     var configuration = sp.GetRequiredService<IConfiguration>();
@@ -27,6 +29,8 @@ builder.Services.AddSingleton(sp =>
     return new ServiceBusClient(fullyQualifiedNamespace, new DefaultAzureCredential(credentialOptions));
 });
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
+builder.Services.AddScoped<ProfileImageProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
 builder.Services.AddHostedService<NlpCompletionConsumerWorker>();
+builder.Services.AddHostedService<ProfileImageConsumerWorker>();
 await builder.Build().RunAsync();

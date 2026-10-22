@@ -23,7 +23,8 @@ public sealed record MemberLookupRequest(string? Email);
 public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
 // display_name is null when another member reads a profile they aren't connected to.
 // email_hint and phone_hint are the member's own masked contact details: set only on /v1/me/profile, never for another member.
-public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? EmailHint = null, string? PhoneHint = null);
+public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? ProfileImageUrl = null, string? ProfileImageStatus = null, string? EmailHint = null, string? PhoneHint = null);
+public sealed record ProfileImageUploadResponse(string ImageId, string Status, string ETag);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);

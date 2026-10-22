@@ -14,6 +14,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 {
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
+    public DbSet<MemberProfileImage> MemberProfileImages => Set<MemberProfileImage>();
     public DbSet<MemberAccount> MemberAccounts => Set<MemberAccount>();
     public DbSet<MemberIdentity> MemberIdentities => Set<MemberIdentity>();
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
@@ -41,6 +42,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
+    IQueryable<MemberProfileImage> ICoreStore.ProfileImages => MemberProfileImages;
     IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
     IQueryable<MemberIdentity> ICoreStore.Identities => MemberIdentities;
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
@@ -339,7 +341,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     protected override void OnModelCreating(ModelBuilder model)
     {
         model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
-        model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
+        model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.ProfileImageId).HasMaxLength(64); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
+        model.Entity<MemberProfileImage>(e => { e.ToTable("member_profile_image", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_profile_image_id").UseIdentityByDefaultColumn(); e.Property(x => x.ImageId).HasColumnName("image_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.OriginalBlobPath).HasMaxLength(512); e.Property(x => x.DeclaredContentType).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.FailureCode).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ImageId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });

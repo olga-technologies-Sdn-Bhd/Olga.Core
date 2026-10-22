@@ -72,6 +72,8 @@ var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
+if (local) builder.Services.AddSingleton<IProfileImageStorage, InMemoryProfileImageStorage>();
+else builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
@@ -85,7 +87,8 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
     try
     {
-        if (context.Request.ContentLength is > 256_000) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
+        var requestLimit = context.Request.Path.StartsWithSegments("/v1/me/profile-picture") ? 5_500_000 : 256_000;
+        if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
         if (context.Request.Path.StartsWithSegments("/v1") && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
         {
@@ -154,8 +157,38 @@ profileV1.MapGet("", async (HttpContext c, ICoreService s, CancellationToken ct)
 profileV1.MapPatch("", async (HttpContext c, ProfileUpdateRequest body, ICoreService s, CancellationToken ct) => { var value = await s.UpdateProfileAsync(Member(c), body, c.Request.Headers.IfMatch.FirstOrDefault(), ct); c.Response.Headers.ETag = value.ETag; return Results.Ok(value); })
     .WithMetadata(new IfMatchMetadata())
     .WithName("UpdateOwnProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapPut("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    if (!c.Request.HasFormContentType) throw new DomainException("PROFILE_IMAGE_MULTIPART_REQUIRED", 415);
+    var form = await c.Request.ReadFormAsync(ct);
+    var file = form.Files.GetFile("file") ?? (form.Files.Count == 1 ? form.Files[0] : null)
+        ?? throw new DomainException("PROFILE_IMAGE_REQUIRED");
+    await using var content = file.OpenReadStream();
+    var value = await s.UploadProfileImageAsync(Member(c), content, file.Length, file.ContentType, Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Accepted(value: value);
+})
+    .WithMetadata(new IfMatchMetadata(), new RequestSizeLimitAttribute(5_500_000))
+    .DisableAntiforgery()
+    .Accepts<IFormFile>("multipart/form-data")
+    .WithName("UploadOwnProfileImage").WithTags("Members").Produces<ProfileImageUploadResponse>(202).Produces<ApiError>(413).Produces<ApiError>(415);
+memberV1.MapDelete("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.DeleteProfileImageAsync(Member(c), Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
+    .WithMetadata(new IfMatchMetadata())
+    .WithName("DeleteOwnProfileImage").WithTags("Members").Produces<ProfileResponse>(200);
 memberV1.MapGet("/members/{memberId}", async (HttpContext c, string memberId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetVisibleProfileAsync(Member(c), memberId, ct)))
     .WithName("GetMemberProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapGet("/members/{memberId}/profile-picture", async (HttpContext c, string memberId, [FromQuery] string? size, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.GetVisibleProfileImageAsync(Member(c), memberId, size ?? "thumbnail", ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Stream(value.Content, value.ContentType, enableRangeProcessing: true);
+})
+    .WithName("GetMemberProfileImage").WithTags("Members").Produces(200, contentType: "image/webp").Produces<ApiError>(404);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
 memberV1.MapGet("/consent-policies/{purposeCode}", async (HttpContext c, string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(Member(c), purposeCode, ct)))
