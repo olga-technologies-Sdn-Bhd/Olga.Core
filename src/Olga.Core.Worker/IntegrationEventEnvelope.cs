@@ -56,3 +56,26 @@ public sealed record NlpMatchRequestCompleted(
         }
     }
 }
+
+public sealed record ProfileImageUploaded(
+    [property: JsonPropertyName("image_id")] string ImageId,
+    [property: JsonPropertyName("member_id")] string MemberId)
+{
+    public const string EventType = "ProfileImageUploaded.v1";
+
+    public static bool TryParse(IntegrationEventEnvelope envelope, out ProfileImageUploaded? uploaded)
+    {
+        uploaded = null;
+        if (!string.Equals(envelope.EventType, EventType, StringComparison.Ordinal)
+            || !string.Equals(envelope.AggregateType, "PROFILE_IMAGE", StringComparison.Ordinal)) return false;
+        try
+        {
+            uploaded = envelope.Data.Deserialize<ProfileImageUploaded>();
+            return uploaded is not null
+                && uploaded.ImageId.Length is > 0 and <= 64
+                && uploaded.MemberId.Length is > 0 and <= 64
+                && string.Equals(envelope.AggregateId, uploaded.ImageId, StringComparison.Ordinal);
+        }
+        catch (JsonException) { return false; }
+    }
+}

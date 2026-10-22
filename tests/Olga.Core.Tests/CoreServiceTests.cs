@@ -278,6 +278,101 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Block_list_shows_my_active_blocks_newest_first_with_names()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "Cara", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.BlockAsync("A", new("B"), default);
+        db.MemberBlocks.Single().CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await db.SaveChangesAsync();
+        await service.BlockAsync("A", new("C"), default);
+        await service.BlockAsync("B", new("A"), default);
+
+        var list = await service.GetBlocksAsync("A", default);
+
+        Assert.Equal(new[] { "C", "B" }, list.Select(x => x.MemberId));
+        Assert.Equal("Cara", list[0].DisplayName);
+        Assert.Equal("A", Assert.Single(await service.GetBlocksAsync("B", default)).MemberId);
+        Assert.Empty(await service.GetBlocksAsync("C", default));
+    }
+
+    [Fact]
+    public async Task Unblock_lifts_the_block_but_restores_no_connection_or_chat()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await ConnectAsync(service, "A", "B");
+        await service.BlockAsync("A", new("B"), default);
+
+        await service.UnblockAsync("A", "B", default);
+
+        Assert.NotNull(db.MemberBlocks.Single().RemovedAt);
+        Assert.Empty(await service.GetBlocksAsync("A", default));
+        Assert.Empty(await service.GetConnectionsAsync("A", default));
+        Assert.Empty((await service.GetConversationsAsync("B", null, 20, default)).Items);
+        Assert.Equal("PENDING", (await service.CreateConnectionRequestAsync("B", new("A"), "after-unblock", default)).Status);
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("A", "B", default));
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("A", "nobody", default));
+        await AssertCode("BLOCK_NOT_FOUND", 404, () => service.UnblockAsync("B", "A", default));
+        // Blocking again after an unblock works and the member is hidden again.
+        await service.BlockAsync("A", new("B"), default);
+        Assert.Equal("B", Assert.Single(await service.GetBlocksAsync("A", default)).MemberId);
+        await AssertCode("CONNECTION_NOT_ALLOWED", 403, () => service.CreateConnectionRequestAsync("A", new("B"), "after-reblock", default));
+    }
+
+    [Fact]
+    public async Task Reporting_a_member_opens_a_report_and_an_admin_case_next_to_message_reports()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("B", conversationId, new("r1", "Spam link"), "rep-m1", default);
+
+        var report = await service.ReportMemberAsync("A", "B", new("fake_profile", "  Not a real person  "), default);
+        await service.ReportMessageAsync("A", "r1", new("SPAM"), default);
+
+        Assert.Equal(("FAKE_PROFILE", "OPEN"), (report.Category, report.Status));
+        var row = db.MemberReports.Single(x => x.ReportId == report.ReportId);
+        Assert.Equal(("A", "B", "PROFILE", "B", "Not a real person"), (row.ReporterMemberId, row.ReportedMemberId, row.ResourceType, row.ResourceId, row.Description));
+        var reports = await new AdminService(db).GetReportsAsync(null, default);
+        Assert.Equal(2, reports.Count);
+        Assert.Contains(reports, x => x.SubjectMemberId == "B" && x.ResourceType == "PROFILE");
+        Assert.Contains(reports, x => x.SubjectMemberId == "B" && x.ResourceType == "MESSAGE");
+    }
+
+    [Fact]
+    public async Task Member_report_rules_self_duplicate_resource_and_reopen_after_closing()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("B", conversationId, new("r1", "Hi"), "rep-m1", default);
+        await service.BlockAsync("B", new("A"), default);
+
+        await AssertCode("SELF_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "A", new("SPAM"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("RUDE"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", new string('x', 2001)), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceType: "ATTACHMENT"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceId: "r1"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("C", "B", new("SPAM", ResourceType: "MESSAGE", ResourceId: "r1"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportMemberAsync("A", "B", new("SPAM", ResourceType: "PROFILE", ResourceId: "C"), default));
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.ReportMemberAsync("A", "nobody", new("SPAM"), default));
+
+        // B blocked A, but A can still report B's message, and the response names no one.
+        var report = await service.ReportMemberAsync("A", "B", new("HARASSMENT", ResourceType: "message", ResourceId: "r1"), default);
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportMemberAsync("A", "B", new("SPAM"), default));
+        Assert.Equal("OPEN", (await service.ReportMemberAsync("C", "B", new("SPAM"), default)).Status);
+
+        var caseId = db.ModerationCases.Single(x => x.SourceId == report.ReportId).ModerationCaseId;
+        await new AdminService(db).SetReportStatusAsync(caseId, new("CLOSED"), default);
+        Assert.Equal("OPEN", (await service.ReportMemberAsync("A", "B", new("SPAM"), default)).Status);
+    }
+
+    [Fact]
     public async Task Message_receipt_is_monotonic_and_updates_participant_cursor()
     {
         await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
@@ -592,6 +687,73 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Recipient_reports_a_commit_sender_by_request_without_learning_who_they_are()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "crep-1", default);
+
+        var report = await service.ReportIncomingCommitAsync("B", sent.RequestId, new("harassment", "  Pushy  "), default);
+
+        Assert.Equal(("HARASSMENT", "OPEN"), (report.Category, report.Status));
+        Assert.DoesNotContain("\"A\"", System.Text.Json.JsonSerializer.Serialize(report));
+        var row = db.MemberReports.Single();
+        Assert.Equal(("B", "A", "REQUEST", sent.RequestId, "Pushy"), (row.ReporterMemberId, row.ReportedMemberId, row.ResourceType, row.ResourceId, row.Description));
+        var admin = Assert.Single(await new AdminService(db).GetReportsAsync(null, default));
+        Assert.Equal(("A", "REQUEST", sent.RequestId), (admin.SubjectMemberId, admin.ResourceType, admin.ResourceId));
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM"), default));
+        await AssertCode("REPORT_ALREADY_OPEN", 409, () => service.ReportMemberAsync("B", "A", new("SPAM"), default));
+    }
+
+    [Fact]
+    public async Task Commit_report_rules_category_note_and_only_the_recipient()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C");
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "crep-2", default);
+        var plain = await service.CreateConnectionRequestAsync("C", new("B"), "crep-plain", default);
+
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("RUDE"), default));
+        await AssertCode("MEMBER_REPORT_INVALID", 400, () => service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM", new string('x', 2001)), default));
+        foreach (var (who, id) in new[] { ("A", sent.RequestId), ("C", sent.RequestId), ("B", "missing"), ("B", plain.RequestId) })
+        {
+            await AssertCode("COMMIT_NOT_FOUND", 404, () => service.ReportIncomingCommitAsync(who, id, new("SPAM"), default));
+            await AssertCode("COMMIT_NOT_FOUND", 404, () => service.BlockIncomingCommitSenderAsync(who, id, default));
+        }
+        Assert.Empty(db.MemberReports);
+        Assert.Empty(db.MemberBlocks);
+
+        // Declined and expired Commits can still be reported.
+        await service.DecideConnectionRequestAsync("B", sent.RequestId, new("DECLINE"), "crep-3", default);
+        db.SocialConnectionRequests.Single(x => x.RequestId == sent.RequestId).ExpiresAt = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Equal("SPAM", (await service.ReportIncomingCommitAsync("B", sent.RequestId, new("SPAM"), default)).Category);
+    }
+
+    [Fact]
+    public async Task Blocking_a_commit_sender_declines_it_silently_and_hides_them_everywhere()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("B"), "cblk-1", default);
+        Assert.Contains((await service.GetEventAttendeesAsync("B", "E", default)).Attendees, x => x.MemberId == "A");
+
+        await service.BlockIncomingCommitSenderAsync("B", sent.RequestId, default);
+        await service.BlockIncomingCommitSenderAsync("B", sent.RequestId, default);
+
+        Assert.Empty(await service.GetIncomingCommitsAsync("B", null, default));
+        Assert.DoesNotContain((await service.GetEventAttendeesAsync("B", "E", default)).Attendees, x => x.MemberId == "A");
+        Assert.Equal("DECLINED", db.SocialConnectionRequests.Single().Status);
+        Assert.Equal("PENDING", Assert.Single(await service.GetOutgoingCommitsAsync("A", "E", default)).Status);
+        var block = Assert.Single(db.MemberBlocks);
+        Assert.Equal(("B", "A"), (block.BlockerMemberId, block.BlockedMemberId));
+        // NLP drops the sender from my matches on this event.
+        Assert.Contains(db.OutboxEvents, x => x.EventType == "MemberBlocked.v1");
+        Assert.Equal("A", Assert.Single(await service.GetBlocksAsync("B", default)).MemberId);
+        await AssertCode("COMMIT_NOT_PENDING", 409, () => service.DecideConnectionRequestAsync("B", sent.RequestId, new("ACCEPT"), "cblk-2", default));
+    }
+
+    [Fact]
     public async Task Accepting_a_commit_reveals_names_and_pins_the_plan_on_the_conversation()
     {
         await using var db = Db();
@@ -616,6 +778,44 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Admin_lists_who_is_live_and_can_end_a_session_like_the_member_would()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.AddRange(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" }, new EventRegistration { EventId = "E", MemberId = "B", Status = "REGISTERED" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var admin = new AdminEventService(db);
+        foreach (var id in new[] { "A", "B" }) await service.RecordConsentAsync(id, new("LIVE_MODE", "1", "GRANTED"), default);
+        var a = await service.StartLiveModeAsync("A", "E", new(60), default);
+        await service.StartLiveModeAsync("B", "E", new(30), default);
+
+        var live = await admin.GetLiveSessionsAsync("E", default);
+        Assert.Equal(new[] { "B", "A" }, live.Select(x => x.MemberId));
+        Assert.Equal(("A", a.SessionId, a.ActiveUntil), (live[1].DisplayName, live[1].SessionId, live[1].ActiveUntil));
+
+        await admin.EndLiveSessionAsync("E", "A", default);
+
+        var ended = db.LiveModeSessions.Single(x => x.MemberId == "A");
+        Assert.Equal("DISABLED", ended.Status);
+        Assert.NotNull(ended.RevokedAt);
+        var change = db.Changes.OrderByDescending(x => x.SyncSequence).First();
+        Assert.Equal(("A", "LIVE_MODE", "E", "DELETE"), (change.MemberScopeId, change.ResourceType, change.ResourceId, change.ChangeType));
+        Assert.Equal("B", Assert.Single(await admin.GetLiveSessionsAsync("E", default)).MemberId);
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "A", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => service.StopLiveModeAsync("A", "E", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "nobody", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => admin.EndLiveSessionAsync("nope", "B", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => admin.GetLiveSessionsAsync("nope", default));
+        // An expired session isn't live: it's left out and can't be ended.
+        db.LiveModeSessions.Single(x => x.MemberId == "B").ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        Assert.Empty(await admin.GetLiveSessionsAsync("E", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 404, () => admin.EndLiveSessionAsync("E", "B", default));
+        // The member can go live again after an admin end.
+        Assert.Equal("ACTIVE", (await service.StartLiveModeAsync("A", "E", new(30), default)).Status);
+    }
+
+    [Fact]
     public async Task Going_live_again_extends_the_session_onto_the_latest_consent()
     {
         await using var db = Db(); SeedMembersAndEvent(db);
@@ -630,6 +830,213 @@ public sealed class CoreServiceTests
 
         Assert.Equal(first.SessionId, again.SessionId);
         Assert.Equal(latest.MemberConsentId, db.LiveModeSessions.Single().ConsentRecordId);
+    }
+
+    [Fact]
+    public async Task Extending_live_mode_adds_time_once_per_key_and_stops_at_the_event_end()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var started = await service.StartLiveModeAsync("A", "E", new(30), default);
+        var changesBefore = db.Changes.Count();
+
+        var extended = await service.ExtendLiveModeAsync("A", "E", new(45), "extend-1", default);
+        var replay = await service.ExtendLiveModeAsync("A", "E", new(45), "extend-1", default);
+
+        Assert.Equal(started.SessionId, extended.SessionId);
+        Assert.Equal(started.ActiveUntil.AddMinutes(45), extended.ActiveUntil);
+        Assert.Equal(extended.ActiveUntil, replay.ActiveUntil);
+        Assert.Equal(changesBefore + 1, db.Changes.Count());
+        Assert.Equal("LIVE_MODE", db.Changes.OrderByDescending(x => x.SyncSequence).First().ResourceType);
+        await AssertCode("IDEMPOTENCY_KEY_REUSED", 409, () => service.ExtendLiveModeAsync("A", "E", new(60), "extend-1", default));
+
+        var ends = DateTimeOffset.UtcNow.AddMinutes(90);
+        db.EventRecords.Single().EndsAt = ends;
+        await db.SaveChangesAsync();
+        Assert.Equal(ends, (await service.ExtendLiveModeAsync("A", "E", new(240), "extend-2", default)).ActiveUntil);
+    }
+
+    [Fact]
+    public async Task Extending_live_mode_needs_an_active_session_and_a_valid_duration()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db);
+        db.EventRegistrations.Add(new EventRegistration { EventId = "E", MemberId = "A", Status = "REGISTERED" });
+        db.MemberAccounts.Add(new MemberAccount { MemberId = "A", CommunityId = "olga" });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+
+        await AssertCode("LIVE_MODE_DURATION_INVALID", 400, () => service.ExtendLiveModeAsync("A", "E", new(4), "x-1", default));
+        await AssertCode("LIVE_MODE_DURATION_INVALID", 400, () => service.ExtendLiveModeAsync("A", "E", new(241), "x-2", default));
+        await AssertCode("EVENT_NOT_FOUND", 404, () => service.ExtendLiveModeAsync("A", "nope", new(30), "x-3", default));
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-4", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        db.LiveModeSessions.Single().ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(-1);
+        await db.SaveChangesAsync();
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-5", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.StopLiveModeAsync("A", "E", default);
+        await AssertCode("LIVE_MODE_NOT_ACTIVE", 409, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-6", default));
+
+        await service.StartLiveModeAsync("A", "E", new(30), default);
+        await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.ExtendLiveModeAsync("A", "E", new(30), "x-7", default));
+    }
+
+    [Fact]
+    public async Task Delete_request_takes_the_member_out_of_the_product_straight_away()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var commit = await service.CreateConnectionRequestAsync("A", Commit("B"), "commit-1", default);
+
+        var request = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        Assert.Equal(("DELETE", "OPEN"), (request.RequestType, request.Status));
+        Assert.NotNull(db.MemberAccounts.Single(x => x.MemberId == "A").DeletedAt);
+        Assert.Equal("DISABLED", db.LiveModeSessions.Single(x => x.MemberId == "A").Status);
+        await AssertCode("PROFILE_NOT_FOUND", 404, () => service.GetVisibleProfileAsync("B", "A", default));
+        Assert.Empty((await service.GetEventAttendeesAsync("B", "E", default)).Attendees);
+        Assert.Empty(await service.GetIncomingCommitsAsync("B", null, default));
+        await AssertCode("CONNECTION_REQUEST_NOT_FOUND", 404, () => service.DecideConnectionRequestAsync("B", commit.RequestId, new("ACCEPT"), "accept-1", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.StartLiveModeAsync("A", "E", new(), default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.CreateConnectionRequestAsync("A", Commit("B"), "commit-2", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.UpdateProfileAsync("A", new("A", null, null, null), "\"1\"", default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default));
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.GetOwnProfileAsync("A", default));
+        Assert.Single(await service.GetPrivacyRequestsAsync("A", default));
+    }
+
+    [Fact]
+    public async Task Member_waiting_for_deletion_cannot_sign_in_or_sign_up_again()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default);
+        var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+
+        var lookup = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new(" ASHA@example.com"), default));
+        var byEmail = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", "asha@example.com"), "register-del-2", default));
+        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789"), "register-del-3", default));
+        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default));
+
+        foreach (var error in new[] { lookup, byEmail, byPhone, replay })
+        {
+            Assert.Equal(("MEMBER_DELETION_PENDING", 409), (error.Code, error.StatusCode));
+            Assert.Equal(request.DueAt, Assert.IsType<DeletionPendingDetails>(error.Details).DueAt);
+        }
+        Assert.Single(db.MemberAccounts);
+        await AssertCode("MEMBER_NOT_ACTIVE", 403, () => service.GetOwnProfileAsync(member.MemberId, default));
+    }
+
+    [Fact]
+    public async Task Sign_in_works_again_after_a_rejected_deletion_and_the_email_is_free_after_erasure()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com"), "register-del", default);
+        var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+
+        await new AdminService(db).SetPrivacyRequestStatusAsync(request.PrivacyRequestId, new("REJECTED"), default);
+        Assert.Equal(member.MemberId, (await service.LookupMemberByEmailAsync(new("asha@example.com"), default)).MemberId);
+        Assert.Equal(member.MemberId, (await service.GetOwnProfileAsync(member.MemberId, default)).MemberId);
+
+        // Erasure (not built yet) removes the identity rows, since the database's unique index covers revoked ones too.
+        await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
+        db.MemberIdentities.RemoveRange(db.MemberIdentities.Where(x => x.MemberId == member.MemberId));
+        db.MemberAccounts.Single(x => x.MemberId == member.MemberId).Status = "DELETED";
+        await db.SaveChangesAsync();
+
+        await AssertCode("MEMBER_NOT_REGISTERED", 404, () => service.LookupMemberByEmailAsync(new("asha@example.com"), default));
+        var fresh = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com"), "register-new", default);
+        Assert.NotEqual(member.MemberId, fresh.MemberId);
+        Assert.Equal(fresh.MemberId, (await service.LookupMemberByEmailAsync(new("asha@example.com"), default)).MemberId);
+    }
+
+    [Fact]
+    public async Task Member_can_read_their_privacy_requests_and_cannot_open_a_second_deletion()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var first = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        await AssertCode("PRIVACY_REQUEST_ALREADY_OPEN", 409, () => service.CreatePrivacyRequestAsync("A", new("DELETE"), default));
+        var listed = await service.GetPrivacyRequestsAsync("A", default);
+
+        Assert.Equal(first.PrivacyRequestId, Assert.Single(listed).PrivacyRequestId);
+        Assert.Empty(await service.GetPrivacyRequestsAsync("B", default));
+    }
+
+    [Fact]
+    public async Task Rejecting_a_deletion_request_restores_the_member()
+    {
+        await using var db = Db();
+        var service = await DeletionSetupAsync(db);
+        var request = await service.CreatePrivacyRequestAsync("A", new("DELETE"), default);
+
+        await new AdminService(db).SetPrivacyRequestStatusAsync(request.PrivacyRequestId, new("REJECTED"), default);
+
+        Assert.Null(db.MemberAccounts.Single(x => x.MemberId == "A").DeletedAt);
+        Assert.Equal("A", (await service.GetVisibleProfileAsync("B", "A", default)).MemberId);
+        Assert.Equal("OPEN", (await service.CreatePrivacyRequestAsync("A", new("DELETE"), default)).Status);
+    }
+
+    [Fact]
+    public async Task Data_export_has_my_data_names_only_connected_members_and_is_recorded()
+    {
+        await using var db = Db();
+        var service = await CommitSetupAsync(db, "C");
+        await service.RecordConsentAsync("A", new("LIVE_MODE", "1", "GRANTED"), default);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("x1", "Mine"), "exp-m1", default);
+        await service.SendMessageAsync("A", conversationId, new("x2", "Deleted"), "exp-m2", default);
+        await service.SendMessageAsync("B", conversationId, new("x3", "Theirs"), "exp-m3", default);
+        await service.DeleteMessageAsync("A", "x2", default);
+        var sent = await service.CreateConnectionRequestAsync("A", Commit("C"), "exp-c1", default);
+        await service.DecideConnectionRequestAsync("C", sent.RequestId, new("DECLINE"), "exp-d1", default);
+        db.LiveModeSessions.Add(new LiveModeSession { EventId = "E", MemberId = "C", ActiveUntil = DateTimeOffset.UtcNow.AddMinutes(30) });
+        await db.SaveChangesAsync();
+        var received = await service.CreateConnectionRequestAsync("C", Commit("A"), "exp-c2", default);
+
+        var export = await service.ExportMyDataAsync("A", default);
+
+        Assert.Equal(("A", "A"), (export.MemberId, export.Profile!.DisplayName));
+        Assert.Equal("E", Assert.Single(export.EventRegistrations).EventId);
+        Assert.Equal(("GRANTED", "LIVE_MODE"), (Assert.Single(export.Consents).Decision, export.Consents[0].PurposeCode));
+        Assert.Equal(new[] { "Mine", null }, export.Messages.Select(x => x.Body));
+        var connection = Assert.Single(export.Connections);
+        Assert.Equal(("B", "B"), (connection.MemberId, connection.DisplayName));
+        // The declined Commit to C still reads as PENDING and C stays anonymous, in both directions.
+        var commit = export.CommitsSent.Single(x => x.RequestId == sent.RequestId);
+        Assert.Equal(("PENDING", null, null, "E"), (commit.Status, commit.MemberId, commit.DisplayName, commit.EventId));
+        var incoming = export.CommitsReceived.Single(x => x.RequestId == received.RequestId);
+        Assert.Equal(((string?)null, (string?)null), (incoming.MemberId, incoming.DisplayName));
+        var record = Assert.Single(export.PrivacyRequests);
+        Assert.Equal(("EXPORT", "COMPLETED"), (record.RequestType, record.Status));
+        Assert.NotNull(db.MemberPrivacyRequests.Single().CompletedAt);
+        Assert.Equal(6, db.PrivacyRequestTasks.Count(x => x.PrivacyRequestId == record.PrivacyRequestId && x.Status == "COMPLETED" && x.EvidenceCode != null && x.CompletedAt != null));
+        Assert.Empty(export.Intents);
+    }
+
+    [Fact]
+    public async Task Data_export_for_an_unknown_member_is_not_registered()
+    {
+        await using var db = Db();
+        await AssertCode("MEMBER_NOT_REGISTERED", 404, () => Service(db).ExportMyDataAsync("nobody", default));
+        Assert.Empty(db.MemberPrivacyRequests);
+    }
+
+    private static async Task<CoreService> DeletionSetupAsync(CoreDbContext db)
+    {
+        var service = await CommitSetupAsync(db);
+        db.MemberAccounts.AddRange(new MemberAccount { MemberId = "A", CommunityId = "olga" }, new MemberAccount { MemberId = "B", CommunityId = "olga" });
+        await db.SaveChangesAsync();
+        return service;
     }
 
     private static async Task<CoreService> CommitSetupAsync(CoreDbContext db, params string[] others)

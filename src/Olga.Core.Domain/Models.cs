@@ -6,6 +6,8 @@ public sealed class MemberAccount
     public string MemberId { get; set; } = "";
     public string CommunityId { get; set; } = "";
     public string Status { get; set; } = "ACTIVE";
+    // Set when the member asks to delete their account (the erasure workflow start); NLP matching excludes them from then on.
+    public DateTimeOffset? DeletedAt { get; set; }
 }
 
 public sealed class MemberProfile
@@ -19,9 +21,26 @@ public sealed class MemberProfile
     public string Status { get; set; } = "DRAFT";
     public decimal CompletenessScore { get; set; }
     public DateTimeOffset? PublishedAt { get; set; }
+    public string? ProfileImageId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public long Version { get; set; } = 1;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class MemberProfileImage
+{
+    public long Id { get; set; }
+    public string ImageId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public string OriginalBlobPath { get; set; } = "";
+    public string DeclaredContentType { get; set; } = "";
+    public long ContentLength { get; set; }
+    public string Status { get; set; } = "PENDING";
+    public string? FailureCode { get; set; }
+    public DateTimeOffset? DeleteAfter { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class ConsentPolicy
@@ -259,6 +278,23 @@ public sealed class PrivacyRequest
     public long RowVersion { get; set; } = 1;
 }
 
+// consent.privacy_request_task: one domain's work for a privacy request. The database lets a request complete
+// only when every task is COMPLETED or EXEMPTED with completed_at and evidence_code.
+public sealed class PrivacyRequestTask
+{
+    public long Id { get; set; }
+    public string PrivacyRequestId { get; set; } = "";
+    public string DomainCode { get; set; } = "";
+    public string ActionType { get; set; } = "";
+    public string Status { get; set; } = "PENDING";
+    public short AttemptCount { get; set; }
+    public string? EvidenceCode { get; set; }
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class SyncChange
 {
     public long SyncSequence { get; set; }
@@ -271,6 +307,19 @@ public sealed class SyncChange
     public string? PayloadJson { get; set; }
     public DateTimeOffset OccurredAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset ExpiresAt { get; set; } = DateTimeOffset.UtcNow.AddDays(30);
+}
+
+// ops.idempotency_record: replay boundary for writes that aren't naturally idempotent.
+public sealed class IdempotencyRecord
+{
+    public string Scope { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+    public string ActorId { get; set; } = "";
+    public string RequestHash { get; set; } = "";
+    public short? StatusCode { get; set; }
+    public string? ResponseRef { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ExpiresAt { get; set; }
 }
 
 public sealed class OutboxEvent
@@ -290,6 +339,8 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
 {
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
+    // Extra fields for the client, returned as "details" in the error body.
+    public object? Details { get; init; }
 }
 
 public sealed class MemberReport

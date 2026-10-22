@@ -5,7 +5,10 @@ public sealed record ApiError(
     string Message,
     string CorrelationId,
     IReadOnlyDictionary<string, string[]>? FieldErrors = null,
-    string? StackTrace = null);
+    string? StackTrace = null,
+    object? Details = null);
+// details of 409 MEMBER_DELETION_PENDING: when the open deletion request is due to complete.
+public sealed record DeletionPendingDetails(DateTimeOffset? DueAt);
 public sealed record MemberCreateRequest(
     string DisplayName,
     string? Email = null,
@@ -20,7 +23,8 @@ public sealed record MemberLookupRequest(string? Email);
 public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
 // display_name is null when another member reads a profile they aren't connected to.
 // email_hint and phone_hint are the member's own masked contact details: set only on /v1/me/profile, never for another member.
-public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? EmailHint = null, string? PhoneHint = null);
+public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? ProfileImageUrl = null, string? ProfileImageStatus = null, string? EmailHint = null, string? PhoneHint = null);
+public sealed record ProfileImageUploadResponse(string ImageId, string Status, string ETag);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
@@ -31,6 +35,8 @@ public sealed record EventAttendeeResponse(string MemberId, string? Headline, st
 public sealed record EventAttendeesResponse(IReadOnlyList<EventAttendeeResponse> Attendees, int Total);
 public sealed record RegistrationResponse(string EventId, string MemberId, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt = null);
 public sealed record LiveModeRequest(int DurationMinutes = 60);
+// Adds duration_minutes (5-240) to the current active_until, capped at the event's end.
+public sealed record LiveModeExtendRequest(int DurationMinutes);
 public sealed record LiveModeResponse(string SessionId, string EventId, string Status, DateTimeOffset ActiveUntil);
 public sealed record PresenceRequest(string CoarseCell, DateTimeOffset ObservedAt, string Source = "FOREGROUND_GEO");
 // A Commit is a connection request with context_id = event_id: a short meeting in that room.
@@ -56,11 +62,19 @@ public sealed record OutgoingCommitResponse(string RequestId, CommitEventSummary
 public sealed record CommitQuotaResponse(int Limit, int Used, int Remaining);
 public sealed record MeetingSpotResponse(string SpotId, string Label);
 public sealed record BlockRequest(string MemberId);
+// A member's own block list: the blocker knows who they blocked, so the name is included.
+public sealed record BlockedMemberResponse(string MemberId, string? DisplayName, DateTimeOffset BlockedAt);
 public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null);
 // A deleted message keeps its place in the conversation with a null body and deleted_at set.
 public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt = null);
 // Category: SPAM, HARASSMENT, INAPPROPRIATE, SCAM or OTHER.
 public sealed record MessageReportRequest(string Category, string? Description = null);
+// Category: SPAM, HARASSMENT, INAPPROPRIATE, FAKE_PROFILE or OTHER. resource_type: PROFILE, REQUEST or MESSAGE (optional).
+public sealed record MemberReportRequest(string Category, string? Description = null, string? ResourceType = null, string? ResourceId = null);
+// Never carries the reported member's name or other details.
+// Reports the sender of an incoming Commit without naming them.
+public sealed record CommitReportRequest(string Category, string? Description = null);
+public sealed record MemberReportResponse(string ReportId, string Category, string Status, DateTimeOffset CreatedAt);
 public sealed record MessageReportResponse(string ReportId, string MessageId, string Category, string Status, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
 // plan is the accepted Commit's meeting plan, when the conversation came from a Commit.
@@ -76,6 +90,27 @@ public sealed record NotificationPreferenceRequest(string PurposeCode, bool Push
 public sealed record NotificationPreferenceResponse(string PurposeCode, bool PushEnabled, bool EmailEnabled, TimeOnly? QuietStartLocal, TimeOnly? QuietEndLocal, string? TimezoneId, string ETag, DateTimeOffset UpdatedAt);
 public sealed record PrivacyRequestCreate(string RequestType);
 public sealed record PrivacyRequestResponse(string PrivacyRequestId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt);
+// GET /v1/me/export: the member's own data only. Another member is named only while connected; contact details are masked hints.
+public sealed record DataExportResponse(
+    DateTimeOffset ExportedAt,
+    string MemberId,
+    ProfileResponse? Profile,
+    IReadOnlyList<ExportIntent> Intents,
+    IReadOnlyList<ExportRegistration> EventRegistrations,
+    IReadOnlyList<ExportRequest> CommitsSent,
+    IReadOnlyList<ExportRequest> CommitsReceived,
+    IReadOnlyList<ExportConnection> Connections,
+    IReadOnlyList<ExportMessage> Messages,
+    IReadOnlyList<ExportConsent> Consents,
+    IReadOnlyList<PrivacyRequestResponse> PrivacyRequests);
+public sealed record ExportIntent(string IntentId, string ContextId, string IntentType, string Text, string Status, string? Category, string? Industry, string? Geography, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt);
+public sealed record ExportRegistration(string EventId, string? EventName, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt);
+// event_id is set for Commits and null for plain connection requests. A sent Commit's DECLINED shows as PENDING, then EXPIRED, as in the app.
+public sealed record ExportRequest(string RequestId, string? EventId, string Status, CommitPlanResponse? Plan, string? Note, string? MemberId, string? DisplayName, DateTimeOffset CreatedAt, DateTimeOffset ExpiresAt);
+public sealed record ExportConnection(string ConnectionId, string Status, string? MemberId, string? DisplayName, DateTimeOffset ConnectedAt, DateTimeOffset? DisconnectedAt);
+// Only messages the member sent; a deleted message has a null body.
+public sealed record ExportMessage(string MessageId, string ConversationId, string MessageType, string? Body, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt);
+public sealed record ExportConsent(string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
 public sealed record SyncItem(long Sequence, string ResourceType, string ResourceId, string ChangeType, long? ResourceVersion, object? Payload, DateTimeOffset OccurredAt);
 public sealed record SyncResponse(IReadOnlyList<SyncItem> Items, string? NextCursor, bool HasMore);
 public sealed record AdminEventCreateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true, bool Publish = false);
@@ -93,4 +128,6 @@ public sealed record AdminConsentPolicyCreateRequest(string PurposeCode, string 
 public sealed record AdminConsentPolicyResponse(string PolicyId, string PurposeCode, string Version, string Locale, string ContentHash, DateTimeOffset EffectiveFrom, DateTimeOffset? RetiredAt, string Status);
 public sealed record ActiveConsentPolicyResponse(string PolicyId, string PurposeCode, string Version, string Locale, string ContentHash, DateTimeOffset EffectiveFrom, string? CurrentDecision, DateTimeOffset? DecisionCapturedAt);
 public sealed record AdminPrivacyRequestResponse(string PrivacyRequestId, string MemberId, string RequestType, string Status, DateTimeOffset CreatedAt, DateTimeOffset? DueAt, DateTimeOffset? VerifiedAt, DateTimeOffset? CompletedAt);
+// Live-ops: a member live in the event now. activated_at is when the session started.
+public sealed record AdminLiveSessionResponse(string MemberId, string? DisplayName, string SessionId, DateTimeOffset ActivatedAt, DateTimeOffset ActiveUntil);
 public sealed record AdminAttendeeResponse(string MemberId, string DisplayName, string? Headline, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt, bool IsLive);

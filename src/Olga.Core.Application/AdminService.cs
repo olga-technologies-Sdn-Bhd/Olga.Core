@@ -117,6 +117,13 @@ public sealed class AdminService(ICoreStore store) : IAdminService
         if (request.Status is "VERIFIED" or "PROCESSING" or "COMPLETED") row.VerifiedAt ??= now;
         if (request.Status is "COMPLETED" or "REJECTED") row.CompletedAt ??= now;
         row.UpdatedAt = now;
+        // Rejecting a deletion request restores the member; completing one keeps deleted_at for the erase step.
+        if (row.RequestType == "DELETE" && request.Status == "REJECTED" &&
+            !store.PrivacyRequests.Any(x => x.MemberId == row.MemberId && x.RequestType == "DELETE" && x.PrivacyRequestId != row.PrivacyRequestId && (x.Status == "OPEN" || x.Status == "VERIFIED" || x.Status == "PROCESSING")))
+        {
+            var account = store.Accounts.SingleOrDefault(x => x.MemberId == row.MemberId);
+            if (account is not null) account.DeletedAt = null;
+        }
         AddChange(row.MemberId, "PRIVACY_REQUEST", row.PrivacyRequestId, new { row.PrivacyRequestId, row.RequestType, row.Status, row.CreatedAt, row.DueAt });
         await store.SaveAsync(ct);
         return Map(row);

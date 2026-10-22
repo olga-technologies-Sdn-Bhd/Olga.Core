@@ -13,9 +13,12 @@ public sealed class OutboxPublisherWorker(
     ILogger<OutboxPublisherWorker> logger) : BackgroundService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
-    private readonly ServiceBusSender sender = serviceBus.CreateSender(
+    private readonly ServiceBusSender integrationSender = serviceBus.CreateSender(
         configuration["ServiceBus:IntegrationTopicName"]
         ?? throw new InvalidOperationException("ServiceBus:IntegrationTopicName is required."));
+    private readonly ServiceBusSender contentScanSender = serviceBus.CreateSender(
+        configuration["ServiceBus:ContentScanQueueName"]
+        ?? throw new InvalidOperationException("ServiceBus:ContentScanQueueName is required."));
     private readonly int maxAttempts = Math.Clamp(configuration.GetValue("Outbox:MaxPublishAttempts", 10), 1, 100);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -59,6 +62,9 @@ public sealed class OutboxPublisherWorker(
                     CorrelationId = row.AggregateId
                 };
                 message.ApplicationProperties["event_type"] = row.EventType;
+                var sender = string.Equals(row.EventType, ProfileImageUploaded.EventType, StringComparison.Ordinal)
+                    ? contentScanSender
+                    : integrationSender;
                 await sender.SendMessageAsync(message, ct);
                 row.PublishedAt = DateTimeOffset.UtcNow;
                 row.NextAttemptAt = null;
@@ -86,6 +92,7 @@ public sealed class OutboxPublisherWorker(
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
         await base.StopAsync(cancellationToken);
-        await sender.DisposeAsync();
+        await integrationSender.DisposeAsync();
+        await contentScanSender.DisposeAsync();
     }
 }
