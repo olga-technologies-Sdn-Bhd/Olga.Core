@@ -188,7 +188,7 @@ memberV1.MapGet("/members/{memberId}/profile-picture", async (HttpContext c, str
     c.Response.Headers.ETag = value.ETag;
     return Results.Stream(value.Content, value.ContentType, enableRangeProcessing: true);
 })
-    .WithName("GetMemberProfileImage").WithTags("Members").Produces(200, contentType: "image/webp").Produces<ApiError>(404);
+    .WithName("GetMemberProfileImage").WithTags("Members").Produces<byte[]>(200, contentType: "image/webp").Produces<ApiError>(404);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
 memberV1.MapGet("/consent-policies/{purposeCode}", async (HttpContext c, string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(Member(c), purposeCode, ct)))
