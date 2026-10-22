@@ -3,10 +3,7 @@ using Microsoft.EntityFrameworkCore;
 using Olga.Core.Application;
 using Olga.Core.Domain;
 using Olga.Core.Infrastructure;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Webp;
-using SixLabors.ImageSharp.Memory;
-using SixLabors.ImageSharp.Processing;
+using SkiaSharp;
 
 namespace Olga.Core.Worker;
 
@@ -14,7 +11,8 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
 {
     private const int MaximumBytes = 5 * 1024 * 1024;
     private const int MaximumDimension = 12_000;
-    private const long MaximumPixels = 40_000_000;
+    // Decoding and auto-orientation can hold two RGBA bitmaps concurrently.
+    private const long MaximumPixels = 20_000_000;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
     public async Task ProcessAsync(ProfileImageUploaded uploaded, CancellationToken ct)
@@ -35,36 +33,27 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
             if (!string.Equals(actualContentType, row.DeclaredContentType, StringComparison.Ordinal))
                 throw new InvalidProfileImageException("PROFILE_IMAGE_SIGNATURE_MISMATCH");
 
-            using var input = new MemoryStream(bytes, writable: false);
-            var configuration = Configuration.Default.Clone();
-            configuration.MemoryAllocator = MemoryAllocator.Create(new MemoryAllocatorOptions
-            {
-                MaximumPoolSizeMegabytes = 64,
-                AllocationLimitMegabytes = 192
-            });
-            var decoderOptions = new DecoderOptions { Configuration = configuration, MaxFrames = 1 };
-            var info = Image.Identify(decoderOptions, input) ?? throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
+            using var encodedSource = SKData.CreateCopy(bytes);
+            using var codec = SKCodec.Create(encodedSource) ?? throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
+            var info = codec.Info;
             if (info.Width > MaximumDimension || info.Height > MaximumDimension || (long)info.Width * info.Height > MaximumPixels)
                 throw new InvalidProfileImageException("PROFILE_IMAGE_DIMENSIONS_INVALID");
 
-            input.Position = 0;
-            using var image = Image.Load(decoderOptions, input);
-            image.Mutate(context => context.AutoOrient());
-            image.Metadata.ExifProfile = null;
-            image.Metadata.IccProfile = null;
-            image.Metadata.IptcProfile = null;
-            image.Metadata.XmpProfile = null;
+            ct.ThrowIfCancellationRequested();
+            using var decoded = new SKBitmap(new SKImageInfo(info.Width, info.Height, SKColorType.Rgba8888, SKAlphaType.Premul));
+            if (codec.GetPixels(decoded.Info, decoded.GetPixels()) != SKCodecResult.Success)
+                throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
+            using var oriented = AutoOrient(decoded, codec.EncodedOrigin);
 
             foreach (var pixels in new[] { 64, 256, 512 })
             {
-                using var derivative = image.Clone(context => context.Resize(new ResizeOptions
-                {
-                    Size = new Size(pixels, pixels),
-                    Mode = ResizeMode.Crop,
-                    Position = AnchorPositionMode.Center
-                }));
+                ct.ThrowIfCancellationRequested();
+                using var derivative = ResizeSquare(oriented, pixels);
+                using var image = SKImage.FromBitmap(derivative);
+                using var webp = image.Encode(SKEncodedImageFormat.Webp, 85)
+                    ?? throw new InvalidProfileImageException("PROFILE_IMAGE_ENCODING_FAILED");
                 await using var encoded = new MemoryStream();
-                await derivative.SaveAsWebpAsync(encoded, new WebpEncoder { Quality = 85 }, ct);
+                webp.SaveTo(encoded);
                 encoded.Position = 0;
                 await storage.UploadAsync(CoreService.DerivativeImagePath(row.MemberId, row.ImageId, pixels), encoded, "image/webp", ct);
             }
@@ -139,6 +128,41 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
         if (bytes.Length >= 8 && bytes[..8].SequenceEqual(new byte[] { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a })) return "image/png";
         if (bytes.Length >= 12 && bytes[..4].SequenceEqual("RIFF"u8) && bytes.Slice(8, 4).SequenceEqual("WEBP"u8)) return "image/webp";
         throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
+    }
+
+    private static SKBitmap AutoOrient(SKBitmap source, SKEncodedOrigin origin)
+    {
+        var swapsAxes = origin is SKEncodedOrigin.LeftTop or SKEncodedOrigin.RightTop or SKEncodedOrigin.RightBottom or SKEncodedOrigin.LeftBottom;
+        var result = new SKBitmap(swapsAxes ? source.Height : source.Width, swapsAxes ? source.Width : source.Height, source.ColorType, source.AlphaType);
+        var matrix = origin switch
+        {
+            SKEncodedOrigin.TopRight => new SKMatrix([-1, 0, source.Width, 0, 1, 0, 0, 0, 1]),
+            SKEncodedOrigin.BottomRight => new SKMatrix([-1, 0, source.Width, 0, -1, source.Height, 0, 0, 1]),
+            SKEncodedOrigin.BottomLeft => new SKMatrix([1, 0, 0, 0, -1, source.Height, 0, 0, 1]),
+            SKEncodedOrigin.LeftTop => new SKMatrix([0, 1, 0, 1, 0, 0, 0, 0, 1]),
+            SKEncodedOrigin.RightTop => new SKMatrix([0, -1, source.Height, 1, 0, 0, 0, 0, 1]),
+            SKEncodedOrigin.RightBottom => new SKMatrix([0, -1, source.Height, -1, 0, source.Width, 0, 0, 1]),
+            SKEncodedOrigin.LeftBottom => new SKMatrix([0, 1, 0, -1, 0, source.Width, 0, 0, 1]),
+            _ => SKMatrix.CreateIdentity()
+        };
+        using var canvas = new SKCanvas(result);
+        canvas.Clear(SKColors.Transparent);
+        canvas.SetMatrix(matrix);
+        canvas.DrawBitmap(source, 0, 0, SKSamplingOptions.Default);
+        canvas.Flush();
+        return result;
+    }
+
+    private static SKBitmap ResizeSquare(SKBitmap source, int pixels)
+    {
+        var crop = Math.Min(source.Width, source.Height);
+        var sourceRect = new SKRect((source.Width - crop) / 2f, (source.Height - crop) / 2f, (source.Width + crop) / 2f, (source.Height + crop) / 2f);
+        var result = new SKBitmap(pixels, pixels, SKColorType.Rgba8888, SKAlphaType.Premul);
+        using var canvas = new SKCanvas(result);
+        canvas.Clear(SKColors.Transparent);
+        canvas.DrawBitmap(source, sourceRect, new SKRect(0, 0, pixels, pixels), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+        canvas.Flush();
+        return result;
     }
 
     private sealed class InvalidProfileImageException(string code) : Exception(code)

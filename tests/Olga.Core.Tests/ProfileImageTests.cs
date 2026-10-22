@@ -6,8 +6,7 @@ using Olga.Core.Application;
 using Olga.Core.Domain;
 using Olga.Core.Infrastructure;
 using Olga.Core.Worker;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
+using SkiaSharp;
 
 namespace Olga.Core.Tests;
 
@@ -169,12 +168,13 @@ public sealed class ProfileImageTests
         return (db, storage, row);
     }
 
-    private static async Task<byte[]> PngAsync()
+    private static Task<byte[]> PngAsync()
     {
-        using var image = new Image<Rgba32>(32, 24);
-        await using var stream = new MemoryStream();
-        await image.SaveAsPngAsync(stream);
-        return stream.ToArray();
+        using var bitmap = new SKBitmap(32, 24, SKColorType.Rgba8888, SKAlphaType.Premul);
+        bitmap.Erase(SKColors.CornflowerBlue);
+        using var image = SKImage.FromBitmap(bitmap);
+        using var encoded = image.Encode(SKEncodedImageFormat.Png, 100);
+        return Task.FromResult(encoded.ToArray());
     }
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
