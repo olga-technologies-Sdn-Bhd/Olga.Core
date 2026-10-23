@@ -635,14 +635,15 @@ public sealed class OutboxPostgreSqlIntegrationTests
             var claims = await Task.WhenAll(
                 repositoryA.ClaimAsync(new OutboxClaim("lease-a", now, now.AddMinutes(5), 50), CancellationToken.None),
                 repositoryB.ClaimAsync(new OutboxClaim("lease-b", now, now.AddMinutes(5), 50), CancellationToken.None));
-            var claimedCopies = claims.SelectMany(x => x.Events).Where(x => x.OutboxEventId == eventId).ToList();
-            var originalClaim = Assert.Single(claimedCopies);
+            var originalClaim = Assert.Single(
+                claims.SelectMany(x => x.Events),
+                x => x.OutboxEventId == eventId);
 
             await ExpireLeaseAsync(dataSource, eventId, originalClaim.LeaseId, now.AddSeconds(-1));
             var reclaimed = await repositoryB.ClaimAsync(
                 new OutboxClaim("lease-c", now, now.AddMinutes(5), 50),
                 CancellationToken.None);
-            var currentClaim = Assert.Single(reclaimed.Events.Where(x => x.OutboxEventId == eventId));
+            var currentClaim = Assert.Single(reclaimed.Events, x => x.OutboxEventId == eventId);
             Assert.Equal("lease-c", currentClaim.LeaseId);
 
             var failure = new OutboxFailure(
