@@ -1,6 +1,8 @@
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Npgsql;
 using Olga.Core.Infrastructure;
 using Olga.Core.Application;
 using Olga.Core.Worker;
@@ -8,7 +10,9 @@ using Olga.Core.Worker;
 var builder = Host.CreateApplicationBuilder(args);
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 if (string.IsNullOrWhiteSpace(connection)) throw new InvalidOperationException("ConnectionStrings:PostgreSql is required by the Core worker.");
-builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection, enableRetryOnFailure: false));
+builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connection));
+builder.Services.AddDbContextPool<CoreDbContext>((services, options) =>
+    options.UseOlgaPostgreSql(services.GetRequiredService<NpgsqlDataSource>()));
 builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddSingleton(sp =>
 {
@@ -28,6 +32,16 @@ builder.Services.AddSingleton(sp =>
     };
     return new ServiceBusClient(fullyQualifiedNamespace, new DefaultAzureCredential(credentialOptions));
 });
+builder.Services.AddOptions<OutboxPublisherOptions>()
+    .Bind(builder.Configuration.GetSection(OutboxPublisherOptions.SectionName))
+    .ValidateOnStart();
+builder.Services.AddSingleton<IValidateOptions<OutboxPublisherOptions>, OutboxPublisherOptionsValidator>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<IOutboxRepository, NpgsqlOutboxRepository>();
+builder.Services.AddSingleton<IOutboxFailureClassifier, OutboxFailureClassifier>();
+builder.Services.AddSingleton<IOutboxJitterSource, RandomOutboxJitterSource>();
+builder.Services.AddSingleton<IOutboxRetryCalculator, OutboxRetryCalculator>();
+builder.Services.AddSingleton<IOutboxEventPublisher, ServiceBusOutboxEventPublisher>();
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
 builder.Services.AddScoped<ProfileImageProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();

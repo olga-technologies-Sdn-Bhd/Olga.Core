@@ -19,6 +19,15 @@ public static class PostgreSqlConfiguration
         return options.UseSnakeCaseNamingConvention();
     }
 
+    public static DbContextOptionsBuilder UseOlgaPostgreSql(
+        this DbContextOptionsBuilder options,
+        NpgsqlDataSource dataSource,
+        int commandTimeoutSeconds = 15)
+    {
+        options.UseNpgsql(dataSource, postgres => postgres.CommandTimeout(commandTimeoutSeconds));
+        return options.UseSnakeCaseNamingConvention();
+    }
+
     public static bool IsUniqueViolation(DbUpdateException exception) =>
         exception.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation };
 
