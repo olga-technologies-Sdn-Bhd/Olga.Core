@@ -7,7 +7,6 @@ using NpgsqlTypes;
 using Olga.Core.Application;
 using Olga.Core.Infrastructure;
 using Olga.Core.Worker;
-using Xunit.Sdk;
 
 namespace Olga.Core.Tests;
 
@@ -616,12 +615,10 @@ public sealed class OutboxWorkerFailureTests
 
 public sealed class OutboxPostgreSqlIntegrationTests
 {
-    [Fact]
+    [PostgreSqlFact]
     public async Task Active_claim_is_exclusive_and_stale_owner_is_fenced_after_reclaim()
     {
-        var connectionString = Environment.GetEnvironmentVariable("OLGA_TEST_POSTGRES");
-        if (string.IsNullOrWhiteSpace(connectionString))
-            throw SkipException.ForSkip("Set OLGA_TEST_POSTGRES to a disposable PostgreSQL 17 database with migration 004 applied.");
+        var connectionString = Environment.GetEnvironmentVariable("OLGA_TEST_POSTGRES")!;
 
         await using var dataSource = NpgsqlDataSource.Create(connectionString);
         var repositoryA = new NpgsqlOutboxRepository(dataSource);
@@ -711,5 +708,14 @@ public sealed class OutboxPostgreSqlIntegrationTests
             """);
         command.Parameters.Add(new NpgsqlParameter("outbox_event_id", NpgsqlDbType.Varchar, 64) { Value = eventId });
         await command.ExecuteNonQueryAsync(CancellationToken.None);
+    }
+}
+
+public sealed class PostgreSqlFactAttribute : FactAttribute
+{
+    public PostgreSqlFactAttribute()
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("OLGA_TEST_POSTGRES")))
+            Skip = "Set OLGA_TEST_POSTGRES to a disposable PostgreSQL 17 database with migration 004 applied.";
     }
 }
