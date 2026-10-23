@@ -14,7 +14,8 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 - Connection request, acceptance, canonical connection, conversation creation, and blocking.
 - Idempotent client message IDs and server message ordering.
 - Notification preferences, privacy-request initiation, and authorization-filtered sync changes.
-- Transactional outbox records published as versioned Service Bus envelopes by the Core worker.
+- Transactional outbox records published as versioned Service Bus envelopes by the Core worker
+  using bounded batch claims, expiring leases, lease renewal, jittered retry, and explicit exhaustion.
 - Consumption of `NlpMatchRequestCompleted.v1` into authorization-scoped sync projections and policy-resolved match notifications.
 - Transactional integration events that allow NLP to refresh its read-only eligibility projections without proxying NLP requests through Core.
 - EF Core InMemory local development and PostgreSQL configuration through `ConnectionStrings__PostgreSql`.
@@ -23,6 +24,10 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 ## What is intentionally not implemented yet
 
 This foundation is not the full product backlog. Entra token validation and external-identity linking, fine-grained permissions, general private-file lifecycle, provider notification delivery, privacy task orchestration, retention execution, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
+
+PostgreSQL deployments must be at schema v2.6. The database repository owns the generated v2.4
+baseline and the ordered v2.5 profile-image and v2.6 outbox-leasing migrations; application startup
+does not perform DDL.
 
 ## Run locally
 
