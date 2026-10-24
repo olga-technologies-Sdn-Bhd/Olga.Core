@@ -483,6 +483,74 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Sender_sees_how_far_the_other_member_has_received_and_read()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        var first = await service.SendMessageAsync("A", conversationId, new("s1", "One"), "seen-m1", default);
+        var second = await service.SendMessageAsync("A", conversationId, new("s2", "Two"), "seen-m2", default);
+        await service.SendMessageAsync("B", conversationId, new("s3", "Mine"), "seen-m3", default);
+
+        var before = await service.GetConversationAsync("A", conversationId, default);
+        await service.SaveMessageReceiptAsync("B", second.MessageId, new(DeliveredAt: DateTimeOffset.UtcNow), "seen-r1", default);
+        var delivered = await service.GetConversationAsync("A", conversationId, default);
+        await service.MarkConversationReadAsync("B", conversationId, new(first.MessageId), "seen-read", default);
+        var read = (await service.GetConversationsAsync("A", null, 20, default)).Items.Single();
+        // B's own view never counts A's receipts on B's messages.
+        var forB = await service.GetConversationAsync("B", conversationId, default);
+
+        Assert.Equal(((long?)null, (long?)null), (before.OtherDeliveredThroughSequence, before.OtherReadThroughSequence));
+        Assert.Equal((second.ServerSequence, (long?)null), (delivered.OtherDeliveredThroughSequence, delivered.OtherReadThroughSequence));
+        Assert.Equal((second.ServerSequence, first.ServerSequence), (read.OtherDeliveredThroughSequence, read.OtherReadThroughSequence));
+        Assert.Equal(((long?)null, (long?)null), (forB.OtherDeliveredThroughSequence, forB.OtherReadThroughSequence));
+    }
+
+    [Fact]
+    public async Task Marking_read_publishes_one_ConversationRead_event_for_the_sender()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        await service.SendMessageAsync("A", conversationId, new("e1", "One"), "evt-m1", default);
+        var second = await service.SendMessageAsync("A", conversationId, new("e2", "Two"), "evt-m2", default);
+
+        await service.MarkConversationReadAsync("B", conversationId, new(second.MessageId), "evt-read", default);
+        await service.MarkConversationReadAsync("B", conversationId, new(second.MessageId), "evt-read", default);
+        await service.MarkConversationReadAsync("B", conversationId, new(second.MessageId), "evt-read-again", default);
+
+        var evt = Assert.Single(db.OutboxEvents.Where(x => x.EventType == "ConversationRead.v1").ToList());
+        using var payload = System.Text.Json.JsonDocument.Parse(evt.PayloadJson);
+        var p = payload.RootElement;
+        Assert.Equal(("CONVERSATION", conversationId), (evt.AggregateType, evt.AggregateId));
+        Assert.Equal((conversationId, "B", "A", "e2", second.ServerSequence),
+            (p.GetProperty("conversation_id").GetString(), p.GetProperty("reader_member_id").GetString(), p.GetProperty("sender_member_id").GetString(),
+             p.GetProperty("last_read_message_id").GetString(), p.GetProperty("last_read_server_sequence").GetInt64()));
+    }
+
+    [Fact]
+    public async Task Deleting_a_message_publishes_MessageDeleted_once_without_the_body()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        var conversationId = await ConnectAsync(service, "A", "B");
+        var message = await service.SendMessageAsync("A", conversationId, new("d1", "Secret"), "del-m1", default);
+
+        await service.DeleteMessageAsync("A", message.MessageId, default);
+        await service.DeleteMessageAsync("A", message.MessageId, default);
+
+        var evt = Assert.Single(db.OutboxEvents.Where(x => x.EventType == "MessageDeleted.v1").ToList());
+        using var payload = System.Text.Json.JsonDocument.Parse(evt.PayloadJson);
+        var p = payload.RootElement;
+        Assert.Equal(("MESSAGE", "d1"), (evt.AggregateType, evt.AggregateId));
+        Assert.Equal(("d1", conversationId, "A", "B", message.ServerSequence),
+            (p.GetProperty("message_id").GetString(), p.GetProperty("conversation_id").GetString(), p.GetProperty("sender_member_id").GetString(),
+             p.GetProperty("recipient_member_id").GetString(), p.GetProperty("server_sequence").GetInt64()));
+        Assert.True(p.TryGetProperty("deleted_at", out _));
+        Assert.DoesNotContain("Secret", evt.PayloadJson);
+    }
+
+    [Fact]
     public async Task Marking_read_rejects_unknown_messages_outsiders_and_blank_input()
     {
         await using var db = Db(); SeedMembersAndEvent(db);

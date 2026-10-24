@@ -859,6 +859,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             // Per-message keys and hashes leave out readAt so a retry of the same request replays cleanly.
             foreach (var message in unread)
                 await store.SaveMessageReceiptAsync(memberId, message.MessageId, new(ReadAt: readAt), $"read:{Hash(idempotencyKey, message.MessageId)[..59]}", Hash("chat.conversation_read", memberId, message.MessageId, idempotencyKey), ct);
+            // Written after the receipts, so a crash in between loses only this event; clients recover through REST.
+            if (unread.Length > 0)
+            {
+                AddConversationRead(memberId, connection, conversationId, unread[^1], readAt);
+                await store.SaveAsync(ct);
+            }
         }
         else if (unread.Length > 0)
         {
@@ -871,6 +877,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId);
             var current = participant?.LastReadMessageId is null ? 0 : store.Messages.Where(x => x.MessageId == participant.LastReadMessageId).Select(x => x.ServerSequence).SingleOrDefault();
             if (participant is not null && unread[^1].ServerSequence > current) participant.LastReadMessageId = unread[^1].MessageId;
+            AddConversationRead(memberId, connection, conversationId, unread[^1], readAt);
             await store.SaveAsync(ct);
         }
         return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
@@ -942,7 +949,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         // Soft delete: the body stays in the database for moderation but is never returned again.
         var now = DateTimeOffset.UtcNow;
         message.DeletedAt = now; message.UpdatedAt = now;
-        foreach (var id in new[] { memberId, OtherMember(connection, memberId) }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        var other = OtherMember(connection, memberId);
+        foreach (var id in new[] { memberId, other }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        AddOutbox("MESSAGE", messageId, "MessageDeleted.v1", new { message_id = messageId, conversation_id = message.ConversationId, sender_member_id = memberId, recipient_member_id = other, server_sequence = message.ServerSequence, deleted_at = now });
         await store.SaveAsync(ct);
     }
 
@@ -1214,6 +1223,16 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .ToDictionary(x => x.ConversationId, x => x.MutedUntil);
         var requestIds = connections.Select(x => x.AcceptedRequestId).ToArray();
         var plans = store.ConnectionRequests.Where(x => requestIds.Contains(x.RequestId) && x.ContextId != null).AsEnumerable().ToDictionary(x => x.RequestId, PlanOf);
+        // Receipts on my messages can only come from the other member. Read marks everything up to a message,
+        // so the highest receipted sequence is a watermark for the whole conversation.
+        var myReceipts = from m in store.Messages
+                         join r in store.MessageReceipts on m.MessageId equals r.MessageId
+                         where conversationIds.Contains(m.ConversationId) && m.SenderMemberId == memberId && r.MemberId != memberId
+                         select new { m.ConversationId, m.ServerSequence, r.DeliveredAt, r.ReadAt };
+        var deliveredThrough = myReceipts.Where(x => x.DeliveredAt != null).GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) }).ToDictionary(x => x.ConversationId, x => (long?)x.Sequence);
+        var readThrough = myReceipts.Where(x => x.ReadAt != null).GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) }).ToDictionary(x => x.ConversationId, x => (long?)x.Sequence);
 
         return conversations.Select(c =>
         {
@@ -1223,7 +1242,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var last = lastMessages.GetValueOrDefault(c.ConversationId);
             return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
                 last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
-                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId));
+                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId),
+                deliveredThrough.GetValueOrDefault(c.ConversationId), readThrough.GetValueOrDefault(c.ConversationId));
         }).ToArray();
     }
 
@@ -1243,6 +1263,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     }
 
     private void AddChange(string? memberId, string type, string id, string change, object? payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = change, PayloadJson = payload is null ? null : JsonSerializer.Serialize(payload, JsonOptions) });
+    // Tells the sender's devices that the reader has read their messages up to last_read_server_sequence.
+    private void AddConversationRead(string readerId, Connection connection, string conversationId, Message lastRead, DateTimeOffset readAt) =>
+        AddOutbox("CONVERSATION", conversationId, "ConversationRead.v1", new { conversation_id = conversationId, reader_member_id = readerId, sender_member_id = OtherMember(connection, readerId), last_read_message_id = lastRead.MessageId, last_read_server_sequence = lastRead.ServerSequence, read_at = readAt });
     private void AddOutbox(string aggregateType, string aggregateId, string eventType, object payload) => store.Add(new OutboxEvent { AggregateType = aggregateType, AggregateId = aggregateId, EventType = eventType, PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
     private static (string Low, string High) Pair(string a, string b) => string.CompareOrdinal(a, b) < 0 ? (a, b) : (b, a);
     // ops.outbox_event.aggregate_id is varchar(64). Keep the readable "a:b" key when it fits;

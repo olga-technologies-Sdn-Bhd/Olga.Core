@@ -239,27 +239,54 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     async Task<Message> ICoreStore.SaveMessageAsync(string memberId, string conversationId, Contracts.MessageCreateRequest request, string idempotencyKey, string requestHash, CancellationToken ct)
     {
-        await using var command = CreateCommand("SELECT * FROM chat.save_message(@message_id, @conversation_id, @sender_id, @message_type, @body, @client_sent_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
-        AddVarchar(command, "message_id", request.MessageId, 64); AddVarchar(command, "conversation_id", conversationId, 64); AddVarchar(command, "sender_id", memberId, 64); AddVarchar(command, "message_type", request.MessageType, 20);
-        command.Parameters.Add(new NpgsqlParameter("body", NpgsqlDbType.Text) { Value = request.Body is null ? DBNull.Value : request.Body });
-        command.Parameters.Add(new NpgsqlParameter("client_sent_at", NpgsqlDbType.TimestampTz) { Value = request.ClientSentAt is null ? DBNull.Value : request.ClientSentAt.Value.ToUniversalTime() });
-        AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
-        AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
         var close = await OpenIfNeededAsync(ct);
         try
         {
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("save_message returned no result.");
-            return new Message
+            await using var transaction = await ((NpgsqlConnection)Database.GetDbConnection()).BeginTransactionAsync(ct);
+            await using var command = CreateCommand("SELECT * FROM chat.save_message(@message_id, @conversation_id, @sender_id, @message_type, @body, @client_sent_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)", transaction);
+            AddVarchar(command, "message_id", request.MessageId, 64); AddVarchar(command, "conversation_id", conversationId, 64); AddVarchar(command, "sender_id", memberId, 64); AddVarchar(command, "message_type", request.MessageType, 20);
+            command.Parameters.Add(new NpgsqlParameter("body", NpgsqlDbType.Text) { Value = request.Body is null ? DBNull.Value : request.Body });
+            command.Parameters.Add(new NpgsqlParameter("client_sent_at", NpgsqlDbType.TimestampTz) { Value = request.ClientSentAt is null ? DBNull.Value : request.ClientSentAt.Value.ToUniversalTime() });
+            AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+            AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
+            Message message;
+            await using (var reader = await command.ExecuteReaderAsync(ct))
             {
-                MessageId = reader.GetString(reader.GetOrdinal("message_id")), ConversationId = reader.GetString(reader.GetOrdinal("conversation_id")), SenderMemberId = reader.GetString(reader.GetOrdinal("sender_member_id")),
-                MessageType = reader.GetString(reader.GetOrdinal("message_type")), Body = GetNullableString(reader, "body"), ClientSentAt = GetNullableInstant(reader, "client_sent_at"),
-                ServerSequence = reader.GetInt64(reader.GetOrdinal("server_sequence")), ModerationStatus = reader.GetString(reader.GetOrdinal("moderation_status")), DeletedAt = GetNullableInstant(reader, "deleted_at"),
-                CreatedAt = GetInstant(reader, "created_at"), UpdatedAt = GetInstant(reader, "updated_at"), RowVersion = reader.GetInt64(reader.GetOrdinal("row_version"))
-            };
+                if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("save_message returned no result.");
+                message = new Message
+                {
+                    MessageId = reader.GetString(reader.GetOrdinal("message_id")), ConversationId = reader.GetString(reader.GetOrdinal("conversation_id")), SenderMemberId = reader.GetString(reader.GetOrdinal("sender_member_id")),
+                    MessageType = reader.GetString(reader.GetOrdinal("message_type")), Body = GetNullableString(reader, "body"), ClientSentAt = GetNullableInstant(reader, "client_sent_at"),
+                    ServerSequence = reader.GetInt64(reader.GetOrdinal("server_sequence")), ModerationStatus = reader.GetString(reader.GetOrdinal("moderation_status")), DeletedAt = GetNullableInstant(reader, "deleted_at"),
+                    CreatedAt = GetInstant(reader, "created_at"), UpdatedAt = GetInstant(reader, "updated_at"), RowVersion = reader.GetInt64(reader.GetOrdinal("row_version"))
+                };
+            }
+
+            // chat.save_message only writes the legacy chat.message.created event, so MessageCreated.v1 is added in the same
+            // transaction. The event ID is derived from the message ID, so an idempotent replay adds nothing.
+            await using (var outbox = CreateCommand("""
+                INSERT INTO ops.outbox_event(outbox_event_id, aggregate_type, aggregate_id, event_type, payload_json)
+                SELECT @event_id, 'MESSAGE', m.message_id, 'MessageCreated.v1',
+                       jsonb_build_object('message_id', m.message_id, 'conversation_id', m.conversation_id, 'sender_member_id', m.sender_member_id,
+                                          'recipient_member_id', p.member_id, 'server_sequence', m.server_sequence)
+                FROM chat.message m
+                JOIN chat.conversation_participant p ON p.conversation_id = m.conversation_id AND p.member_id <> m.sender_member_id
+                WHERE m.message_id = @message_id
+                LIMIT 1
+                ON CONFLICT (outbox_event_id) DO NOTHING
+                """, transaction))
+            {
+                AddVarchar(outbox, "event_id", MessageCreatedEventId(message.MessageId), 64); AddVarchar(outbox, "message_id", message.MessageId, 64);
+                await outbox.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+            return message;
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
+
+    private static string MessageCreatedEventId(string messageId) =>
+        $"msgc_{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"MessageCreated.v1\n{messageId}"))).ToLowerInvariant()[..59]}";
 
     async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
     {
