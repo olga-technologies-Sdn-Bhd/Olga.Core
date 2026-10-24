@@ -41,10 +41,22 @@ builder.Services.AddSingleton<IOutboxRepository, NpgsqlOutboxRepository>();
 builder.Services.AddSingleton<IOutboxFailureClassifier, OutboxFailureClassifier>();
 builder.Services.AddSingleton<IOutboxJitterSource, RandomOutboxJitterSource>();
 builder.Services.AddSingleton<IOutboxRetryCalculator, OutboxRetryCalculator>();
-builder.Services.AddSingleton<IOutboxEventPublisher, ServiceBusOutboxEventPublisher>();
+builder.Services.AddSingleton<ServiceBusOutboxEventPublisher>();
+// With SignalR:Endpoint set, chat events also go to the conversation's members' devices.
+if (string.IsNullOrWhiteSpace(builder.Configuration["SignalR:Endpoint"]))
+    builder.Services.AddSingleton<IOutboxEventPublisher>(sp => sp.GetRequiredService<ServiceBusOutboxEventPublisher>());
+else
+{
+    builder.Services.AddSingleton<IChatRealtimeSender, AzureSignalRChatSender>();
+    builder.Services.AddSingleton<IOutboxEventPublisher>(sp => new SignalRChatEventPublisher(
+        sp.GetRequiredService<ServiceBusOutboxEventPublisher>(), sp.GetRequiredService<IChatRealtimeSender>(), sp.GetRequiredService<ILogger<SignalRChatEventPublisher>>()));
+}
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
 builder.Services.AddScoped<ProfileImageProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
 builder.Services.AddHostedService<NlpCompletionConsumerWorker>();
 builder.Services.AddHostedService<ProfileImageConsumerWorker>();
 await builder.Build().RunAsync();
+
+// SignalR brings in ASP.NET Core, whose generator would make Program public and clash with the API's Program in tests.
+internal partial class Program;
