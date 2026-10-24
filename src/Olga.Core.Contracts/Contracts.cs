@@ -78,7 +78,9 @@ public sealed record MemberReportResponse(string ReportId, string Category, stri
 public sealed record MessageReportResponse(string ReportId, string MessageId, string Category, string Status, DateTimeOffset CreatedAt);
 // The other member is named here because only connected members share a conversation.
 // plan is the accepted Commit's meeting plan, when the conversation came from a Commit.
-public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend, DateTimeOffset? MutedUntil = null, CommitPlanResponse? Plan = null);
+// other_delivered_through_sequence / other_read_through_sequence: the highest server_sequence of my messages the other
+// member has received / read; my messages at or below it count as delivered / read. Null until the first receipt.
+public sealed record ConversationResponse(string ConversationId, string ConnectionId, string Status, string MemberId, string? DisplayName, string? Headline, string? RoleCategory, MessageResponse? LastMessage, int UnreadCount, DateTimeOffset LastActivityAt, bool CanSend, DateTimeOffset? MutedUntil = null, CommitPlanResponse? Plan = null, long? OtherDeliveredThroughSequence = null, long? OtherReadThroughSequence = null);
 public sealed record ConversationListResponse(IReadOnlyList<ConversationResponse> Items, string? NextCursor, bool HasMore);
 // Marks every message from the other member up to and including this one as read.
 public sealed record ConversationReadRequest(string LastReadMessageId);
