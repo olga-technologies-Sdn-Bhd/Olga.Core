@@ -1122,6 +1122,77 @@ public sealed class CoreServiceTests
 
     private static ConnectionRequestCreate Commit(string recipient, string when = "IN_10_MIN") => new(recipient, ContextId: "E", Plan: new(new("THEIR_CHOICE"), when));
 
+    [Fact]
+    public async Task Device_registration_stores_an_encrypted_token_and_replaces_it_on_rotation()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+
+        var bare = await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.0"), default);
+        var first = await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.1", "FCM", "token-one"), default);
+        var again = await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.1", "FCM", "token-one"), default);
+        await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.1", "FCM", "token-two"), default);
+
+        Assert.Equal((false, true, true), (bare.PushEnabled, first.PushEnabled, again.PushEnabled));
+        Assert.Equal(("1.0.1", "ACTIVE"), (first.AppVersion, first.Status));
+        var tokens = db.PushTokens.ToList();
+        Assert.Equal(2, tokens.Count);
+        Assert.Equal("token-two", IdentityProtector.Unprotect("dev-1", "FCM", Assert.Single(tokens, x => x.Status == "ACTIVE").TokenCiphertext));
+        Assert.NotNull(Assert.Single(tokens, x => x.Status == "INVALID").InvalidatedAt);
+        Assert.All(tokens, x => Assert.DoesNotContain("token", System.Text.Encoding.UTF8.GetString(x.TokenCiphertext)));
+    }
+
+    [Fact]
+    public async Task Device_and_token_move_to_whoever_signs_in_on_them()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterDeviceAsync("A", "dev-1", new("IOS", "1.0.0", "APNS", "shared-token"), default);
+
+        // Same installation, new member.
+        await service.RegisterDeviceAsync("B", "dev-1", new("IOS", "1.0.0"), default);
+        Assert.Equal("B", db.MemberDevices.Single().MemberId);
+        await AssertCode("DEVICE_NOT_FOUND", 404, () => service.RevokeDeviceAsync("A", "dev-1", default));
+
+        // Reinstall: a new installation reports the same token, which leaves the old one.
+        var reinstalled = await service.RegisterDeviceAsync("B", "dev-2", new("IOS", "1.1.0", "APNS", "shared-token"), default);
+        Assert.True(reinstalled.PushEnabled);
+        Assert.Equal("dev-2", db.PushTokens.Single().DeviceId);
+    }
+
+    [Fact]
+    public async Task Revoking_a_device_invalidates_its_tokens_and_is_retry_safe()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        var service = Service(db);
+        await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.0", "FCM", "token-one"), default);
+
+        await service.RevokeDeviceAsync("A", "dev-1", default);
+        await service.RevokeDeviceAsync("A", "dev-1", default);
+
+        var device = db.MemberDevices.Single();
+        Assert.Equal("REVOKED", device.Status); Assert.NotNull(device.RevokedAt);
+        Assert.Equal("INVALID", db.PushTokens.Single().Status);
+        // Signing in again brings the device back, with push once a token is sent.
+        var back = await service.RegisterDeviceAsync("A", "dev-1", new("ANDROID", "1.0.0"), default);
+        Assert.Equal(("ACTIVE", false), (back.Status, back.PushEnabled));
+        await AssertCode("DEVICE_NOT_FOUND", 404, () => service.RevokeDeviceAsync("A", "unknown", default));
+    }
+
+    [Theory]
+    [InlineData("", "ANDROID", "1.0", null, null)]
+    [InlineData("dev", "WINDOWS", "1.0", null, null)]
+    [InlineData("dev", "IOS", "", null, null)]
+    [InlineData("dev", "IOS", "1.0", "APNS", null)]
+    [InlineData("dev", "IOS", "1.0", null, "token")]
+    [InlineData("dev", "IOS", "1.0", "SMS", "token")]
+    public async Task Device_registration_rejects_invalid_input(string deviceId, string platform, string appVersion, string? provider, string? token)
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); await db.SaveChangesAsync();
+        await AssertCode("DEVICE_REGISTRATION_INVALID", 400, () => Service(db).RegisterDeviceAsync("A", deviceId, new(platform, appVersion, provider, token), default));
+        Assert.Empty(db.MemberDevices);
+    }
+
     private static async Task AssertCode(string code, int status, Func<Task> action)
     {
         var error = await Assert.ThrowsAsync<DomainException>(action);

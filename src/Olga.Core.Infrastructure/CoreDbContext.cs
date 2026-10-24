@@ -33,6 +33,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<Message> ChatMessages => Set<Message>();
     public DbSet<MessageReceipt> MessageReceipts => Set<MessageReceipt>();
     public DbSet<NotificationPreference> Preferences => Set<NotificationPreference>();
+    public DbSet<MemberDevice> MemberDevices => Set<MemberDevice>();
+    public DbSet<PushToken> PushTokens => Set<PushToken>();
     public DbSet<PrivacyRequest> MemberPrivacyRequests => Set<PrivacyRequest>();
     public DbSet<PrivacyRequestTask> PrivacyRequestTasks => Set<PrivacyRequestTask>();
     public DbSet<SyncChange> Changes => Set<SyncChange>();
@@ -61,6 +63,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<Message> ICoreStore.Messages => ChatMessages;
     IQueryable<MessageReceipt> ICoreStore.MessageReceipts => MessageReceipts;
     IQueryable<NotificationPreference> ICoreStore.NotificationPreferences => Preferences;
+    IQueryable<MemberDevice> ICoreStore.Devices => MemberDevices;
+    IQueryable<PushToken> ICoreStore.PushTokens => PushTokens;
     IQueryable<PrivacyRequest> ICoreStore.PrivacyRequests => MemberPrivacyRequests;
     IQueryable<SyncChange> ICoreStore.SyncChanges => Changes;
     IQueryable<ModerationCase> ICoreStore.ModerationCases => ModerationCases;
@@ -387,6 +391,9 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<Message>(e => { e.ToTable("message", "chat"); e.HasKey(x => x.MessageId); e.Property(x => x.MessageId).HasMaxLength(64); e.Property(x => x.Body).HasColumnType("text"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.ConversationId, x.ServerSequence }).IsUnique(); });
         model.Entity<MessageReceipt>(e => { e.ToTable("message_receipt", "chat"); e.HasKey(x => new { x.MessageId, x.MemberId }); });
         model.Entity<NotificationPreference>(e => { e.ToTable("notification_preference", "notification"); e.HasKey(x => new { x.MemberId, x.PurposeCode }); ConfigureVersion(e.Property(x => x.RowVersion)); });
+        model.Entity<MemberDevice>(e => { e.ToTable("member_device", "iam"); e.HasKey(x => x.DeviceId); e.Property(x => x.DeviceId).HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Platform).HasMaxLength(16); e.Property(x => x.AppVersion).HasMaxLength(32); e.Property(x => x.Status).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.Status }); });
+        // The foreign key makes EF insert a new device before its token in one save.
+        model.Entity<PushToken>(e => { e.ToTable("push_token", "notification"); e.HasKey(x => x.PushTokenId); e.Property(x => x.PushTokenId).UseIdentityByDefaultColumn(); e.Property(x => x.DeviceId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(24); e.Property(x => x.TokenCiphertext).HasColumnType("bytea"); e.Property(x => x.TokenFingerprint).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.TokenFingerprint).IsUnique(); e.HasOne<MemberDevice>().WithMany().HasForeignKey(x => x.DeviceId); });
         model.Entity<ModerationCase>(e => { e.ToTable("moderation_case", "moderation"); e.HasKey(x => x.ModerationCaseId); e.Property(x => x.ModerationCaseId).HasMaxLength(64); e.Property(x => x.SourceType).HasMaxLength(32); e.Property(x => x.SourceId).HasMaxLength(64); e.Property(x => x.SubjectMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Priority).HasMaxLength(16); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.AssignedTo).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberReport>(e => { e.ToTable("member_report", "social"); e.HasKey(x => x.ReportId); e.Property(x => x.ReportId).HasMaxLength(64); e.Property(x => x.ReporterMemberId).HasMaxLength(64); e.Property(x => x.ReportedMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Category).HasMaxLength(64); e.Property(x => x.Description).HasMaxLength(2000); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
