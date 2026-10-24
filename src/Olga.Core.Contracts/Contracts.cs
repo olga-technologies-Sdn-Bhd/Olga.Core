@@ -86,6 +86,10 @@ public sealed record ConversationReadRequest(string LastReadMessageId);
 public sealed record ConversationMuteRequest(DateTimeOffset? MutedUntil);
 public sealed record MessageReceiptRequest(DateTimeOffset? DeliveredAt = null, DateTimeOffset? ReadAt = null);
 public sealed record MessageReceiptResponse(string MessageId, string MemberId, DateTimeOffset? DeliveredAt, DateTimeOffset? ReadAt, DateTimeOffset UpdatedAt);
+// platform: IOS or ANDROID. push_provider (APNS or FCM) and push_token go together; leave both out to register the device only.
+public sealed record DeviceRegistrationRequest(string Platform, string AppVersion, string? PushProvider = null, string? PushToken = null);
+// The push token is never returned; push_enabled says whether the device has an active one.
+public sealed record DeviceResponse(string DeviceId, string Platform, string AppVersion, string Status, bool PushEnabled, DateTimeOffset LastSeenAt);
 public sealed record NotificationPreferenceRequest(string PurposeCode, bool PushEnabled, bool EmailEnabled, TimeOnly? QuietStartLocal = null, TimeOnly? QuietEndLocal = null, string? TimezoneId = null);
 public sealed record NotificationPreferenceResponse(string PurposeCode, bool PushEnabled, bool EmailEnabled, TimeOnly? QuietStartLocal, TimeOnly? QuietEndLocal, string? TimezoneId, string ETag, DateTimeOffset UpdatedAt);
 public sealed record PrivacyRequestCreate(string RequestType);

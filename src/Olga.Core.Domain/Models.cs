@@ -322,6 +322,37 @@ public sealed class IdempotencyRecord
     public DateTimeOffset ExpiresAt { get; set; }
 }
 
+// iam.member_device: one app installation. A re-login on the same installation moves it to the new member.
+public sealed class MemberDevice
+{
+    public string DeviceId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public string Platform { get; set; } = "";
+    public string AppVersion { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset LastSeenAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? RevokedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+// notification.push_token: an encrypted APNS/FCM token, unique by its keyed fingerprint.
+public sealed class PushToken
+{
+    public long PushTokenId { get; set; }
+    public string DeviceId { get; set; } = "";
+    public string Provider { get; set; } = "";
+    public byte[] TokenCiphertext { get; set; } = [];
+    public string TokenFingerprint { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset? LastSuccessAt { get; set; }
+    public DateTimeOffset? InvalidatedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
 public sealed class OutboxEvent
 {
     public string OutboxEventId { get; set; } = Guid.NewGuid().ToString("N");

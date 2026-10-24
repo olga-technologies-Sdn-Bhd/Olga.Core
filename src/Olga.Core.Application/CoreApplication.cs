@@ -27,6 +27,8 @@ public interface ICoreStore
     IQueryable<Message> Messages { get; }
     IQueryable<MessageReceipt> MessageReceipts { get; }
     IQueryable<NotificationPreference> NotificationPreferences { get; }
+    IQueryable<MemberDevice> Devices { get; }
+    IQueryable<PushToken> PushTokens { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
     IQueryable<ModerationCase> ModerationCases { get; }
@@ -99,6 +101,10 @@ public interface ICoreService
     Task<MemberReportResponse> ReportMemberAsync(string memberId, string reportedMemberId, MemberReportRequest request, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
+    // Registers or refreshes this installation for the member; with a push token, replaces the device's previous token.
+    Task<DeviceResponse> RegisterDeviceAsync(string memberId, string deviceId, DeviceRegistrationRequest request, CancellationToken ct);
+    // Sign-out: the device stops receiving pushes. 404 DEVICE_NOT_FOUND unless the device is the member's.
+    Task RevokeDeviceAsync(string memberId, string deviceId, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
     Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct);
     // Also records a completed EXPORT privacy request so admin can see it happened.
@@ -134,6 +140,8 @@ public interface IIdentityProtector
     ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
     // Keyed lookup hash for an email, identical to the SubjectHash ProtectEmail stores.
     string EmailLookupHash(string email);
+    // SubjectHash is the token's keyed fingerprint; DisplayHint is empty.
+    ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token);
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
@@ -1015,6 +1023,51 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         await store.SaveAsync(ct);
         return new(row.PurposeCode, row.PushEnabled, row.EmailEnabled, row.QuietStartLocal, row.QuietEndLocal, row.TimezoneId, $"\"{row.RowVersion}\"", row.UpdatedAt);
     }
+
+    public async Task<DeviceResponse> RegisterDeviceAsync(string memberId, string deviceId, DeviceRegistrationRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId) || deviceId.Length > 64 || request.Platform is not ("IOS" or "ANDROID")
+            || string.IsNullOrWhiteSpace(request.AppVersion) || request.AppVersion.Length > 32
+            || (request.PushProvider is null) != string.IsNullOrWhiteSpace(request.PushToken)
+            || request.PushProvider is not (null or "APNS" or "FCM") || request.PushToken?.Length > 4096)
+            throw new DomainException("DEVICE_REGISTRATION_INVALID");
+        EnsureNotDeletionPending(memberId);
+        var now = DateTimeOffset.UtcNow;
+        var device = store.Devices.SingleOrDefault(x => x.DeviceId == deviceId);
+        if (device is null) { device = new MemberDevice { DeviceId = deviceId, CreatedAt = now }; store.Add(device); }
+        // The same installation signing in as another member moves to that member; tokens follow the device.
+        device.MemberId = memberId; device.Platform = request.Platform; device.AppVersion = request.AppVersion.Trim();
+        device.Status = "ACTIVE"; device.RevokedAt = null; device.LastSeenAt = now; device.UpdatedAt = now;
+
+        if (request.PushProvider is not null)
+        {
+            var token = identityProtector.ProtectPushToken(deviceId, request.PushProvider, request.PushToken!.Trim());
+            // A token is unique across devices: if the app was reinstalled the old installation's row moves here.
+            var row = store.PushTokens.SingleOrDefault(x => x.TokenFingerprint == token.SubjectHash);
+            if (row is null) { row = new PushToken { TokenFingerprint = token.SubjectHash, CreatedAt = now }; store.Add(row); }
+            row.DeviceId = deviceId; row.Provider = request.PushProvider; row.TokenCiphertext = token.SubjectCiphertext;
+            row.Status = "ACTIVE"; row.InvalidatedAt = null; row.UpdatedAt = now;
+            // The provider rotated the token: the device's older ones stop being used.
+            foreach (var old in store.PushTokens.Where(x => x.DeviceId == deviceId && x.Status == "ACTIVE" && x.TokenFingerprint != token.SubjectHash))
+            { old.Status = "INVALID"; old.InvalidatedAt = now; old.UpdatedAt = now; }
+        }
+        await store.SaveAsync(ct);
+        return MapDevice(device);
+    }
+
+    public async Task RevokeDeviceAsync(string memberId, string deviceId, CancellationToken ct)
+    {
+        var device = store.Devices.SingleOrDefault(x => x.DeviceId == deviceId && x.MemberId == memberId) ?? throw new DomainException("DEVICE_NOT_FOUND", 404);
+        if (device.Status == "REVOKED") return;
+        var now = DateTimeOffset.UtcNow;
+        device.Status = "REVOKED"; device.RevokedAt = now; device.UpdatedAt = now;
+        foreach (var token in store.PushTokens.Where(x => x.DeviceId == deviceId && x.Status == "ACTIVE"))
+        { token.Status = "INVALID"; token.InvalidatedAt = now; token.UpdatedAt = now; }
+        await store.SaveAsync(ct);
+    }
+
+    private DeviceResponse MapDevice(MemberDevice x) =>
+        new(x.DeviceId, x.Platform, x.AppVersion, x.Status, x.Status == "ACTIVE" && store.PushTokens.Any(t => t.DeviceId == x.DeviceId && t.Status == "ACTIVE"), x.LastSeenAt);
 
     public async Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct)
     {

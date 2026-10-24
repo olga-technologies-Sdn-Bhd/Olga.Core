@@ -254,6 +254,10 @@ memberV1.MapPost("/members/{memberId}/report", async (HttpContext c, string memb
     .WithName("ReportMember").WithTags("Social").Produces<MemberReportResponse>(201);
 memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, NotificationPreferenceRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SetNotificationPreferenceAsync(Member(c), body, ct)))
     .WithName("SetNotificationPreference").WithTags("Preferences and privacy").Produces<NotificationPreferenceResponse>(200);
+memberV1.MapPut("/me/devices/{deviceId}", async (HttpContext c, string deviceId, DeviceRegistrationRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.RegisterDeviceAsync(Member(c), deviceId, body, ct)))
+    .WithName("RegisterDevice").WithTags("Devices").Produces<DeviceResponse>(200);
+memberV1.MapDelete("/me/devices/{deviceId}", async (HttpContext c, string deviceId, ICoreService s, CancellationToken ct) => { await s.RevokeDeviceAsync(Member(c), deviceId, ct); return Results.NoContent(); })
+    .WithName("RevokeDevice").WithTags("Devices").Produces(204);
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)))
     .WithName("CreatePrivacyRequest").WithTags("Preferences and privacy").Produces<PrivacyRequestResponse>(202);
 memberV1.MapGet("/me/privacy-requests", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(Member(c), ct)))
