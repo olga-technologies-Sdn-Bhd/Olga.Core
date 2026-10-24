@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 using Npgsql;
@@ -64,6 +66,14 @@ builder.Services.AddOpenApi(options =>
     });
 });
 builder.Services.AddHealthChecks();
+// Realtime chat through Azure SignalR when SignalR:Endpoint is set (keyless, managed identity); in-process otherwise.
+var signalR = builder.Services.AddSignalR();
+var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
+if (!string.IsNullOrWhiteSpace(signalREndpoint))
+{
+    var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions { ManagedIdentityClientId = builder.Configuration["SignalR:ManagedIdentityClientId"] });
+    signalR.AddAzureSignalR(options => options.Endpoints = [new ServiceEndpoint(new Uri(signalREndpoint), credential)]);
+}
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
 if (local) builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseInMemoryDatabase("olga-core-local"));
@@ -90,7 +100,9 @@ app.Use(async (context, next) =>
         var requestLimit = context.Request.Path.StartsWithSegments("/v1/me/profile-picture") ? 5_500_000 : 256_000;
         if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
-        if (context.Request.Path.StartsWithSegments("/v1") && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
+        // SignalR's negotiate POST is a connection handshake, not a mutation.
+        if (context.Request.Path.StartsWithSegments("/v1") && !context.Request.Path.StartsWithSegments(ChatRealtime.HubPath)
+            && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
         {
             await Error(context, 400, "IDEMPOTENCY_KEY_REQUIRED");
             return;
@@ -126,6 +138,8 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json", "OLGA Core API v1");
 });
 app.MapHealthChecks("/health");
+app.UseMiddleware<RealtimeMemberMiddleware>();
+app.MapHub<ChatHub>(ChatRealtime.HubPath);
 app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503))
     .WithName("GetReadiness").WithTags("Operations").Produces(200).Produces(503);
 

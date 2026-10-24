@@ -31,6 +31,21 @@ public sealed class ServiceBusOutboxEventPublisher : IOutboxEventPublisher, IAsy
 
     public static ServiceBusMessage CreateMessage(ClaimedOutboxEvent outboxEvent)
     {
+        var message = new ServiceBusMessage(Envelope(outboxEvent))
+        {
+            MessageId = outboxEvent.OutboxEventId,
+            Subject = outboxEvent.EventType,
+            ContentType = "application/json",
+            CorrelationId = outboxEvent.AggregateId
+        };
+        message.ApplicationProperties["event_type"] = outboxEvent.EventType;
+        message.ApplicationProperties["aggregate_type"] = outboxEvent.AggregateType;
+        return message;
+    }
+
+    // The integration event envelope: event_id, event_type, aggregate_type, aggregate_id, occurred_at, data.
+    public static BinaryData Envelope(ClaimedOutboxEvent outboxEvent)
+    {
         var buffer = new ArrayBufferWriter<byte>();
         using (var writer = new Utf8JsonWriter(buffer))
         {
@@ -44,17 +59,7 @@ public sealed class ServiceBusOutboxEventPublisher : IOutboxEventPublisher, IAsy
             writer.WriteRawValue(outboxEvent.PayloadJson, skipInputValidation: false);
             writer.WriteEndObject();
         }
-
-        var message = new ServiceBusMessage(new BinaryData(buffer.WrittenMemory))
-        {
-            MessageId = outboxEvent.OutboxEventId,
-            Subject = outboxEvent.EventType,
-            ContentType = "application/json",
-            CorrelationId = outboxEvent.AggregateId
-        };
-        message.ApplicationProperties["event_type"] = outboxEvent.EventType;
-        message.ApplicationProperties["aggregate_type"] = outboxEvent.AggregateType;
-        return message;
+        return new BinaryData(buffer.WrittenMemory);
     }
 
     public async ValueTask DisposeAsync()
