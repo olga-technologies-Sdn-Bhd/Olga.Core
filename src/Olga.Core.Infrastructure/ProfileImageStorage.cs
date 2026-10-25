@@ -4,6 +4,7 @@ using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
 using Olga.Core.Application;
 
 namespace Olga.Core.Infrastructure;
@@ -13,8 +14,9 @@ public sealed class AzureProfileImageStorage : IProfileImageStorage
     private const string MalwareScanResultTag = "Malware Scanning scan result";
     private readonly BlobContainerClient pending;
     private readonly BlobContainerClient images;
+    private readonly bool bypassMalwareScanning;
 
-    public AzureProfileImageStorage(IConfiguration configuration)
+    public AzureProfileImageStorage(IConfiguration configuration, IHostEnvironment environment)
     {
         var endpoint = configuration["Storage:BlobServiceEndpoint"]
             ?? throw new InvalidOperationException("Storage:BlobServiceEndpoint is required.");
@@ -23,6 +25,8 @@ public sealed class AzureProfileImageStorage : IProfileImageStorage
         var service = new BlobServiceClient(new Uri(endpoint), credential);
         pending = service.GetBlobContainerClient(configuration["Storage:PendingProfileImagesContainerName"] ?? "pending-profile-images");
         images = service.GetBlobContainerClient(configuration["Storage:ProfileImagesContainerName"] ?? "profile-images");
+        var malwareScanningRequired = !bool.TryParse(configuration["MalwareScanning:Required"], out var required) || required;
+        bypassMalwareScanning = environment.IsDevelopment() && !malwareScanningRequired;
     }
 
     public async Task UploadAsync(string blobPath, Stream content, string contentType, CancellationToken ct)
@@ -49,6 +53,7 @@ public sealed class AzureProfileImageStorage : IProfileImageStorage
 
     public async Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct)
     {
+        if (bypassMalwareScanning) return MalwareScanResult.Clean;
         var tags = (await Container(blobPath).GetBlobClient(blobPath).GetTagsAsync(cancellationToken: ct)).Value.Tags;
         if (!tags.TryGetValue(MalwareScanResultTag, out var result)) return MalwareScanResult.Pending;
         if (string.Equals(result, "No threats found", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Clean;
