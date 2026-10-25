@@ -266,31 +266,11 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
                 };
             }
 
-            // chat.save_message only writes the legacy chat.message.created event, so MessageCreated.v1 is added in the same
-            // transaction. The event ID is derived from the message ID, so an idempotent replay adds nothing.
-            await using (var outbox = CreateCommand("""
-                INSERT INTO ops.outbox_event(outbox_event_id, aggregate_type, aggregate_id, event_type, payload_json)
-                SELECT @event_id, 'MESSAGE', m.message_id, 'MessageCreated.v1',
-                       jsonb_build_object('message_id', m.message_id, 'conversation_id', m.conversation_id, 'sender_member_id', m.sender_member_id,
-                                          'recipient_member_id', p.member_id, 'server_sequence', m.server_sequence)
-                FROM chat.message m
-                JOIN chat.conversation_participant p ON p.conversation_id = m.conversation_id AND p.member_id <> m.sender_member_id
-                WHERE m.message_id = @message_id
-                LIMIT 1
-                ON CONFLICT (outbox_event_id) DO NOTHING
-                """, transaction))
-            {
-                AddVarchar(outbox, "event_id", MessageCreatedEventId(message.MessageId), 64); AddVarchar(outbox, "message_id", message.MessageId, 64);
-                await outbox.ExecuteNonQueryAsync(ct);
-            }
             await transaction.CommitAsync(ct);
             return message;
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
-
-    private static string MessageCreatedEventId(string messageId) =>
-        $"msgc_{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"MessageCreated.v1\n{messageId}"))).ToLowerInvariant()[..59]}";
 
     async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
     {
@@ -372,8 +352,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     protected override void OnModelCreating(ModelBuilder model)
     {
         model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
-        model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.ProfileImageId).HasMaxLength(64); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
-        model.Entity<MemberProfileImage>(e => { e.ToTable("member_profile_image", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_profile_image_id").UseIdentityByDefaultColumn(); e.Property(x => x.ImageId).HasColumnName("image_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.OriginalBlobPath).HasMaxLength(512); e.Property(x => x.DeclaredContentType).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.FailureCode).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ImageId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
+        model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
+        model.Entity<MemberProfileImage>(e => { e.ToTable("member_profile_image", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("profile_image_id").UseIdentityAlwaysColumn(); e.Property(x => x.ImageId).HasColumnName("image_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.OriginalBlobPath).HasColumnName("source_blob_path").HasMaxLength(1024); e.Property(x => x.DisplayBlobPath).HasMaxLength(1024); e.Property(x => x.ThumbnailBlobPath).HasMaxLength(1024); e.Property(x => x.DeclaredContentType).HasColumnName("content_type").HasMaxLength(100); e.Property(x => x.ContentLength).HasColumnName("size_bytes"); e.Property(x => x.ContentSha256).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.FailureCode).HasColumnName("rejection_reason").HasMaxLength(240); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ImageId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });

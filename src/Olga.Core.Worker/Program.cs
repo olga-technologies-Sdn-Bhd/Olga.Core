@@ -43,7 +43,14 @@ builder.Services.AddSingleton<IOutboxJitterSource, RandomOutboxJitterSource>();
 builder.Services.AddSingleton<IOutboxRetryCalculator, OutboxRetryCalculator>();
 builder.Services.AddSingleton<ServiceBusOutboxEventPublisher>();
 // With SignalR:Endpoint set, chat events also go to the conversation's members' devices.
-if (string.IsNullOrWhiteSpace(builder.Configuration["SignalR:Endpoint"]))
+var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
+var signalRRequired = builder.Configuration.GetValue<bool>("SignalR:Required");
+if (signalRRequired && string.IsNullOrWhiteSpace(signalREndpoint))
+    throw new InvalidOperationException("SignalR:Endpoint is required when SignalR:Required is enabled.");
+if (!string.IsNullOrWhiteSpace(signalREndpoint)
+    && (!Uri.TryCreate(signalREndpoint, UriKind.Absolute, out var signalRUri) || signalRUri.Scheme != Uri.UriSchemeHttps))
+    throw new InvalidOperationException("SignalR:Endpoint must be an absolute HTTPS URI.");
+if (string.IsNullOrWhiteSpace(signalREndpoint))
     builder.Services.AddSingleton<IOutboxEventPublisher>(sp => sp.GetRequiredService<ServiceBusOutboxEventPublisher>());
 else
 {

@@ -25,7 +25,7 @@ Create GitHub Environments named `dev` and `prd`. Define these variables in each
 | `ACR_LOGIN_SERVER` | `acrolgadevmalaysiaweste.azurecr.io` | Image registry |
 | `AZURE_RESOURCE_GROUP` | `rg-olga-dev-malaysiawest` | Container App resource group |
 | `CONTAINER_APP_NAME` | `ca-olga-core-api-dev` | Deployment target |
-| `WORKER_CONTAINER_APP_NAME` | `ca-olga-core-worker-dev` | Worker deployment target (no ingress) |
+| `WORKER_CONTAINER_APP_NAME` | `ca-olga-core-worker-dev` | Required worker deployment target (no ingress); deployments fail when it is absent |
 
 No long-lived Azure client secret is required. This repository uses GitHub's immutable OIDC subject format. Configure the deployment identity's federated credentials with issuer `https://token.actions.githubusercontent.com`, audience `api://AzureADTokenExchange`, and these exact subjects:
 
@@ -62,11 +62,15 @@ Configure the API container with the following exact environment-variable names:
 | --- | --- | --- |
 | `ConnectionStrings__PostgreSql` | Yes; use a Key Vault-backed Container Apps secret reference | PostgreSQL connection string using the server FQDN, database `olga_connect_dev`, port `5432`, and TLS certificate verification |
 | `Mvp__DefaultMemberId` | No | Member used by anonymous MVP requests that omit `X-Member-Id`; defaults to `A123` |
+| `Mvp__AllowInsecureMemberHeader` | No | Development-only switch allowing realtime identity from `X-Member-Id` or `member_id`; keep `false` outside the MVP development environment |
 | `Diagnostics__IncludeExceptionDetails` | No | Includes `stack_trace` in unhandled-error responses when enabled; root exception messages are returned in every environment |
+| `SignalR__Required` | No | Set to `true` in Azure so a missing realtime endpoint fails startup instead of silently selecting in-process SignalR |
+| `SignalR__Endpoint` | No | Azure SignalR HTTPS endpoint |
+| `SignalR__ManagedIdentityClientId` | No | Core API runtime identity client ID |
 
 The API intentionally does not validate caller identity in this open MVP configuration. Requests may select any member with `X-Member-Id`, so the deployment must not be treated as suitable for public or sensitive member data. Never place database credentials or tokens in GitHub variables, workflow YAML, logs, or OpenAPI documents.
 
-Configure the worker with `ConnectionStrings__PostgreSql`, `ServiceBus__FullyQualifiedNamespace`, `ServiceBus__ManagedIdentityClientId`, `ServiceBus__IntegrationTopicName=integration-events`, and `ServiceBus__NlpCompletionSubscriptionName=core-nlp-completions`. Provision the topic with duplicate detection and the Core subscription with a SQL filter for `event_type = 'NlpMatchRequestCompleted.v1'`. Grant the Core worker identity Service Bus Data Sender on the topic and Data Receiver on only that subscription. Configure a dead-letter alert and keep at least one worker replica running.
+Configure the worker with `ConnectionStrings__PostgreSql`, `ServiceBus__FullyQualifiedNamespace`, `ServiceBus__ManagedIdentityClientId`, `ServiceBus__IntegrationTopicName=integration-events`, `ServiceBus__NlpCompletionSubscriptionName=core-nlp-completions`, `Outbox__Enabled=true`, `SignalR__Required=true`, `SignalR__Endpoint`, and `SignalR__ManagedIdentityClientId`. Provision the topic with duplicate detection and the Core subscription with a SQL filter for `event_type = 'NlpMatchRequestCompleted.v1'`. Grant the Core worker identity Service Bus Data Sender on the topic, Data Receiver on only that subscription and the content-scan queue, and `SignalR REST API Owner` on the SignalR resource. Grant the Core API identity `SignalR App Server`. Configure a dead-letter alert and keep at least one worker replica running. The application deployment workflow validates this contract before releasing either image.
 
 The current registry uses the non-ABAC permission model. Grant the GitHub deployment identity `AcrPush` on `acrolgadevmalaysiaweste`, and grant the runtime managed identity only `AcrPull` on that registry. The runtime identity also needs permission to read the referenced Key Vault secrets. PostgreSQL schema creation and upgrades must run from a trusted host with network access to the private database endpoint.
 

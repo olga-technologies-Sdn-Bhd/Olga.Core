@@ -10,8 +10,8 @@ public interface IChatRealtimeSender
 }
 
 // Publishes to Service Bus first, then forwards chat events to the conversation's members through SignalR.
-// Realtime is best effort: a SignalR failure is logged, never retried through the outbox, because the
-// Service Bus publish already succeeded and clients recover missed events through REST.
+// Realtime remains best effort: a SignalR failure is logged after the durable Service Bus publish,
+// and clients must recover missed events through REST/sync.
 public sealed class SignalRChatEventPublisher(IOutboxEventPublisher inner, IChatRealtimeSender realtime, ILogger<SignalRChatEventPublisher> logger) : IOutboxEventPublisher
 {
     public async Task PublishAsync(ClaimedOutboxEvent outboxEvent, CancellationToken cancellationToken)
@@ -26,7 +26,7 @@ public sealed class SignalRChatEventPublisher(IOutboxEventPublisher inner, IChat
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
-            logger.LogWarning(ex, "Realtime delivery failed for outbox event {OutboxEventId} of type {EventType}", outboxEvent.OutboxEventId, outboxEvent.EventType);
+            logger.LogWarning(ex, "Realtime delivery failed for outbox event {OutboxEventId} of type {EventType}; clients must recover through REST/sync", outboxEvent.OutboxEventId, outboxEvent.EventType);
         }
     }
 }

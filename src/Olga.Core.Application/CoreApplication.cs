@@ -246,15 +246,21 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         EnsureProfileEtag(profile, ifMatch);
 
         var blobPath = OriginalImagePath(memberId, imageId);
+        await using var buffered = new MemoryStream((int)contentLength);
+        await content.CopyToAsync(buffered, ct);
+        if (buffered.Length != contentLength) throw new DomainException("PROFILE_IMAGE_SIZE_INVALID", 413);
+        var contentSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(buffered.GetBuffer().AsSpan(0, (int)buffered.Length))).ToLowerInvariant();
+        buffered.Position = 0;
         await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
-            .UploadAsync(blobPath, content, contentType, ct);
+            .UploadAsync(blobPath, buffered, contentType, ct);
         store.Add(new MemberProfileImage
         {
             ImageId = imageId,
             MemberId = memberId,
             OriginalBlobPath = blobPath,
             DeclaredContentType = contentType,
-            ContentLength = contentLength
+            ContentLength = contentLength,
+            ContentSha256 = contentSha256
         });
         TouchProfile(profile);
         AddOutbox("PROFILE_IMAGE", imageId, "ProfileImageUploaded.v1", new { image_id = imageId, member_id = memberId });
@@ -277,11 +283,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         }
         EnsureProfileEtag(profile, ifMatch);
         var now = DateTimeOffset.UtcNow;
-        var affected = store.ProfileImages.Where(x => x.MemberId == memberId && x.Status != "DELETED").ToList();
-        foreach (var image in affected)
+        var affected = store.ProfileImages.Where(x => x.MemberId == memberId && (x.Id == profile.ProfileImageId || x.Status == "PENDING" || x.Status == "PROCESSING")).ToList();
+        foreach (var image in affected.Where(x => x.Status is "PENDING" or "PROCESSING"))
         {
-            image.Status = "DELETED";
-            image.DeleteAfter = now.AddDays(7);
+            image.Status = "FAILED";
+            image.FailureCode = "PROFILE_IMAGE_REMOVED";
+            image.ProcessedAt = now;
             image.UpdatedAt = now;
             if (!store.IsRelational) image.RowVersion++;
         }
@@ -300,7 +307,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var pixels = normalizedSize switch { "thumbnail" => 64, "small" => 256, "large" => 512, _ => throw new DomainException("PROFILE_IMAGE_SIZE_INVALID") };
         var profile = FindProfile(memberId);
         if (profile.ProfileImageId is null) throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
-        var image = store.ProfileImages.SingleOrDefault(x => x.ImageId == profile.ProfileImageId && x.MemberId == memberId && x.Status == "READY")
+        var image = store.ProfileImages.SingleOrDefault(x => x.Id == profile.ProfileImageId && x.MemberId == memberId && x.Status == "APPROVED")
             ?? throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
         var stream = await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
             .OpenReadAsync(DerivativeImagePath(memberId, image.ImageId, pixels), ct);
@@ -1336,9 +1343,13 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private ProfileResponse Map(MemberProfile x)
     {
-        var latest = store.ProfileImages.Where(i => i.MemberId == x.MemberId).OrderByDescending(i => i.CreatedAt).FirstOrDefault();
+        var latest = store.ProfileImages
+            .Where(i => i.MemberId == x.MemberId && (i.Id == x.ProfileImageId || i.Status == "PENDING" || i.Status == "PROCESSING"))
+            .OrderByDescending(i => i.CreatedAt)
+            .FirstOrDefault();
         var imageUrl = x.ProfileImageId is null ? null : $"/v1/members/{Uri.EscapeDataString(x.MemberId)}/profile-picture?size=thumbnail";
-        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, latest?.Status);
+        var imageStatus = latest?.Status == "APPROVED" ? "READY" : latest?.Status;
+        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, imageStatus);
     }
     public static string OriginalImagePath(string memberId, string imageId) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/original";
     public static string DerivativeImagePath(string memberId, string imageId, int pixels) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/avatar-{pixels}.webp";

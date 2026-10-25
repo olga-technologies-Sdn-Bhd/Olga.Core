@@ -2,6 +2,7 @@ using System.Net;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
 using Olga.Core.Application;
 using Olga.Core.Worker;
@@ -42,10 +43,12 @@ public sealed class ChatRealtimeTests
     }
 
     [Fact]
-    public async Task A_realtime_failure_does_not_fail_the_outbox_publish_but_a_Service_Bus_failure_does()
+    public async Task A_realtime_failure_is_best_effort_but_a_Service_Bus_failure_leaves_the_publish_incomplete()
     {
-        var publisher = new SignalRChatEventPublisher(new RecordingPublisher(), new RecordingSender { Fail = true }, NullLogger<SignalRChatEventPublisher>.Instance);
+        var inner = new RecordingPublisher();
+        var publisher = new SignalRChatEventPublisher(inner, new RecordingSender { Fail = true }, NullLogger<SignalRChatEventPublisher>.Instance);
         await publisher.PublishAsync(Event("ConversationRead.v1", """{"reader_member_id":"B","sender_member_id":"A"}"""), default);
+        Assert.Single(inner.Published);
 
         var sender = new RecordingSender();
         var failing = new SignalRChatEventPublisher(new RecordingPublisher { Fail = true }, sender, NullLogger<SignalRChatEventPublisher>.Instance);
@@ -84,7 +87,12 @@ public sealed class ChatRealtimeTests
 public sealed class ChatHubApiTests : IClassFixture<WebApplicationFactory<Program>>
 {
     private readonly WebApplicationFactory<Program> factory;
-    public ChatHubApiTests(WebApplicationFactory<Program> factory) => this.factory = factory.WithWebHostBuilder(b => b.UseEnvironment("Testing"));
+    public ChatHubApiTests(WebApplicationFactory<Program> factory) => this.factory = factory.WithWebHostBuilder(b =>
+    {
+        b.UseEnvironment("Testing");
+        b.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(
+            new Dictionary<string, string?> { ["Mvp:AllowInsecureMemberHeader"] = "true" }));
+    });
 
     [Fact]
     public async Task Negotiate_needs_a_member_but_no_idempotency_key()
@@ -101,5 +109,20 @@ public sealed class ChatHubApiTests : IClassFixture<WebApplicationFactory<Progra
         Assert.Equal(HttpStatusCode.OK, member.StatusCode);
         Assert.Contains("connectionToken", await member.Content.ReadAsStringAsync());
         Assert.Equal(HttpStatusCode.OK, byQuery.StatusCode);
+    }
+
+    [Fact]
+    public async Task Negotiate_rejects_the_MVP_identity_fallback_when_it_is_disabled()
+    {
+        using var securedFactory = factory.WithWebHostBuilder(b => b.ConfigureAppConfiguration((_, configuration) =>
+            configuration.AddInMemoryCollection(
+                new Dictionary<string, string?> { ["Mvp:AllowInsecureMemberHeader"] = "false" })));
+        using var client = securedFactory.CreateClient();
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{ChatRealtime.HubPath}/negotiate?negotiateVersion=1&member_id=A123");
+        request.Headers.Add("X-Member-Id", "A123");
+
+        using var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 }

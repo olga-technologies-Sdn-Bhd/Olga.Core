@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace Olga.Core.Application;
 
 // Realtime chat: the API hosts the hub and the worker forwards committed outbox events to it.
-// Realtime is best effort; clients recover anything missed through REST and sync.
+// Realtime is best effort; clients must recover anything missed through REST and sync.
 public static class ChatRealtime
 {
     // Must match the API's hub class name: Azure SignalR identifies the hub by it.

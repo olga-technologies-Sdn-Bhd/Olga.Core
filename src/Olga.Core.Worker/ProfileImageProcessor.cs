@@ -19,7 +19,7 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
     {
         var row = await db.MemberProfileImages.SingleOrDefaultAsync(x => x.ImageId == uploaded.ImageId && x.MemberId == uploaded.MemberId, ct)
             ?? throw new InvalidOperationException("Profile image event references a missing database row.");
-        if (row.Status is "READY" or "REJECTED" or "DELETED") return;
+        if (row.Status is "APPROVED" or "REJECTED" or "FAILED") return;
 
         row.Status = "PROCESSING";
         row.UpdatedAt = DateTimeOffset.UtcNow;
@@ -57,6 +57,8 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
                 encoded.Position = 0;
                 await storage.UploadAsync(CoreService.DerivativeImagePath(row.MemberId, row.ImageId, pixels), encoded, "image/webp", ct);
             }
+            row.ThumbnailBlobPath = CoreService.DerivativeImagePath(row.MemberId, row.ImageId, 64);
+            row.DisplayBlobPath = CoreService.DerivativeImagePath(row.MemberId, row.ImageId, 512);
 
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
@@ -75,26 +77,24 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
     {
         await using var transaction = db.Database.IsRelational() ? await db.Database.BeginTransactionAsync(ct) : null;
         var profile = await db.MemberProfiles.SingleAsync(x => x.MemberId == row.MemberId, ct);
-        if (row.Status == "DELETED") return;
-        var previousImageId = profile.ProfileImageId;
-        row.Status = "READY";
+        if (row.Status == "FAILED") return;
+        var previousImage = profile.ProfileImageId is { } previousId
+            ? await db.MemberProfileImages.SingleOrDefaultAsync(x => x.Id == previousId, ct)
+            : null;
+        row.Status = "APPROVED";
         row.FailureCode = null;
+        row.ProcessedAt = DateTimeOffset.UtcNow;
         row.UpdatedAt = DateTimeOffset.UtcNow;
         if (!db.Database.IsRelational()) row.RowVersion++;
-        profile.ProfileImageId = row.ImageId;
+        profile.ProfileImageId = row.Id;
         profile.UpdatedAt = DateTimeOffset.UtcNow;
         if (!db.Database.IsRelational()) profile.Version++;
-        if (previousImageId is not null && !string.Equals(previousImageId, row.ImageId, StringComparison.Ordinal))
-        {
-            var previous = await db.MemberProfileImages.SingleOrDefaultAsync(x => x.ImageId == previousImageId, ct);
-            if (previous is not null) previous.DeleteAfter = DateTimeOffset.UtcNow.AddDays(7);
-        }
         db.OutboxEvents.Add(new OutboxEvent
         {
             AggregateType = "MEMBER",
             AggregateId = row.MemberId,
             EventType = "MemberProfileImageChanged.v1",
-            PayloadJson = JsonSerializer.Serialize(new { member_id = row.MemberId, image_id = row.ImageId, previous_image_id = previousImageId }, JsonOptions)
+            PayloadJson = JsonSerializer.Serialize(new { member_id = row.MemberId, image_id = row.ImageId, previous_image_id = previousImage?.ImageId }, JsonOptions)
         });
         await db.SaveChangesAsync(ct);
         if (transaction is not null) await transaction.CommitAsync(ct);
@@ -104,6 +104,7 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
     {
         row.Status = "REJECTED";
         row.FailureCode = failureCode;
+        row.ProcessedAt = DateTimeOffset.UtcNow;
         row.UpdatedAt = DateTimeOffset.UtcNow;
         if (!db.Database.IsRelational()) row.RowVersion++;
         await db.SaveChangesAsync(ct);

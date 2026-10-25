@@ -165,6 +165,54 @@ jobs:
           IMAGE_DIGEST: ${{ steps.api_image.outputs.digest }}
           WORKER_IMAGE_DIGEST: ${{ steps.worker_image.outputs.digest }}
         run: |
+          : "${WORKER_CONTAINER_APP_NAME:?WORKER_CONTAINER_APP_NAME must identify the Terraform-managed Core worker}"
+
+          mapfile -t api_env_names < <(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[].name" \
+            --output tsv)
+          has_api_env() { printf '%s\n' "${api_env_names[@]}" | grep -Fxq "$1"; }
+          for required_name in SignalR__Required SignalR__Endpoint SignalR__ManagedIdentityClientId; do
+            has_api_env "$required_name" || { echo "Core API is missing $required_name" >&2; exit 1; }
+          done
+
+          mapfile -t worker_env_names < <(az containerapp show \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[].name" \
+            --output tsv)
+          has_worker_env() { printf '%s\n' "${worker_env_names[@]}" | grep -Fxq "$1"; }
+          for required_name in ConnectionStrings__PostgreSql ServiceBus__FullyQualifiedNamespace ServiceBus__ManagedIdentityClientId Outbox__Enabled SignalR__Required SignalR__Endpoint SignalR__ManagedIdentityClientId; do
+            has_worker_env "$required_name" || { echo "Core worker is missing $required_name" >&2; exit 1; }
+          done
+
+          api_signalr_required=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='SignalR__Required'].value | [0]" \
+            --output tsv)
+          worker_signalr_required=$(az containerapp show \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='SignalR__Required'].value | [0]" \
+            --output tsv)
+          outbox_enabled=$(az containerapp show \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.containers[0].env[?name=='Outbox__Enabled'].value | [0]" \
+            --output tsv)
+          [[ "$api_signalr_required" == "true" ]] || { echo "Core API must set SignalR__Required=true" >&2; exit 1; }
+          [[ "$worker_signalr_required" == "true" ]] || { echo "Core worker must set SignalR__Required=true" >&2; exit 1; }
+          [[ "$outbox_enabled" == "true" ]] || { echo "Core worker must set Outbox__Enabled=true" >&2; exit 1; }
+
+          worker_min_replicas=$(az containerapp show \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.scale.minReplicas" \
+            --output tsv)
+          [[ "$worker_min_replicas" =~ ^[1-9][0-9]*$ ]] || { echo "Core worker must have at least one replica" >&2; exit 1; }
+
           image_ref="${ACR_LOGIN_SERVER}/${IMAGE_NAME}@${IMAGE_DIGEST}"
           worker_image_ref="${ACR_LOGIN_SERVER}/${WORKER_IMAGE_NAME}@${WORKER_IMAGE_DIGEST}"
           revision_suffix="${GITHUB_SHA:0:8}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -179,28 +227,23 @@ jobs:
             --set-env-vars "Diagnostics__IncludeExceptionDetails=$include_exception_details" \
             --output none
 
-          worker_revision="not-configured"
-          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
-            az containerapp update \
-              --name "$WORKER_CONTAINER_APP_NAME" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --image "$worker_image_ref" \
-              --revision-suffix "$revision_suffix" \
-              --output none
-          fi
+          az containerapp update \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --image "$worker_image_ref" \
+            --revision-suffix "$revision_suffix" \
+            --output none
 
           revision=$(az containerapp show \
             --name "$CONTAINER_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --query properties.latestRevisionName \
             --output tsv)
-          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
-            worker_revision=$(az containerapp show \
-              --name "$WORKER_CONTAINER_APP_NAME" \
-              --resource-group "$AZURE_RESOURCE_GROUP" \
-              --query properties.latestRevisionName \
-              --output tsv)
-          fi
+          worker_revision=$(az containerapp show \
+            --name "$WORKER_CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query properties.latestRevisionName \
+            --output tsv)
 
           for attempt in {1..20}; do
             health=$(az containerapp revision show \
@@ -215,20 +258,18 @@ jobs:
             sleep 15
           done
 
-          if [[ -n "$WORKER_CONTAINER_APP_NAME" ]]; then
-            for attempt in {1..20}; do
-              worker_state=$(az containerapp revision show \
-                --name "$WORKER_CONTAINER_APP_NAME" \
-                --resource-group "$AZURE_RESOURCE_GROUP" \
-                --revision "$worker_revision" \
-                --query properties.runningState \
-                --output tsv)
-              [[ "$worker_state" == "Running" ]] && break
-              [[ "$worker_state" == "Failed" || "$worker_state" == "Degraded" ]] && exit 1
-              [[ "$attempt" == "20" ]] && exit 1
-              sleep 15
-            done
-          fi
+          for attempt in {1..20}; do
+            worker_state=$(az containerapp revision show \
+              --name "$WORKER_CONTAINER_APP_NAME" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --revision "$worker_revision" \
+              --query properties.runningState \
+              --output tsv)
+            [[ "$worker_state" == "Running" ]] && break
+            [[ "$worker_state" == "Failed" || "$worker_state" == "Degraded" ]] && exit 1
+            [[ "$attempt" == "20" ]] && exit 1
+            sleep 15
+          done
 
           {
             echo "### Core API deployment"

@@ -75,8 +75,8 @@ public sealed class ProfileImageTests
         {
             await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
 
-            Assert.Equal("READY", row.Status);
-            Assert.Equal(row.ImageId, db.MemberProfiles.Single().ProfileImageId);
+            Assert.Equal("APPROVED", row.Status);
+            Assert.Equal(row.Id, db.MemberProfiles.Single().ProfileImageId);
             Assert.Equal("MemberProfileImageChanged.v1", Assert.Single(db.OutboxEvents).EventType);
             foreach (var pixels in new[] { 64, 256, 512 })
                 await using (await storage.OpenReadAsync(CoreService.DerivativeImagePath(row.MemberId, row.ImageId, pixels), default)) { }
@@ -89,12 +89,12 @@ public sealed class ProfileImageTests
         var (db, storage, row) = await PendingAsync("image/png", () => Task.FromResult<byte[]>([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
         await using (db)
         {
-            db.MemberProfiles.Single().ProfileImageId = "img_old";
+            db.MemberProfiles.Single().ProfileImageId = 999L;
             await db.SaveChangesAsync();
 
             await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
 
-            Assert.Equal("img_old", db.MemberProfiles.Single().ProfileImageId);
+            Assert.Equal(999L, db.MemberProfiles.Single().ProfileImageId);
             Assert.Equal("REJECTED", row.Status);
         }
     }
@@ -104,8 +104,12 @@ public sealed class ProfileImageTests
     {
         await using var db = Db();
         var storage = new InMemoryProfileImageStorage();
-        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE", Visibility = "HIDDEN", ProfileImageId = "img_a" });
-        db.MemberProfileImages.Add(new MemberProfileImage { ImageId = "img_a", MemberId = "A", Status = "READY", OriginalBlobPath = "private" });
+        var profile = new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE", Visibility = "HIDDEN" };
+        var image = new MemberProfileImage { ImageId = "img_a", MemberId = "A", Status = "APPROVED", OriginalBlobPath = "private" };
+        db.MemberProfiles.Add(profile);
+        db.MemberProfileImages.Add(image);
+        await db.SaveChangesAsync();
+        profile.ProfileImageId = image.Id;
         await db.SaveChangesAsync();
         await storage.UploadAsync(CoreService.DerivativeImagePath("A", "img_a", 64), new MemoryStream([1]), "image/webp", default);
         var service = Service(db, storage);
@@ -121,10 +125,13 @@ public sealed class ProfileImageTests
     public async Task Delete_clears_pointer_rejects_pending_work_and_emits_event()
     {
         await using var db = Db();
-        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE", ProfileImageId = "img_old" });
-        db.MemberProfileImages.AddRange(
-            new MemberProfileImage { ImageId = "img_old", MemberId = "A", Status = "READY", OriginalBlobPath = "old" },
-            new MemberProfileImage { ImageId = "img_pending", MemberId = "A", Status = "PENDING", OriginalBlobPath = "pending" });
+        var profile = new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" };
+        var approved = new MemberProfileImage { ImageId = "img_old", MemberId = "A", Status = "APPROVED", OriginalBlobPath = "old" };
+        var pending = new MemberProfileImage { ImageId = "img_pending", MemberId = "A", Status = "PENDING", OriginalBlobPath = "pending" };
+        db.MemberProfiles.Add(profile);
+        db.MemberProfileImages.AddRange(approved, pending);
+        await db.SaveChangesAsync();
+        profile.ProfileImageId = approved.Id;
         await db.SaveChangesAsync();
 
         var service = Service(db, new InMemoryProfileImageStorage());
@@ -132,7 +139,8 @@ public sealed class ProfileImageTests
         var replay = await service.DeleteProfileImageAsync("A", "delete-1", "\"1\"", default);
 
         Assert.Null(db.MemberProfiles.Single().ProfileImageId);
-        Assert.All(db.MemberProfileImages, image => Assert.Equal("DELETED", image.Status));
+        Assert.Equal("APPROVED", approved.Status);
+        Assert.Equal("FAILED", pending.Status);
         Assert.Equal("ProfileImageRemoved.v1", Assert.Single(db.OutboxEvents).EventType);
         Assert.Null(response.ProfileImageUrl);
         Assert.Equal(response.ETag, replay.ETag);
@@ -142,14 +150,19 @@ public sealed class ProfileImageTests
     public async Task Profile_contract_never_exposes_a_blob_path()
     {
         await using var db = Db();
-        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE", ProfileImageId = "img_a" });
-        db.MemberProfileImages.Add(new MemberProfileImage { ImageId = "img_a", MemberId = "A", Status = "READY", OriginalBlobPath = "members/A/img_a/original" });
+        var profile = new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" };
+        var image = new MemberProfileImage { ImageId = "img_a", MemberId = "A", Status = "APPROVED", OriginalBlobPath = "members/A/img_a/original" };
+        db.MemberProfiles.Add(profile);
+        db.MemberProfileImages.Add(image);
+        await db.SaveChangesAsync();
+        profile.ProfileImageId = image.Id;
         await db.SaveChangesAsync();
 
         var response = await Service(db, new InMemoryProfileImageStorage()).GetOwnProfileAsync("A", default);
         var json = System.Text.Json.JsonSerializer.Serialize(response);
 
         Assert.Equal("/v1/members/A/profile-picture?size=thumbnail", response.ProfileImageUrl);
+        Assert.Equal("READY", response.ProfileImageStatus);
         Assert.DoesNotContain("members/A/img_a/original", json, StringComparison.Ordinal);
     }
 
@@ -164,6 +177,7 @@ public sealed class ProfileImageTests
         await db.SaveChangesAsync();
         var bytes = await content();
         row.ContentLength = bytes.Length;
+        row.ContentSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
         await storage.UploadAsync(row.OriginalBlobPath, new MemoryStream(bytes), contentType, default);
         return (db, storage, row);
     }

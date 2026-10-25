@@ -69,10 +69,15 @@ builder.Services.AddHealthChecks();
 // Realtime chat through Azure SignalR when SignalR:Endpoint is set (keyless, managed identity); in-process otherwise.
 var signalR = builder.Services.AddSignalR();
 var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
+var signalRRequired = builder.Configuration.GetValue<bool>("SignalR:Required");
+if (signalRRequired && string.IsNullOrWhiteSpace(signalREndpoint))
+    throw new InvalidOperationException("SignalR:Endpoint is required when SignalR:Required is enabled.");
 if (!string.IsNullOrWhiteSpace(signalREndpoint))
 {
+    if (!Uri.TryCreate(signalREndpoint, UriKind.Absolute, out var signalRUri) || signalRUri.Scheme != Uri.UriSchemeHttps)
+        throw new InvalidOperationException("SignalR:Endpoint must be an absolute HTTPS URI.");
     var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions { ManagedIdentityClientId = builder.Configuration["SignalR:ManagedIdentityClientId"] });
-    signalR.AddAzureSignalR(options => options.Endpoints = [new ServiceEndpoint(new Uri(signalREndpoint), credential)]);
+    signalR.AddAzureSignalR(options => options.Endpoints = [new ServiceEndpoint(signalRUri, credential)]);
 }
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
