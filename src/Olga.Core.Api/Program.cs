@@ -82,6 +82,10 @@ var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
+var chatFileOptions = builder.Configuration.GetSection(ChatFileOptions.SectionName).Get<ChatFileOptions>() ?? new ChatFileOptions();
+builder.Services.AddSingleton(chatFileOptions);
+if (local) builder.Services.AddSingleton<IChatFileStorage, InMemoryChatFileStorage>();
+else builder.Services.AddSingleton<IChatFileStorage, AzureChatFileStorage>();
 if (local) builder.Services.AddSingleton<IProfileImageStorage, InMemoryProfileImageStorage>();
 else builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
@@ -97,7 +101,9 @@ app.Use(async (context, next) =>
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
     try
     {
-        var requestLimit = context.Request.Path.StartsWithSegments("/v1/me/profile-picture") ? 5_500_000 : 256_000;
+        var requestLimit = context.Request.Path.StartsWithSegments("/v1/me/profile-picture") ? 5_500_000
+            : IsChatAttachmentUpload(context.Request.Path) ? chatFileOptions.MaxBytes + 512_000
+            : 256_000;
         if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
         // SignalR's negotiate POST is a connection handshake, not a mutation.
@@ -258,6 +264,27 @@ memberV1.MapGet("/conversations/{conversationId}/messages", async (HttpContext c
     .WithName("ListMessages").WithTags("Chat").Produces<IReadOnlyList<MessageResponse>>(200);
 memberV1.MapPost("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, MessageCreateRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/conversations/{conversationId}/messages/{body.MessageId}", await s.SendMessageAsync(Member(c), conversationId, body, Idempotency(c), ct)))
     .WithName("SendMessage").WithTags("Chat").Produces<MessageResponse>(201);
+memberV1.MapPost("/conversations/{conversationId}/attachments", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) =>
+{
+    if (!c.Request.HasFormContentType) throw new DomainException("ATTACHMENT_MULTIPART_REQUIRED", 415);
+    var form = await c.Request.ReadFormAsync(ct);
+    var file = form.Files.GetFile("file") ?? (form.Files.Count == 1 ? form.Files[0] : null)
+        ?? throw new DomainException("ATTACHMENT_REQUIRED");
+    await using var content = file.OpenReadStream();
+    return Results.Created((string?)null, await s.UploadChatAttachmentAsync(Member(c), conversationId, content, file.Length, file.ContentType, file.FileName, Idempotency(c), ct));
+})
+    .WithMetadata(new RequestSizeLimitAttribute(chatFileOptions.MaxBytes + 512_000))
+    .DisableAntiforgery()
+    .Accepts<IFormFile>("multipart/form-data")
+    .WithName("UploadChatAttachment").WithTags("Chat").Produces<ChatAttachmentUploadResponse>(201).Produces<ApiError>(413).Produces<ApiError>(415);
+memberV1.MapGet("/messages/{messageId}/attachment", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.GetMessageAttachmentAsync(Member(c), messageId, ct);
+    c.Response.Headers.CacheControl = "private, max-age=86400";
+    c.Response.Headers.XContentTypeOptions = "nosniff";
+    return Results.Stream(value.Content, value.MediaType, value.FileName, entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue(value.ETag), enableRangeProcessing: true);
+})
+    .WithName("GetMessageAttachment").WithTags("Chat").Produces<byte[]>(200, contentType: "application/octet-stream").Produces<ApiError>(404).Produces<ApiError>(409);
 memberV1.MapPut("/messages/{messageId}/receipt", async (HttpContext c, string messageId, MessageReceiptRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SaveMessageReceiptAsync(Member(c), messageId, body, Idempotency(c), ct)))
     .WithName("SaveMessageReceipt").WithTags("Chat").Produces<MessageReceiptResponse>(200);
 memberV1.MapDelete("/messages/{messageId}", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) => { await s.DeleteMessageAsync(Member(c), messageId, ct); return Results.NoContent(); })
@@ -356,7 +383,11 @@ string Member(HttpContext context)
     return id;
 }
 
-string Idempotency(HttpContext context) => context.Request.Headers[idempotencyKeyHeader].ToString();
+// POST /v1/conversations/{id}/attachments carries a file, so it gets the chat file limit instead of the JSON one.
+static bool IsChatAttachmentUpload(PathString path) =>
+    path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "attachments"];
+
+string Idempotency(HttpContext context) =>context.Request.Headers[idempotencyKeyHeader].ToString();
 
 static void AddHeaderParameter(OpenApiOperation operation, string name, bool required, string description, int? maxLength = null)
 {
