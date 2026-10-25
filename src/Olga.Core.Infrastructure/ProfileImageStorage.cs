@@ -10,6 +10,7 @@ namespace Olga.Core.Infrastructure;
 
 public sealed class AzureProfileImageStorage : IProfileImageStorage
 {
+    private const string MalwareScanResultTag = "Malware Scanning scan result";
     private readonly BlobContainerClient pending;
     private readonly BlobContainerClient images;
 
@@ -46,6 +47,16 @@ public sealed class AzureProfileImageStorage : IProfileImageStorage
         return response.Value.Content;
     }
 
+    public async Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct)
+    {
+        var tags = (await Container(blobPath).GetBlobClient(blobPath).GetTagsAsync(cancellationToken: ct)).Value.Tags;
+        if (!tags.TryGetValue(MalwareScanResultTag, out var result)) return MalwareScanResult.Pending;
+        if (string.Equals(result, "No threats found", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Clean;
+        if (string.Equals(result, "Malicious", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Malicious;
+        if (string.IsNullOrWhiteSpace(result) || string.Equals(result, "Pending", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Pending;
+        return MalwareScanResult.Failed;
+    }
+
     public async Task DeleteIfExistsAsync(string blobPath, CancellationToken ct) =>
         _ = await Container(blobPath).GetBlobClient(blobPath).DeleteIfExistsAsync(DeleteSnapshotsOption.IncludeSnapshots, cancellationToken: ct);
 
@@ -69,6 +80,9 @@ public sealed class InMemoryProfileImageStorage : IProfileImageStorage
         if (!blobs.TryGetValue(blobPath, out var blob)) throw new FileNotFoundException("Profile image blob not found.", blobPath);
         return Task.FromResult<Stream>(new MemoryStream(blob.Content, writable: false));
     }
+
+    public Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct) =>
+        Task.FromResult(MalwareScanResult.Clean);
 
     public Task DeleteIfExistsAsync(string blobPath, CancellationToken ct)
     {

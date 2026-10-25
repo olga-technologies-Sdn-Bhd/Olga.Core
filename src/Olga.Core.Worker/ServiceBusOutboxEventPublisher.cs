@@ -24,6 +24,7 @@ public sealed class ServiceBusOutboxEventPublisher : IOutboxEventPublisher, IAsy
     {
         var message = CreateMessage(outboxEvent);
         var sender = string.Equals(outboxEvent.EventType, ProfileImageUploaded.EventType, StringComparison.Ordinal)
+            || string.Equals(outboxEvent.EventType, ChatFileUploaded.EventType, StringComparison.Ordinal)
             ? contentScanSender
             : integrationSender;
         await sender.SendMessageAsync(message, cancellationToken);

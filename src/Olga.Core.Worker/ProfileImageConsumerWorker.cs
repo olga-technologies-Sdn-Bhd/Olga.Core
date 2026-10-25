@@ -3,16 +3,20 @@ using Azure.Messaging.ServiceBus;
 
 namespace Olga.Core.Worker;
 
-public sealed class ProfileImageConsumerWorker(
+public sealed class ContentScanConsumerWorker(
     IServiceScopeFactory scopes,
     ServiceBusClient serviceBus,
     IConfiguration configuration,
-    ILogger<ProfileImageConsumerWorker> logger) : BackgroundService
+    ILogger<ContentScanConsumerWorker> logger) : BackgroundService
 {
+    private const int MaximumScanAttempts = 20;
     private readonly ServiceBusProcessor processor = serviceBus.CreateProcessor(
         configuration["ServiceBus:ContentScanQueueName"]
             ?? throw new InvalidOperationException("ServiceBus:ContentScanQueueName is required."),
         new ServiceBusProcessorOptions { AutoCompleteMessages = false, MaxConcurrentCalls = 2, PrefetchCount = 4 });
+    private readonly ServiceBusSender retrySender = serviceBus.CreateSender(
+        configuration["ServiceBus:ContentScanQueueName"]
+            ?? throw new InvalidOperationException("ServiceBus:ContentScanQueueName is required."));
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -33,28 +37,81 @@ public sealed class ProfileImageConsumerWorker(
             await args.DeadLetterMessageAsync(args.Message, "INVALID_ENVELOPE", ex.Message);
             return;
         }
-        if (envelope is null || !ProfileImageUploaded.TryParse(envelope, out var uploaded))
+        if (envelope is null)
         {
-            await args.DeadLetterMessageAsync(args.Message, "UNSUPPORTED_EVENT", envelope?.EventType ?? "Missing event type");
+            await args.DeadLetterMessageAsync(args.Message, "INVALID_ENVELOPE", "Missing event envelope");
             return;
         }
 
         try
         {
             await using var scope = scopes.CreateAsyncScope();
-            await scope.ServiceProvider.GetRequiredService<ProfileImageProcessor>().ProcessAsync(uploaded!, args.CancellationToken);
+            var completed = true;
+            Func<CancellationToken, Task>? markTimedOut = null;
+            if (ProfileImageUploaded.TryParse(envelope, out var profileImage))
+            {
+                var handler = scope.ServiceProvider.GetRequiredService<ProfileImageProcessor>();
+                completed = await handler.ProcessAsync(profileImage!, args.CancellationToken);
+                markTimedOut = token => handler.MarkTimedOutAsync(profileImage!, token);
+            }
+            else if (ChatFileUploaded.TryParse(envelope, out var chatFile))
+            {
+                var handler = scope.ServiceProvider.GetRequiredService<ChatAttachmentProcessor>();
+                completed = await handler.ProcessAsync(chatFile!, args.CancellationToken);
+                markTimedOut = token => handler.MarkTimedOutAsync(chatFile!, token);
+            }
+            else
+            {
+                await args.DeadLetterMessageAsync(args.Message, "UNSUPPORTED_EVENT", envelope.EventType);
+                return;
+            }
+
+            if (!completed)
+            {
+                var attempt = args.Message.ApplicationProperties.TryGetValue("scan_attempt", out var value)
+                    ? Convert.ToInt32(value, System.Globalization.CultureInfo.InvariantCulture) + 1
+                    : 1;
+                if (attempt >= MaximumScanAttempts)
+                {
+                    await markTimedOut!(args.CancellationToken);
+                    await args.DeadLetterMessageAsync(args.Message, "MALWARE_SCAN_TIMEOUT", "Defender for Storage did not publish a terminal blob-index tag in time.");
+                    return;
+                }
+                var retry = new ServiceBusMessage(args.Message.Body)
+                {
+                    MessageId = $"{envelope.EventId}:scan:{attempt}",
+                    Subject = envelope.EventType,
+                    ContentType = "application/json",
+                    CorrelationId = envelope.AggregateId,
+                    ScheduledEnqueueTime = DateTimeOffset.UtcNow.AddSeconds(Math.Min(300, 15 * attempt))
+                };
+                retry.ApplicationProperties["scan_attempt"] = attempt;
+                retry.ApplicationProperties["event_type"] = envelope.EventType;
+                retry.ApplicationProperties["aggregate_type"] = envelope.AggregateType;
+                await retrySender.SendMessageAsync(retry, args.CancellationToken);
+            }
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            logger.LogError(ex, "Profile image event {EventId} failed on delivery {DeliveryCount}", envelope.EventId, args.Message.DeliveryCount);
+            logger.LogError(ex, "Content scan event {EventId} failed on delivery {DeliveryCount}", envelope.EventId, args.Message.DeliveryCount);
+            if (args.Message.DeliveryCount >= 5)
+            {
+                await using var failureScope = scopes.CreateAsyncScope();
+                if (ProfileImageUploaded.TryParse(envelope, out var failedProfile))
+                    await failureScope.ServiceProvider.GetRequiredService<ProfileImageProcessor>().MarkProcessingFailedAsync(failedProfile!, args.CancellationToken);
+                else if (ChatFileUploaded.TryParse(envelope, out var failedChatFile))
+                    await failureScope.ServiceProvider.GetRequiredService<ChatAttachmentProcessor>().MarkProcessingFailedAsync(failedChatFile!, args.CancellationToken);
+                await args.DeadLetterMessageAsync(args.Message, "CONTENT_SCAN_FAILED", ex.GetType().Name);
+                return;
+            }
             await args.AbandonMessageAsync(args.Message, cancellationToken: args.CancellationToken);
         }
     }
 
     private Task ProcessErrorAsync(ProcessErrorEventArgs args)
     {
-        logger.LogError(args.Exception, "Profile image queue receive failure in {ErrorSource} for {EntityPath}", args.ErrorSource, args.EntityPath);
+        logger.LogError(args.Exception, "Content scan queue receive failure in {ErrorSource} for {EntityPath}", args.ErrorSource, args.EntityPath);
         return Task.CompletedTask;
     }
 
@@ -62,5 +119,6 @@ public sealed class ProfileImageConsumerWorker(
     {
         await base.StopAsync(cancellationToken);
         await processor.DisposeAsync();
+        await retrySender.DisposeAsync();
     }
 }

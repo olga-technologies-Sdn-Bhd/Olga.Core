@@ -49,7 +49,7 @@ public sealed class ProfileImageTests
         var (db, storage, row) = await PendingAsync("image/jpeg", PngAsync);
         await using (db)
         {
-            await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
+            await Processor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
             Assert.Equal("REJECTED", row.Status);
             Assert.Equal("PROFILE_IMAGE_SIGNATURE_MISMATCH", row.FailureCode);
         }
@@ -61,7 +61,7 @@ public sealed class ProfileImageTests
         var (db, storage, row) = await PendingAsync("image/png", () => Task.FromResult<byte[]>([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]));
         await using (db)
         {
-            await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
+            await Processor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
             Assert.Equal("REJECTED", row.Status);
             Assert.Equal("PROFILE_IMAGE_INVALID", row.FailureCode);
         }
@@ -73,7 +73,7 @@ public sealed class ProfileImageTests
         var (db, storage, row) = await PendingAsync("image/png", PngAsync);
         await using (db)
         {
-            await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
+            await Processor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
 
             Assert.Equal("APPROVED", row.Status);
             Assert.Equal(row.Id, db.MemberProfiles.Single().ProfileImageId);
@@ -92,7 +92,7 @@ public sealed class ProfileImageTests
             db.MemberProfiles.Single().ProfileImageId = 999L;
             await db.SaveChangesAsync();
 
-            await new ProfileImageProcessor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
+            await Processor(db, storage).ProcessAsync(new(row.ImageId, row.MemberId), default);
 
             Assert.Equal(999L, db.MemberProfiles.Single().ProfileImageId);
             Assert.Equal("REJECTED", row.Status);
@@ -193,6 +193,13 @@ public sealed class ProfileImageTests
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
     private static CoreService Service(CoreDbContext db, IProfileImageStorage storage) => new(db, IdentityProtector, storage);
+    private static ProfileImageProcessor Processor(CoreDbContext db, IProfileImageStorage storage) => new(db, storage, new AllowImageModeration());
+
+    private sealed class AllowImageModeration : IImageModerationClient
+    {
+        public Task<ImageModerationResult> AnalyzeAsync(byte[] normalizedJpeg, CancellationToken ct) =>
+            Task.FromResult(new ImageModerationResult(true, []));
+    }
 }
 
 public sealed class ProfileImageApiTests : IClassFixture<WebApplicationFactory<Program>>

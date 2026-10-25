@@ -79,3 +79,34 @@ public sealed record ProfileImageUploaded(
         catch (JsonException) { return false; }
     }
 }
+
+public sealed record ChatFileUploaded(
+    [property: JsonPropertyName("file_asset_id")] string FileAssetId,
+    [property: JsonPropertyName("conversation_id")] string ConversationId,
+    [property: JsonPropertyName("owner_member_id")] string OwnerMemberId,
+    [property: JsonPropertyName("container_name")] string ContainerName,
+    [property: JsonPropertyName("media_type")] string MediaType,
+    [property: JsonPropertyName("size_bytes")] long SizeBytes)
+{
+    public const string EventType = "ChatFileUploaded.v1";
+
+    public static bool TryParse(IntegrationEventEnvelope envelope, out ChatFileUploaded? uploaded)
+    {
+        uploaded = null;
+        if (!string.Equals(envelope.EventType, EventType, StringComparison.Ordinal)
+            || !string.Equals(envelope.AggregateType, "FILE_ASSET", StringComparison.Ordinal)) return false;
+        try
+        {
+            uploaded = envelope.Data.Deserialize<ChatFileUploaded>();
+            return uploaded is not null
+                && uploaded.FileAssetId.Length is > 0 and <= 64
+                && uploaded.ConversationId.Length is > 0 and <= 64
+                && uploaded.OwnerMemberId.Length is > 0 and <= 64
+                && uploaded.ContainerName == Olga.Core.Application.ChatFiles.ContainerName
+                && uploaded.MediaType.Length is > 0 and <= 128
+                && uploaded.SizeBytes > 0
+                && string.Equals(envelope.AggregateId, uploaded.FileAssetId, StringComparison.Ordinal);
+        }
+        catch (JsonException) { return false; }
+    }
+}

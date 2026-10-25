@@ -20,10 +20,13 @@ public sealed class ChatFileOptions
 
 public sealed record ChatFileContent(Stream Content, string MediaType, string FileName, string ETag);
 
+public enum MalwareScanResult { Pending, Clean, Malicious, Failed }
+
 public interface IChatFileStorage
 {
     Task UploadAsync(string blobPath, Stream content, string contentType, CancellationToken ct);
     Task<Stream> OpenReadAsync(string blobPath, CancellationToken ct);
+    Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct);
 }
 
 public static class ChatFiles
@@ -46,7 +49,9 @@ public static class ChatFiles
         if (content.Length >= 12 && content[4..8].SequenceEqual("ftyp"u8))
         {
             var brands = FtypBrands(content);
-            if (brands.Overlaps(["heic", "heix", "heim", "heis", "hevc", "hevx"])) return new("image/heic", Kind.Image, ".heic");
+            // HEIC/HEIF is rejected until the Linux worker has a deterministic decoder that can
+            // normalize it to a Content Safety-supported format without relying on host codecs.
+            if (brands.Overlaps(["heic", "heix", "heim", "heis", "hevc", "hevx"])) return null;
             var audio = brands.Overlaps(["M4A ", "M4B "]) || declaredContentType?.Trim().StartsWith("audio/", StringComparison.OrdinalIgnoreCase) == true;
             return audio && Mp4AudioDuration(content) is { } ms ? new("audio/mp4", Kind.Audio, ".m4a", ms) : null;
         }

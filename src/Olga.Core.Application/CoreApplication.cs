@@ -126,6 +126,7 @@ public interface IProfileImageStorage
 {
     Task UploadAsync(string blobPath, Stream content, string contentType, CancellationToken ct);
     Task<Stream> OpenReadAsync(string blobPath, CancellationToken ct);
+    Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct);
     Task DeleteIfExistsAsync(string blobPath, CancellationToken ct);
 }
 

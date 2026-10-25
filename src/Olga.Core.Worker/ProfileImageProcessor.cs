@@ -7,19 +7,24 @@ using SkiaSharp;
 
 namespace Olga.Core.Worker;
 
-public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage storage)
+public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage storage, IImageModerationClient moderation)
 {
     private const int MaximumBytes = 5 * 1024 * 1024;
-    private const int MaximumDimension = 12_000;
-    // Decoding and auto-orientation can hold two RGBA bitmaps concurrently.
-    private const long MaximumPixels = 20_000_000;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
-    public async Task ProcessAsync(ProfileImageUploaded uploaded, CancellationToken ct)
+    public async Task<bool> ProcessAsync(ProfileImageUploaded uploaded, CancellationToken ct)
     {
         var row = await db.MemberProfileImages.SingleOrDefaultAsync(x => x.ImageId == uploaded.ImageId && x.MemberId == uploaded.MemberId, ct)
             ?? throw new InvalidOperationException("Profile image event references a missing database row.");
-        if (row.Status is "APPROVED" or "REJECTED" or "FAILED") return;
+        if (row.Status is "APPROVED" or "REJECTED" or "FAILED") return true;
+
+        var malware = await storage.GetMalwareScanResultAsync(row.OriginalBlobPath, ct);
+        if (malware == MalwareScanResult.Pending) return false;
+        if (malware != MalwareScanResult.Clean)
+        {
+            await MarkRejectedAsync(row, malware == MalwareScanResult.Malicious ? "MALWARE_DETECTED" : "MALWARE_SCAN_FAILED", ct);
+            return true;
+        }
 
         row.Status = "PROCESSING";
         row.UpdatedAt = DateTimeOffset.UtcNow;
@@ -33,17 +38,15 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
             if (!string.Equals(actualContentType, row.DeclaredContentType, StringComparison.Ordinal))
                 throw new InvalidProfileImageException("PROFILE_IMAGE_SIGNATURE_MISMATCH");
 
-            using var encodedSource = SKData.CreateCopy(bytes);
-            using var codec = SKCodec.Create(encodedSource) ?? throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
-            var info = codec.Info;
-            if (info.Width > MaximumDimension || info.Height > MaximumDimension || (long)info.Width * info.Height > MaximumPixels)
-                throw new InvalidProfileImageException("PROFILE_IMAGE_DIMENSIONS_INVALID");
-
             ct.ThrowIfCancellationRequested();
-            using var decoded = new SKBitmap(new SKImageInfo(info.Width, info.Height, SKColorType.Rgba8888, SKAlphaType.Premul));
-            if (codec.GetPixels(decoded.Info, decoded.GetPixels()) != SKCodecResult.Success)
-                throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
-            using var oriented = AutoOrient(decoded, codec.EncodedOrigin);
+            using var oriented = SafeImageDecoder.Decode(bytes);
+            var verdict = await moderation.AnalyzeAsync(SafeImageDecoder.NormalizeForModeration(oriented), ct);
+            if (!verdict.Allowed)
+            {
+                await AddModerationCaseAsync(row, ct);
+                await MarkRejectedAsync(row, "CONTENT_UNSAFE:" + string.Join(',', verdict.ReasonCodes), ct);
+                return true;
+            }
 
             foreach (var pixels in new[] { 64, 256, 512 })
             {
@@ -62,15 +65,42 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
 
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex)
+        catch (InvalidImageException ex)
         {
-            await MarkRejectedAsync(row, ex is InvalidProfileImageException invalid ? invalid.Code : "PROFILE_IMAGE_INVALID", ct);
-            return;
+            await MarkRejectedAsync(row, "PROFILE_" + ex.Code, ct);
+            return true;
+        }
+        catch (InvalidProfileImageException ex)
+        {
+            await MarkRejectedAsync(row, ex.Code, ct);
+            return true;
         }
 
         // Keep the pointer/outbox transaction outside the decode failure handler. A database
         // failure must be retried by Service Bus, never converted into a rejected image.
         await MarkReadyAsync(row, ct);
+        return true;
+    }
+
+    public async Task MarkTimedOutAsync(ProfileImageUploaded uploaded, CancellationToken ct)
+    {
+        var row = await db.MemberProfileImages.SingleOrDefaultAsync(
+            x => x.ImageId == uploaded.ImageId && x.MemberId == uploaded.MemberId, ct);
+        if (row is not null && row.Status is "PENDING" or "PROCESSING")
+            await MarkRejectedAsync(row, "MALWARE_SCAN_TIMEOUT", ct);
+    }
+
+    public async Task MarkProcessingFailedAsync(ProfileImageUploaded uploaded, CancellationToken ct)
+    {
+        var row = await db.MemberProfileImages.SingleOrDefaultAsync(
+            x => x.ImageId == uploaded.ImageId && x.MemberId == uploaded.MemberId, ct);
+        if (row is null || row.Status is not ("PENDING" or "PROCESSING")) return;
+        row.Status = "FAILED";
+        row.FailureCode = "CONTENT_SCAN_FAILED";
+        row.ProcessedAt = DateTimeOffset.UtcNow;
+        row.UpdatedAt = DateTimeOffset.UtcNow;
+        if (!db.Database.IsRelational()) row.RowVersion++;
+        await db.SaveChangesAsync(ct);
     }
 
     private async Task MarkReadyAsync(MemberProfileImage row, CancellationToken ct)
@@ -110,18 +140,25 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
         await db.SaveChangesAsync(ct);
     }
 
-    private static async Task<byte[]> ReadBoundedAsync(Stream source, int maximumBytes, CancellationToken ct)
+    private async Task AddModerationCaseAsync(MemberProfileImage row, CancellationToken ct)
     {
-        await using var destination = new MemoryStream();
-        var buffer = new byte[81_920];
-        while (true)
+        var caseId = "case_scan_" + row.ImageId;
+        if (caseId.Length > 64) caseId = caseId[..64];
+        if (await db.ModerationCases.AnyAsync(x => x.ModerationCaseId == caseId, ct)) return;
+        db.ModerationCases.Add(new ModerationCase
         {
-            var read = await source.ReadAsync(buffer.AsMemory(0, Math.Min(buffer.Length, maximumBytes + 1 - (int)destination.Length)), ct);
-            if (read == 0) return destination.ToArray();
-            await destination.WriteAsync(buffer.AsMemory(0, read), ct);
-            if (destination.Length > maximumBytes) throw new InvalidProfileImageException("PROFILE_IMAGE_SIZE_INVALID");
-        }
+            ModerationCaseId = caseId,
+            SourceType = "AUTOMATED_SCAN",
+            SourceId = row.ImageId,
+            SubjectMemberId = row.MemberId,
+            ResourceType = "PROFILE_IMAGE",
+            ResourceId = row.ImageId,
+            Priority = "HIGH"
+        });
     }
+
+    private static async Task<byte[]> ReadBoundedAsync(Stream source, int maximumBytes, CancellationToken ct) =>
+        await SafeImageDecoder.ReadBoundedAsync(source, maximumBytes, ct);
 
     private static string DetectContentType(ReadOnlySpan<byte> bytes)
     {
@@ -129,29 +166,6 @@ public sealed class ProfileImageProcessor(CoreDbContext db, IProfileImageStorage
         if (bytes.Length >= 8 && bytes[..8].SequenceEqual(new byte[] { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a })) return "image/png";
         if (bytes.Length >= 12 && bytes[..4].SequenceEqual("RIFF"u8) && bytes.Slice(8, 4).SequenceEqual("WEBP"u8)) return "image/webp";
         throw new InvalidProfileImageException("PROFILE_IMAGE_INVALID");
-    }
-
-    private static SKBitmap AutoOrient(SKBitmap source, SKEncodedOrigin origin)
-    {
-        var swapsAxes = origin is SKEncodedOrigin.LeftTop or SKEncodedOrigin.RightTop or SKEncodedOrigin.RightBottom or SKEncodedOrigin.LeftBottom;
-        var result = new SKBitmap(swapsAxes ? source.Height : source.Width, swapsAxes ? source.Width : source.Height, source.ColorType, source.AlphaType);
-        var matrix = origin switch
-        {
-            SKEncodedOrigin.TopRight => new SKMatrix([-1, 0, source.Width, 0, 1, 0, 0, 0, 1]),
-            SKEncodedOrigin.BottomRight => new SKMatrix([-1, 0, source.Width, 0, -1, source.Height, 0, 0, 1]),
-            SKEncodedOrigin.BottomLeft => new SKMatrix([1, 0, 0, 0, -1, source.Height, 0, 0, 1]),
-            SKEncodedOrigin.LeftTop => new SKMatrix([0, 1, 0, 1, 0, 0, 0, 0, 1]),
-            SKEncodedOrigin.RightTop => new SKMatrix([0, -1, source.Height, 1, 0, 0, 0, 0, 1]),
-            SKEncodedOrigin.RightBottom => new SKMatrix([0, -1, source.Height, -1, 0, source.Width, 0, 0, 1]),
-            SKEncodedOrigin.LeftBottom => new SKMatrix([0, 1, 0, -1, 0, source.Width, 0, 0, 1]),
-            _ => SKMatrix.CreateIdentity()
-        };
-        using var canvas = new SKCanvas(result);
-        canvas.Clear(SKColors.Transparent);
-        canvas.SetMatrix(matrix);
-        canvas.DrawBitmap(source, 0, 0, SKSamplingOptions.Default);
-        canvas.Flush();
-        return result;
     }
 
     private static SKBitmap ResizeSquare(SKBitmap source, int pixels)

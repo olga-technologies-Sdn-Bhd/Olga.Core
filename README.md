@@ -150,7 +150,7 @@ Do not commit the master key, print it in logs, or rotate/delete it without a mi
 
 ## Profile-image storage configuration
 
-PostgreSQL deployments of the API and worker must set `Storage__BlobServiceEndpoint`. Optional settings are `Storage__ManagedIdentityClientId`, `Storage__PendingProfileImagesContainerName` (default `pending-profile-images`), and `Storage__ProfileImagesContainerName` (default `profile-images`). Blob access uses `DefaultAzureCredential`; no account keys or SAS URLs are returned to clients. The worker also consumes `ServiceBus__ContentScanQueueName` (default `content-scan`).
+PostgreSQL deployments of the API and worker must set `Storage__BlobServiceEndpoint`. Optional settings are `Storage__ManagedIdentityClientId`, `Storage__PendingProfileImagesContainerName` (default `pending-profile-images`), `Storage__ProfileImagesContainerName` (default `profile-images`), and `Storage__ChatFilesContainerName` (default `chat-files`). Blob access uses `DefaultAzureCredential`; no account keys or SAS URLs are returned to clients. The worker consumes `ServiceBus__ContentScanQueueName` (default `content-scan`) for profile and chat uploads. It waits for the Defender for Storage blob-index malware verdict, then sends safely decoded and normalized images to `ContentSafety__Endpoint`. Images that meet a configured severity threshold and every malicious or failed malware scan are quarantined; an attachment is downloadable only after its aggregate scan status is `CLEAN`. Keep `ContentSafety__Required=true` for deployments that accept user images.
 
 ## MVP request headers
 

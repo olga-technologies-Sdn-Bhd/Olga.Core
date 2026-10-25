@@ -11,6 +11,7 @@ namespace Olga.Core.Infrastructure;
 // Chat files live in the private chat-files container and are only ever streamed through the API: never a SAS URL.
 public sealed class AzureChatFileStorage : IChatFileStorage
 {
+    private const string MalwareScanResultTag = "Malware Scanning scan result";
     private readonly BlobContainerClient container;
 
     public AzureChatFileStorage(IConfiguration configuration)
@@ -40,6 +41,16 @@ public sealed class AzureChatFileStorage : IChatFileStorage
 
     public async Task<Stream> OpenReadAsync(string blobPath, CancellationToken ct) =>
         (await container.GetBlobClient(blobPath).DownloadStreamingAsync(cancellationToken: ct)).Value.Content;
+
+    public async Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct)
+    {
+        var tags = (await container.GetBlobClient(blobPath).GetTagsAsync(cancellationToken: ct)).Value.Tags;
+        if (!tags.TryGetValue(MalwareScanResultTag, out var result)) return MalwareScanResult.Pending;
+        if (string.Equals(result, "No threats found", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Clean;
+        if (string.Equals(result, "Malicious", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Malicious;
+        if (string.IsNullOrWhiteSpace(result) || string.Equals(result, "Pending", StringComparison.OrdinalIgnoreCase)) return MalwareScanResult.Pending;
+        return MalwareScanResult.Failed;
+    }
 }
 
 public sealed class InMemoryChatFileStorage : IChatFileStorage
@@ -59,4 +70,7 @@ public sealed class InMemoryChatFileStorage : IChatFileStorage
         if (!blobs.TryGetValue(blobPath, out var blob)) throw new FileNotFoundException("Chat file blob not found.", blobPath);
         return Task.FromResult<Stream>(new MemoryStream(blob, writable: false));
     }
+
+    public Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct) =>
+        Task.FromResult(MalwareScanResult.Clean);
 }

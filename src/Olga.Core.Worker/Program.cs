@@ -1,4 +1,5 @@
 using Azure.Identity;
+using Azure.Core;
 using Azure.Messaging.ServiceBus;
 using Microsoft.Azure.NotificationHubs;
 using Microsoft.EntityFrameworkCore;
@@ -15,6 +16,20 @@ builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connection));
 builder.Services.AddDbContextPool<CoreDbContext>((services, options) =>
     options.UseOlgaPostgreSql(services.GetRequiredService<NpgsqlDataSource>()));
 builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
+builder.Services.AddSingleton<IChatFileStorage, AzureChatFileStorage>();
+builder.Services.AddOptions<ContentSafetyOptions>()
+    .Bind(builder.Configuration.GetSection(ContentSafetyOptions.SectionName))
+    .Validate(options => !options.Required || Uri.TryCreate(options.Endpoint, UriKind.Absolute, out var endpoint) && endpoint.Scheme == Uri.UriSchemeHttps,
+        "ContentSafety:Endpoint must be an absolute HTTPS URI when ContentSafety:Required is enabled.")
+    .Validate(options => new[] { options.SexualSeverityThreshold, options.ViolenceSeverityThreshold, options.HateSeverityThreshold, options.SelfHarmSeverityThreshold }.All(x => x is 0 or 2 or 4 or 6),
+        "Content Safety thresholds must be one of 0, 2, 4 or 6.")
+    .ValidateOnStart();
+builder.Services.AddSingleton<TokenCredential>(_ => new DefaultAzureCredential(new DefaultAzureCredentialOptions
+{
+    ManagedIdentityClientId = builder.Configuration["Storage:ManagedIdentityClientId"] ?? builder.Configuration["AZURE_CLIENT_ID"]
+}));
+builder.Services.AddSingleton(new HttpClient { Timeout = TimeSpan.FromSeconds(30) });
+builder.Services.AddSingleton<IImageModerationClient, AzureContentSafetyImageClient>();
 builder.Services.AddSingleton(sp =>
 {
     var configuration = sp.GetRequiredService<IConfiguration>();
@@ -76,9 +91,10 @@ builder.Services.AddSingleton<IOutboxEventPublisher>(sp =>
 });
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
 builder.Services.AddScoped<ProfileImageProcessor>();
+builder.Services.AddScoped<ChatAttachmentProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
 builder.Services.AddHostedService<NlpCompletionConsumerWorker>();
-builder.Services.AddHostedService<ProfileImageConsumerWorker>();
+builder.Services.AddHostedService<ContentScanConsumerWorker>();
 var host = builder.Build();
 if (!pushEnabled) host.Services.GetRequiredService<ILogger<Program>>().LogInformation("Push notifications are off: Push:NotificationHubConnectionString, Push:NotificationHubName and IdentityProtection:MasterKeyBase64 are all needed.");
 await host.RunAsync();

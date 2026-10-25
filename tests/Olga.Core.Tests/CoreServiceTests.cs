@@ -1670,7 +1670,7 @@ public sealed class CoreServiceTests
     [InlineData("jpeg", null, "image/jpeg")]
     [InlineData("png", null, "image/png")]
     [InlineData("webp", null, "image/webp")]
-    [InlineData("heic", null, "image/heic")]
+    [InlineData("heic", null, null)]
     [InlineData("pdf", "image/png", "application/pdf")]
     [InlineData("m4a", null, "audio/mp4")]
     [InlineData("mp4-audio", "audio/mp4", "audio/mp4")]

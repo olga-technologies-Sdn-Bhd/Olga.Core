@@ -66,7 +66,7 @@ public sealed record BlockRequest(string MemberId);
 public sealed record BlockedMemberResponse(string MemberId, string? DisplayName, DateTimeOffset BlockedAt);
 // message_type FILE needs file_asset_id from POST /v1/conversations/{id}/attachments; body is then an optional caption.
 public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null, string? FileAssetId = null);
-// A sent file. media_type is detected from the file itself: image/jpeg, image/png, image/webp, image/heic, application/pdf, audio/mp4 or audio/aac.
+// A sent file. media_type is detected from the file itself: image/jpeg, image/png, image/webp, application/pdf, audio/mp4 or audio/aac.
 public sealed record MessageAttachment(string FileAssetId, string MediaType, long SizeBytes, string FileName);
 public sealed record ChatAttachmentUploadResponse(string FileAssetId, string MediaType, long SizeBytes, string FileName);
 // A deleted message keeps its place in the conversation with a null body and deleted_at set.
