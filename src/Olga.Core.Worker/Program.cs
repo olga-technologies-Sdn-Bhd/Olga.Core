@@ -1,5 +1,6 @@
 using Azure.Identity;
 using Azure.Messaging.ServiceBus;
+using Microsoft.Azure.NotificationHubs;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Npgsql;
@@ -43,20 +44,43 @@ builder.Services.AddSingleton<IOutboxJitterSource, RandomOutboxJitterSource>();
 builder.Services.AddSingleton<IOutboxRetryCalculator, OutboxRetryCalculator>();
 builder.Services.AddSingleton<ServiceBusOutboxEventPublisher>();
 // With SignalR:Endpoint set, chat events also go to the conversation's members' devices.
-if (string.IsNullOrWhiteSpace(builder.Configuration["SignalR:Endpoint"]))
-    builder.Services.AddSingleton<IOutboxEventPublisher>(sp => sp.GetRequiredService<ServiceBusOutboxEventPublisher>());
-else
+var realtime = !string.IsNullOrWhiteSpace(builder.Configuration["SignalR:Endpoint"]);
+if (realtime) builder.Services.AddSingleton<IChatRealtimeSender, AzureSignalRChatSender>();
+// Push needs Notification Hubs and the identity protection key that decrypts the stored push tokens.
+var push = builder.Configuration.GetSection(PushOptions.SectionName).Get<PushOptions>() ?? new PushOptions();
+var tokenKey = ReadIdentityKey(builder.Configuration["IdentityProtection:MasterKeyBase64"]);
+var pushEnabled = push.IsConfigured && tokenKey is not null;
+if (pushEnabled)
 {
-    builder.Services.AddSingleton<IChatRealtimeSender, AzureSignalRChatSender>();
-    builder.Services.AddSingleton<IOutboxEventPublisher>(sp => new SignalRChatEventPublisher(
-        sp.GetRequiredService<ServiceBusOutboxEventPublisher>(), sp.GetRequiredService<IChatRealtimeSender>(), sp.GetRequiredService<ILogger<SignalRChatEventPublisher>>()));
+    builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(tokenKey!));
+    builder.Services.AddSingleton<INotificationHubClient>(NotificationHubClient.CreateClientFromConnectionString(push.NotificationHubConnectionString, push.NotificationHubName));
+    builder.Services.AddSingleton<IPushSender, NotificationHubPushSender>();
+    builder.Services.AddSingleton<IChatPushStore, NpgsqlChatPushStore>();
+    builder.Services.AddSingleton<PushNotificationQueue>();
+    builder.Services.AddScoped<ChatPushDispatcher>();
+    builder.Services.AddHostedService<PushNotificationWorker>();
 }
+builder.Services.AddSingleton<IOutboxEventPublisher>(sp =>
+{
+    IOutboxEventPublisher publisher = sp.GetRequiredService<ServiceBusOutboxEventPublisher>();
+    if (realtime) publisher = new SignalRChatEventPublisher(publisher, sp.GetRequiredService<IChatRealtimeSender>(), sp.GetRequiredService<ILogger<SignalRChatEventPublisher>>());
+    if (pushEnabled) publisher = new PushOutboxEventPublisher(publisher, sp.GetRequiredService<PushNotificationQueue>(), sp.GetRequiredService<ILogger<PushOutboxEventPublisher>>());
+    return publisher;
+});
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
 builder.Services.AddScoped<ProfileImageProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
 builder.Services.AddHostedService<NlpCompletionConsumerWorker>();
 builder.Services.AddHostedService<ProfileImageConsumerWorker>();
-await builder.Build().RunAsync();
+var host = builder.Build();
+if (!pushEnabled) host.Services.GetRequiredService<ILogger<Program>>().LogInformation("Push notifications are off: Push:NotificationHubConnectionString, Push:NotificationHubName and IdentityProtection:MasterKeyBase64 are all needed.");
+await host.RunAsync();
+
+static byte[]? ReadIdentityKey(string? encoded)
+{
+    try { return Convert.FromBase64String(encoded ?? "") is { Length: 32 } key ? key : null; }
+    catch (FormatException) { return null; }
+}
 
 // SignalR brings in ASP.NET Core, whose generator would make Program public and clash with the API's Program in tests.
 internal partial class Program;
