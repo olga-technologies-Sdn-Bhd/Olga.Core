@@ -243,6 +243,43 @@ public sealed class Message
     public long RowVersion { get; set; } = 1;
 }
 
+// storage.file_asset: a private blob and its scan and lifecycle state. Only AVAILABLE once scan_status is CLEAN.
+public sealed class FileAsset
+{
+    public string FileAssetId { get; set; } = "";
+    public string CommunityId { get; set; } = "";
+    public string? OwnerMemberId { get; set; }
+    public string PurposeCode { get; set; } = "CHAT_FILE";
+    public string ContainerName { get; set; } = "";
+    public string BlobPath { get; set; } = "";
+    public string BlobPathHash { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string MediaType { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public string Sha256 { get; set; } = "";
+    public string Classification { get; set; } = "CONFIDENTIAL";
+    public string ScanStatus { get; set; } = "PENDING";
+    public string LifecycleStatus { get; set; } = "UPLOADING";
+    public DateTimeOffset? ExpiresAt { get; set; }
+    public DateTimeOffset? DeletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+// storage.file_asset_link: attaches a file to a resource, e.g. a chat message (resource_type MESSAGE).
+public sealed class FileAssetLink
+{
+    public long FileAssetLinkId { get; set; }
+    public string FileAssetId { get; set; } = "";
+    public string ResourceType { get; set; } = "";
+    public string ResourceId { get; set; } = "";
+    public string RelationshipType { get; set; } = "PRIMARY";
+    public string? LinkedBy { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? RemovedAt { get; set; }
+}
+
 public sealed class MessageReceipt
 {
     public string MessageId { get; set; } = "";

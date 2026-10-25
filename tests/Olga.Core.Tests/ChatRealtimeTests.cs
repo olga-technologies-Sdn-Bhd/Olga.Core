@@ -56,6 +56,80 @@ public sealed class ChatRealtimeTests
         Assert.Empty(sender.Sent);
     }
 
+    [Fact]
+    public void Typing_is_forwarded_at_most_once_per_member_and_conversation_every_three_seconds()
+    {
+        var time = new ManualTime();
+        var throttle = new ChatTypingThrottle(time);
+
+        Assert.True(throttle.TryAcquire("A", "c1"));
+        Assert.False(throttle.TryAcquire("A", "c1"));
+        Assert.True(throttle.TryAcquire("A", "c2"));
+        Assert.True(throttle.TryAcquire("B", "c1"));
+        time.Now += TimeSpan.FromSeconds(2.9);
+        Assert.False(throttle.TryAcquire("A", "c1"));
+        time.Now += TimeSpan.FromSeconds(0.1);
+        Assert.True(throttle.TryAcquire("A", "c1"));
+    }
+
+    [Fact]
+    public async Task Typing_goes_to_the_other_member_only_in_the_event_envelope_and_survives_a_SignalR_failure()
+    {
+        var time = new ManualTime();
+        var clients = new RecordingHubClients();
+        var publisher = new Olga.Core.Api.SignalRChatTypingPublisher(new RecordingHubContext(clients), new ChatTypingThrottle(time), time, NullLogger<Olga.Core.Api.SignalRChatTypingPublisher>.Instance);
+
+        await publisher.PublishAsync("A", "B", "c1", default);
+        await publisher.PublishAsync("A", "B", "c1", default);
+
+        var (user, method, envelope) = Assert.Single(clients.Sent);
+        Assert.Equal(("B", ChatRealtime.ClientMethod, "TypingStarted.v1", "CONVERSATION", "c1"), (user, method, envelope.GetProperty("event_type").GetString(), envelope.GetProperty("aggregate_type").GetString(), envelope.GetProperty("aggregate_id").GetString()));
+        var data = envelope.GetProperty("data");
+        Assert.Equal(("c1", "A"), (data.GetProperty("conversation_id").GetString(), data.GetProperty("member_id").GetString()));
+        Assert.Equal(time.Now.AddSeconds(5), data.GetProperty("expires_at").GetDateTimeOffset());
+        Assert.StartsWith("typ_", envelope.GetProperty("event_id").GetString());
+
+        clients.Fail = true;
+        await publisher.PublishAsync("A", "B", "c2", default);
+    }
+
+    private sealed class ManualTime : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 10, 25, 9, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    private sealed class RecordingHubContext(RecordingHubClients clients) : Microsoft.AspNetCore.SignalR.IHubContext<Olga.Core.Api.ChatHub>
+    {
+        public Microsoft.AspNetCore.SignalR.IHubClients Clients => clients;
+        public Microsoft.AspNetCore.SignalR.IGroupManager Groups => throw new NotSupportedException();
+    }
+
+    private sealed class RecordingHubClients : Microsoft.AspNetCore.SignalR.IHubClients
+    {
+        public bool Fail { get; set; }
+        public List<(string User, string Method, JsonElement Envelope)> Sent { get; } = [];
+        public Microsoft.AspNetCore.SignalR.IClientProxy User(string userId) => new Proxy(this, userId);
+        public Microsoft.AspNetCore.SignalR.IClientProxy All => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy AllExcept(IReadOnlyList<string> excludedConnectionIds) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy Client(string connectionId) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy Clients(IReadOnlyList<string> connectionIds) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy Group(string groupName) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy GroupExcept(string groupName, IReadOnlyList<string> excludedConnectionIds) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy Groups(IReadOnlyList<string> groupNames) => throw new NotSupportedException();
+        public Microsoft.AspNetCore.SignalR.IClientProxy Users(IReadOnlyList<string> userIds) => throw new NotSupportedException();
+
+        private sealed class Proxy(RecordingHubClients owner, string user) : Microsoft.AspNetCore.SignalR.IClientProxy
+        {
+            public Task SendCoreAsync(string method, object?[] args, CancellationToken cancellationToken = default)
+            {
+                if (owner.Fail) throw new HttpRequestException("SignalR down");
+                owner.Sent.Add((user, method, ((JsonElement)args[0]!).Clone()));
+                return Task.CompletedTask;
+            }
+        }
+    }
+
     private static ClaimedOutboxEvent Event(string type, string payload) =>
         new($"evt-{type}", type.StartsWith("Conversation") ? "CONVERSATION" : "MESSAGE", "agg", type, payload, DateTimeOffset.UtcNow, 1, "lease", DateTimeOffset.UtcNow.AddMinutes(1));
 
@@ -124,5 +198,16 @@ public sealed class ChatHubApiTests : IClassFixture<WebApplicationFactory<Progra
         using var response = await client.SendAsync(request);
 
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Typing_needs_no_idempotency_key()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/v1/conversations/unknown/typing");
+        request.Headers.Add("X-Member-Id", "A123");
+        var response = await factory.CreateClient().SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Contains("CONVERSATION_NOT_FOUND", await response.Content.ReadAsStringAsync());
     }
 }

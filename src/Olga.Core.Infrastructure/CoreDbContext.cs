@@ -32,6 +32,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<ConversationParticipant> ConversationParticipants => Set<ConversationParticipant>();
     public DbSet<Message> ChatMessages => Set<Message>();
     public DbSet<MessageReceipt> MessageReceipts => Set<MessageReceipt>();
+    public DbSet<FileAsset> FileAssets => Set<FileAsset>();
+    public DbSet<FileAssetLink> FileAssetLinks => Set<FileAssetLink>();
     public DbSet<NotificationPreference> Preferences => Set<NotificationPreference>();
     public DbSet<MemberDevice> MemberDevices => Set<MemberDevice>();
     public DbSet<PushToken> PushTokens => Set<PushToken>();
@@ -62,6 +64,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<ConversationParticipant> ICoreStore.ConversationParticipants => ConversationParticipants;
     IQueryable<Message> ICoreStore.Messages => ChatMessages;
     IQueryable<MessageReceipt> ICoreStore.MessageReceipts => MessageReceipts;
+    IQueryable<FileAsset> ICoreStore.FileAssets => FileAssets;
+    IQueryable<FileAssetLink> ICoreStore.FileAssetLinks => FileAssetLinks;
     IQueryable<NotificationPreference> ICoreStore.NotificationPreferences => Preferences;
     IQueryable<MemberDevice> ICoreStore.Devices => MemberDevices;
     IQueryable<PushToken> ICoreStore.PushTokens => PushTokens;
@@ -247,6 +251,33 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         try
         {
             await using var transaction = await ((NpgsqlConnection)Database.GetDbConnection()).BeginTransactionAsync(ct);
+            // A FILE message's upload is locked until commit, so it can only ever be attached to one message.
+            if (request.FileAssetId is not null)
+            {
+                await using var lookup = CreateCommand("""
+                    SELECT f.owner_member_id, f.purpose_code, f.blob_path, f.scan_status, f.lifecycle_status, f.expires_at,
+                           (SELECT l.resource_id FROM storage.file_asset_link l
+                            WHERE l.file_asset_id = f.file_asset_id AND l.resource_type = 'MESSAGE' AND l.removed_at IS NULL LIMIT 1) AS linked_message_id
+                    FROM storage.file_asset f WHERE f.file_asset_id = @file_asset_id
+                    FOR UPDATE OF f
+                    """, transaction);
+                AddVarchar(lookup, "file_asset_id", request.FileAssetId, 64);
+                FileAsset? asset = null; string? linkedMessageId = null;
+                await using (var reader = await lookup.ExecuteReaderAsync(ct))
+                {
+                    if (await reader.ReadAsync(ct))
+                    {
+                        asset = new FileAsset
+                        {
+                            FileAssetId = request.FileAssetId, OwnerMemberId = GetNullableString(reader, "owner_member_id"), PurposeCode = reader.GetString(reader.GetOrdinal("purpose_code")),
+                            BlobPath = reader.GetString(reader.GetOrdinal("blob_path")), ScanStatus = reader.GetString(reader.GetOrdinal("scan_status")),
+                            LifecycleStatus = reader.GetString(reader.GetOrdinal("lifecycle_status")), ExpiresAt = GetNullableInstant(reader, "expires_at")
+                        };
+                        linkedMessageId = GetNullableString(reader, "linked_message_id");
+                    }
+                }
+                ChatFiles.EnsureAttachable(asset, linkedMessageId, memberId, conversationId, request.MessageId, DateTimeOffset.UtcNow);
+            }
             await using var command = CreateCommand("SELECT * FROM chat.save_message(@message_id, @conversation_id, @sender_id, @message_type, @body, @client_sent_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)", transaction);
             AddVarchar(command, "message_id", request.MessageId, 64); AddVarchar(command, "conversation_id", conversationId, 64); AddVarchar(command, "sender_id", memberId, 64); AddVarchar(command, "message_type", request.MessageType, 20);
             command.Parameters.Add(new NpgsqlParameter("body", NpgsqlDbType.Text) { Value = request.Body is null ? DBNull.Value : request.Body });
@@ -266,11 +297,44 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
                 };
             }
 
+            // chat.save_message only writes the legacy chat.message.created event, so MessageCreated.v1 is added in the same
+            // transaction. The event ID is derived from the message ID, so an idempotent replay adds nothing.
+            await using (var outbox = CreateCommand("""
+                INSERT INTO ops.outbox_event(outbox_event_id, aggregate_type, aggregate_id, event_type, payload_json)
+                SELECT @event_id, 'MESSAGE', m.message_id, 'MessageCreated.v1',
+                       jsonb_build_object('message_id', m.message_id, 'conversation_id', m.conversation_id, 'sender_member_id', m.sender_member_id,
+                                          'recipient_member_id', p.member_id, 'server_sequence', m.server_sequence)
+                FROM chat.message m
+                JOIN chat.conversation_participant p ON p.conversation_id = m.conversation_id AND p.member_id <> m.sender_member_id
+                WHERE m.message_id = @message_id
+                LIMIT 1
+                ON CONFLICT (outbox_event_id) DO NOTHING
+                """, transaction))
+            {
+                AddVarchar(outbox, "event_id", MessageCreatedEventId(message.MessageId), 64); AddVarchar(outbox, "message_id", message.MessageId, 64);
+                await outbox.ExecuteNonQueryAsync(ct);
+            }
+            if (request.FileAssetId is not null)
+            {
+                // A replay finds the link already there. Once sent, the upload no longer expires.
+                await using var link = CreateCommand("""
+                    INSERT INTO storage.file_asset_link(file_asset_id, resource_type, resource_id, relationship_type, linked_by)
+                    VALUES (@file_asset_id, 'MESSAGE', @message_id, 'PRIMARY', @member_id)
+                    ON CONFLICT (file_asset_id, resource_type, resource_id, relationship_type) DO NOTHING;
+                    UPDATE storage.file_asset SET expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE file_asset_id = @file_asset_id AND expires_at IS NOT NULL;
+                    """, transaction);
+                AddVarchar(link, "file_asset_id", request.FileAssetId, 64); AddVarchar(link, "message_id", message.MessageId, 64); AddVarchar(link, "member_id", memberId, 64);
+                await link.ExecuteNonQueryAsync(ct);
+            }
             await transaction.CommitAsync(ct);
             return message;
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
+
+    private static string MessageCreatedEventId(string messageId) =>
+        $"msgc_{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"MessageCreated.v1\n{messageId}"))).ToLowerInvariant()[..59]}";
 
     async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
     {
@@ -370,6 +434,8 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<ConversationParticipant>(e => { e.ToTable("conversation_participant", "chat"); e.HasKey(x => new { x.ConversationId, x.MemberId }); });
         model.Entity<Message>(e => { e.ToTable("message", "chat"); e.HasKey(x => x.MessageId); e.Property(x => x.MessageId).HasMaxLength(64); e.Property(x => x.Body).HasColumnType("text"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.ConversationId, x.ServerSequence }).IsUnique(); });
         model.Entity<MessageReceipt>(e => { e.ToTable("message_receipt", "chat"); e.HasKey(x => new { x.MessageId, x.MemberId }); });
+        model.Entity<FileAsset>(e => { e.ToTable("file_asset", "storage"); e.HasKey(x => x.FileAssetId); e.Property(x => x.FileAssetId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.OwnerMemberId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(32); e.Property(x => x.ContainerName).HasMaxLength(128); e.Property(x => x.BlobPath).HasMaxLength(1024); e.Property(x => x.BlobPathHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.FileName).HasMaxLength(255); e.Property(x => x.MediaType).HasMaxLength(128); e.Property(x => x.Sha256).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Classification).HasMaxLength(24); e.Property(x => x.ScanStatus).HasMaxLength(24); e.Property(x => x.LifecycleStatus).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.BlobPathHash).IsUnique(); });
+        model.Entity<FileAssetLink>(e => { e.ToTable("file_asset_link", "storage"); e.HasKey(x => x.FileAssetLinkId); e.Property(x => x.FileAssetLinkId).UseIdentityByDefaultColumn(); e.Property(x => x.FileAssetId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.RelationshipType).HasMaxLength(32); e.Property(x => x.LinkedBy).HasMaxLength(64); e.HasIndex(x => new { x.ResourceType, x.ResourceId, x.RemovedAt }); });
         model.Entity<NotificationPreference>(e => { e.ToTable("notification_preference", "notification"); e.HasKey(x => new { x.MemberId, x.PurposeCode }); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberDevice>(e => { e.ToTable("member_device", "iam"); e.HasKey(x => x.DeviceId); e.Property(x => x.DeviceId).HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Platform).HasMaxLength(16); e.Property(x => x.AppVersion).HasMaxLength(32); e.Property(x => x.Status).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.Status }); });
         // The foreign key makes EF insert a new device before its token in one save.

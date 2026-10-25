@@ -64,9 +64,14 @@ public sealed record MeetingSpotResponse(string SpotId, string Label);
 public sealed record BlockRequest(string MemberId);
 // A member's own block list: the blocker knows who they blocked, so the name is included.
 public sealed record BlockedMemberResponse(string MemberId, string? DisplayName, DateTimeOffset BlockedAt);
-public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null);
+// message_type FILE needs file_asset_id from POST /v1/conversations/{id}/attachments; body is then an optional caption.
+public sealed record MessageCreateRequest(string MessageId, string? Body, string MessageType = "TEXT", DateTimeOffset? ClientSentAt = null, string? FileAssetId = null);
+// A sent file. media_type is detected from the file itself: image/jpeg, image/png, image/webp, image/heic, application/pdf, audio/mp4 or audio/aac.
+public sealed record MessageAttachment(string FileAssetId, string MediaType, long SizeBytes, string FileName);
+public sealed record ChatAttachmentUploadResponse(string FileAssetId, string MediaType, long SizeBytes, string FileName);
 // A deleted message keeps its place in the conversation with a null body and deleted_at set.
-public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt = null);
+// attachment is set on a FILE message until it is deleted; the file itself comes from GET /v1/messages/{id}/attachment.
+public sealed record MessageResponse(string MessageId, string ConversationId, string SenderMemberId, string MessageType, string? Body, long ServerSequence, string ModerationStatus, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt = null, MessageAttachment? Attachment = null);
 // Category: SPAM, HARASSMENT, INAPPROPRIATE, SCAM or OTHER.
 public sealed record MessageReportRequest(string Category, string? Description = null);
 // Category: SPAM, HARASSMENT, INAPPROPRIATE, FAKE_PROFILE or OTHER. resource_type: PROFILE, REQUEST or MESSAGE (optional).

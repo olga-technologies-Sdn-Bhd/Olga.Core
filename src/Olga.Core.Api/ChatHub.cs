@@ -1,4 +1,5 @@
 using System.Security.Claims;
+using System.Text.Json;
 using Microsoft.AspNetCore.SignalR;
 using Olga.Core.Application;
 
@@ -34,5 +35,32 @@ public sealed class RealtimeMemberMiddleware(RequestDelegate next, IConfiguratio
         if (usedInsecureFallback)
             context.User.AddIdentity(new ClaimsIdentity([new Claim(ClaimTypes.NameIdentifier, memberId)], AuthenticationType));
         return next(context);
+    }
+}
+
+// Sends TypingStarted.v1 through the hub to the other member only, in the outbox event envelope but never stored.
+// Throttled per member and conversation; a SignalR failure is logged and the request still succeeds.
+public sealed class SignalRChatTypingPublisher(IHubContext<ChatHub> hub, ChatTypingThrottle throttle, TimeProvider time, ILogger<SignalRChatTypingPublisher> logger) : IChatTypingPublisher
+{
+    private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+
+    public async Task PublishAsync(string memberId, string recipientMemberId, string conversationId, CancellationToken ct)
+    {
+        if (!throttle.TryAcquire(memberId, conversationId)) return;
+        var now = time.GetUtcNow();
+        var envelope = JsonSerializer.SerializeToElement(new
+        {
+            EventId = $"typ_{Guid.NewGuid():N}",
+            EventType = ChatRealtime.TypingStarted,
+            AggregateType = "CONVERSATION",
+            AggregateId = conversationId,
+            OccurredAt = now,
+            Data = new { ConversationId = conversationId, MemberId = memberId, ExpiresAt = now + ChatRealtime.TypingDuration }
+        }, Json);
+        try { await hub.Clients.User(recipientMemberId).SendAsync(ChatRealtime.ClientMethod, envelope, ct); }
+        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        {
+            logger.LogWarning(ex, "Typing signal for conversation {ConversationId} was not delivered", conversationId);
+        }
     }
 }

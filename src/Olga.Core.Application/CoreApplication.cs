@@ -26,6 +26,8 @@ public interface ICoreStore
     IQueryable<ConversationParticipant> ConversationParticipants { get; }
     IQueryable<Message> Messages { get; }
     IQueryable<MessageReceipt> MessageReceipts { get; }
+    IQueryable<FileAsset> FileAssets { get; }
+    IQueryable<FileAssetLink> FileAssetLinks { get; }
     IQueryable<NotificationPreference> NotificationPreferences { get; }
     IQueryable<MemberDevice> Devices { get; }
     IQueryable<PushToken> PushTokens { get; }
@@ -94,7 +96,13 @@ public interface ICoreService
     Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct);
     Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct);
     Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct);
+    // Stores a photo, PDF or voice note for a FILE message in this conversation; it expires unless sent.
+    Task<ChatAttachmentUploadResponse> UploadChatAttachmentAsync(string memberId, string conversationId, Stream content, long contentLength, string? declaredContentType, string? fileName, string idempotencyKey, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
+    // Either participant of an open conversation; served only once the file has been scanned clean.
+    Task<ChatFileContent> GetMessageAttachmentAsync(string memberId, string messageId, CancellationToken ct);
+    // Tells the other member "typing…" in realtime; nothing is stored. Forbidden like sending.
+    Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
     Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
@@ -145,7 +153,7 @@ public interface IIdentityProtector
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
-public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null) : ICoreService
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null, IChatTypingPublisher? typingPublisher = null) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -911,24 +919,122 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))) throw new DomainException("MESSAGE_INVALID");
+        var isFile = request.MessageType == "FILE";
+        if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))
+            || isFile != !string.IsNullOrWhiteSpace(request.FileAssetId) || request.FileAssetId?.Length > 64) throw new DomainException("MESSAGE_INVALID");
         EnsureNotDeletionPending(memberId);
         if (store.IsRelational)
-            return Map(await store.SaveMessageAsync(memberId, conversationId, request, idempotencyKey, Hash(memberId, conversationId, request.MessageId, request.MessageType, request.Body, request.ClientSentAt?.ToString("O")), ct));
+        {
+            // The file asset joins the hash only when present, so TEXT hashes are unchanged.
+            string?[] hashed = [memberId, conversationId, request.MessageId, request.MessageType, request.Body, request.ClientSentAt?.ToString("O"), .. isFile ? new[] { request.FileAssetId } : []];
+            var saved = await store.SaveMessageAsync(memberId, conversationId, request, idempotencyKey, Hash(hashed), ct);
+            return Map(saved, AttachmentsFor([saved]));
+        }
         var conversation = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404);
         var connection = store.Connections.Single(x => x.ConnectionId == conversation.ConnectionId);
         if (connection.Status != "ACTIVE" || (connection.MemberLowId != memberId && connection.MemberHighId != memberId)) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
         var other = connection.MemberLowId == memberId ? connection.MemberHighId : connection.MemberLowId;
         if (IsBlocked(memberId, other)) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
         var existing = store.Messages.SingleOrDefault(x => x.MessageId == request.MessageId);
-        if (existing is not null) return Map(existing);
+        if (existing is not null) return Map(existing, AttachmentsFor([existing]));
+        FileAsset? asset = null;
+        if (isFile)
+        {
+            asset = store.FileAssets.SingleOrDefault(x => x.FileAssetId == request.FileAssetId);
+            var linked = store.FileAssetLinks.Where(x => x.FileAssetId == request.FileAssetId && x.ResourceType == "MESSAGE" && x.RemovedAt == null).Select(x => x.ResourceId).FirstOrDefault();
+            ChatFiles.EnsureAttachable(asset, linked, memberId, conversationId, request.MessageId, DateTimeOffset.UtcNow);
+        }
         var sequence = store.Messages.Where(x => x.ConversationId == conversationId).Select(x => x.ServerSequence).DefaultIfEmpty().Max() + 1;
         var row = new Message { MessageId = request.MessageId, ConversationId = conversationId, SenderMemberId = memberId, MessageType = request.MessageType, Body = request.Body, ClientSentAt = request.ClientSentAt, ServerSequence = sequence };
         store.Add(row);
+        if (asset is not null)
+        {
+            store.Add(new FileAssetLink { FileAssetId = asset.FileAssetId, ResourceType = "MESSAGE", ResourceId = row.MessageId, LinkedBy = memberId });
+            asset.ExpiresAt = null; asset.UpdatedAt = DateTimeOffset.UtcNow;
+        }
         foreach (var id in new[] { memberId, other }) AddChange(id, "MESSAGE", row.MessageId, "UPSERT", new { row.MessageId, row.ConversationId, row.SenderMemberId, row.Body, row.ServerSequence, row.CreatedAt });
         AddOutbox("MESSAGE", row.MessageId, "MessageCreated.v1", new { message_id = row.MessageId, conversation_id = conversationId, sender_member_id = memberId, recipient_member_id = other, row.ServerSequence });
         await store.SaveAsync(ct);
-        return Map(row);
+        return Map(row, AttachmentsFor([row]));
+    }
+
+    public async Task<ChatAttachmentUploadResponse> UploadChatAttachmentAsync(string memberId, string conversationId, Stream content, long contentLength, string? declaredContentType, string? fileName, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        var options = chatFileOptions ?? new ChatFileOptions();
+        if (contentLength <= 0) throw new DomainException("ATTACHMENT_REQUIRED");
+        if (contentLength > options.MaxBytes) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        EnsureNotDeletionPending(memberId);
+        RequireCanSend(memberId, conversationId);
+        var fileAssetId = $"fil_{Hash("chat.attachment", memberId, idempotencyKey)[..32]}";
+        var blobPath = ChatFiles.BlobPath(conversationId, fileAssetId);
+        var existing = store.FileAssets.SingleOrDefault(x => x.FileAssetId == fileAssetId);
+        if (existing is not null)
+        {
+            if (existing.BlobPath != blobPath || existing.SizeBytes != contentLength) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return new(existing.FileAssetId, existing.MediaType, existing.SizeBytes, existing.FileName);
+        }
+
+        // Read at most one byte past the limit, so a wrong Content-Length can't push a larger file through.
+        using var buffer = new MemoryStream((int)contentLength);
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await content.ReadAsync(chunk, ct)) > 0)
+        {
+            buffer.Write(chunk, 0, read);
+            if (buffer.Length > options.MaxBytes) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        }
+        var bytes = buffer.GetBuffer().AsMemory(0, (int)buffer.Length);
+        var detected = ChatFiles.Detect(bytes.Span, declaredContentType) ?? throw new DomainException("ATTACHMENT_TYPE_INVALID", 415);
+        if (bytes.Length > ChatFiles.MaxBytes(options, detected.Kind)) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        if (detected.DurationMs > options.AudioMaxSeconds * 1000L) throw new DomainException("ATTACHMENT_TOO_LONG", 413);
+
+        var safeName = ChatFiles.SafeFileName(fileName, detected);
+        await (chatFileStorage ?? throw new InvalidOperationException("Chat file storage is not configured."))
+            .UploadAsync(blobPath, new MemoryStream(buffer.GetBuffer(), 0, (int)buffer.Length, writable: false), detected.MediaType, ct);
+        var now = DateTimeOffset.UtcNow;
+        store.Add(new FileAsset
+        {
+            FileAssetId = fileAssetId,
+            CommunityId = MemberCommunity(memberId) ?? "",
+            OwnerMemberId = memberId,
+            PurposeCode = ChatFiles.Purpose,
+            ContainerName = ChatFiles.ContainerName,
+            BlobPath = blobPath,
+            BlobPathHash = Hash(ChatFiles.ContainerName, blobPath),
+            FileName = safeName,
+            MediaType = detected.MediaType,
+            SizeBytes = bytes.Length,
+            Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes.Span)).ToLowerInvariant(),
+            ExpiresAt = now.AddHours(options.UnsentFileExpiryHours),
+            CreatedAt = now,
+            UpdatedAt = now
+        });
+        // For the scanner that will move scan_status from PENDING; downloads wait for CLEAN.
+        AddOutbox("FILE_ASSET", fileAssetId, "ChatFileUploaded.v1", new { file_asset_id = fileAssetId, conversation_id = conversationId, owner_member_id = memberId, container_name = ChatFiles.ContainerName, media_type = detected.MediaType, size_bytes = bytes.Length });
+        await store.SaveAsync(ct);
+        return new(fileAssetId, detected.MediaType, bytes.Length, safeName);
+    }
+
+    public async Task<ChatFileContent> GetMessageAttachmentAsync(string memberId, string messageId, CancellationToken ct)
+    {
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId && x.DeletedAt == null) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        RequireCanSend(memberId, message.ConversationId);
+        var asset = (from link in store.FileAssetLinks
+                     join file in store.FileAssets on link.FileAssetId equals file.FileAssetId
+                     where link.ResourceType == "MESSAGE" && link.ResourceId == messageId && link.RemovedAt == null
+                     select file).FirstOrDefault();
+        if (asset is null || asset.LifecycleStatus is "DELETED" or "EXPIRED" or "QUARANTINED") throw new DomainException("ATTACHMENT_NOT_FOUND", 404);
+        if (asset.ScanStatus != "CLEAN") throw new DomainException("ATTACHMENT_NOT_AVAILABLE", 409);
+        var stream = await (chatFileStorage ?? throw new InvalidOperationException("Chat file storage is not configured."))
+            .OpenReadAsync(asset.BlobPath, ct);
+        return new(stream, asset.MediaType, asset.FileName, $"\"{asset.FileAssetId}\"");
+    }
+
+    public async Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct)
+    {
+        var connection = RequireCanSend(memberId, conversationId);
+        if (typingPublisher is not null) await typingPublisher.PublishAsync(memberId, OtherMember(connection, memberId), conversationId, ct);
     }
 
     public async Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct)
@@ -1025,7 +1131,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     {
         ct.ThrowIfCancellationRequested();
         _ = RequireConversationMember(memberId, conversationId);
-        IReadOnlyList<MessageResponse> result = store.Messages.Where(x => x.ConversationId == conversationId && x.ServerSequence > after).OrderBy(x => x.ServerSequence).Take(Math.Clamp(limit, 1, 100)).AsEnumerable().Select(Map).ToArray();
+        var page = store.Messages.Where(x => x.ConversationId == conversationId && x.ServerSequence > after).OrderBy(x => x.ServerSequence).Take(Math.Clamp(limit, 1, 100)).ToArray();
+        var attachments = AttachmentsFor(page);
+        IReadOnlyList<MessageResponse> result = page.Select(x => Map(x, attachments)).ToArray();
         return Task.FromResult(result);
     }
 
@@ -1226,6 +1334,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private bool IsBlocked(string a, string b) => store.Blocks.Any(x => x.RemovedAt == null && ((x.BlockerMemberId == a && x.BlockedMemberId == b) || (x.BlockerMemberId == b && x.BlockedMemberId == a)));
     private bool IsConnected(string a, string b) { var p = Pair(a, b); return store.Connections.Any(x => x.MemberLowId == p.Low && x.MemberHighId == p.High && x.Status == "ACTIVE"); }
     private Connection RequireConversationMember(string memberId, string conversationId) { var c = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404); var link = store.Connections.Single(x => x.ConnectionId == c.ConnectionId); return link.Status == "ACTIVE" && (link.MemberLowId == memberId || link.MemberHighId == memberId) ? link : throw new DomainException("CONVERSATION_FORBIDDEN", 403); }
+    // A participant of an open conversation, with no block either way: the same rule as chat.vw_authorized_conversation.can_send.
+    private Connection RequireCanSend(string memberId, string conversationId)
+    {
+        var connection = RequireConversationMember(memberId, conversationId);
+        if (store.Conversations.Any(x => x.ConversationId == conversationId && x.Status != "ACTIVE") || IsBlocked(memberId, OtherMember(connection, memberId)))
+            throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        return connection;
+    }
     // Every Commit sent in the event counts, whatever happened to it.
     private int CommitsUsed(string senderId, string eventId) => store.ConnectionRequests.Count(x => x.SenderMemberId == senderId && x.ContextId == eventId);
     private bool IsAttending(string eventId, string memberId) => store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"));
@@ -1294,6 +1410,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var readThrough = myReceipts.Where(x => x.ReadAt != null).GroupBy(x => x.ConversationId)
             .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) }).ToDictionary(x => x.ConversationId, x => (long?)x.Sequence);
 
+        var lastAttachments = AttachmentsFor(lastMessages.Values);
         return conversations.Select(c =>
         {
             var connection = byConnection[c.ConnectionId];
@@ -1301,7 +1418,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var profile = profiles.GetValueOrDefault(otherId);
             var last = lastMessages.GetValueOrDefault(c.ConversationId);
             return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
-                last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
+                last is null ? null : Map(last, lastAttachments), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
                 c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId),
                 deliveredThrough.GetValueOrDefault(c.ConversationId), readThrough.GetValueOrDefault(c.ConversationId));
         }).ToArray();
@@ -1361,5 +1478,19 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     // The sender sees a declined Commit as PENDING.
     private static ConnectionRequestResponse Map(ConnectionRequest x, int commitsRemaining) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status == "DECLINED" ? "PENDING" : x.Status, x.ExpiresAt, Math.Max(0, commitsRemaining));
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.ServerSequence, x.ModerationStatus, x.CreatedAt, x.DeletedAt);
+    private static MessageResponse Map(Message x, IReadOnlyDictionary<string, MessageAttachment> attachments) => Map(x) with { Attachment = x.DeletedAt is null ? attachments.GetValueOrDefault(x.MessageId) : null };
+    // The attached file of each FILE message, by message ID.
+    private Dictionary<string, MessageAttachment> AttachmentsFor(IEnumerable<Message> messages)
+    {
+        var ids = messages.Where(x => x.MessageType == "FILE" && x.DeletedAt == null).Select(x => x.MessageId).ToArray();
+        if (ids.Length == 0) return [];
+        return (from link in store.FileAssetLinks
+                join file in store.FileAssets on link.FileAssetId equals file.FileAssetId
+                where link.ResourceType == "MESSAGE" && ids.Contains(link.ResourceId) && link.RemovedAt == null
+                select new { link.ResourceId, file.FileAssetId, file.MediaType, file.SizeBytes, file.FileName })
+            .AsEnumerable()
+            .GroupBy(x => x.ResourceId)
+            .ToDictionary(g => g.Key, g => { var x = g.First(); return new MessageAttachment(x.FileAssetId, x.MediaType, x.SizeBytes, x.FileName); });
+    }
     private static PrivacyRequestResponse Map(PrivacyRequest x) => new(x.PrivacyRequestId, x.RequestType, x.Status, x.CreatedAt, x.DueAt);
 }
