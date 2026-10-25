@@ -56,7 +56,7 @@ builder.Services.AddOpenApi(options =>
 
         var method = context.Description.HttpMethod;
         if (context.Description.RelativePath?.StartsWith("v1/", StringComparison.OrdinalIgnoreCase) == true
-            && method is "POST" or "PUT" or "PATCH" or "DELETE")
+            && method is "POST" or "PUT" or "PATCH" or "DELETE" && !metadata.OfType<NoIdempotencyMetadata>().Any())
             AddHeaderParameter(operation, idempotencyKeyHeader, true, "Unique key for this logical mutation. Reuse the same key only when retrying the same request.", 128);
 
         if (metadata.OfType<IfMatchMetadata>().Any())
@@ -89,6 +89,9 @@ else builder.Services.AddSingleton<IChatFileStorage, AzureChatFileStorage>();
 if (local) builder.Services.AddSingleton<IProfileImageStorage, InMemoryProfileImageStorage>();
 else builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<ChatTypingThrottle>();
+builder.Services.AddSingleton<IChatTypingPublisher, SignalRChatTypingPublisher>();
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
@@ -106,8 +109,8 @@ app.Use(async (context, next) =>
             : 256_000;
         if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
-        // SignalR's negotiate POST is a connection handshake, not a mutation.
-        if (context.Request.Path.StartsWithSegments("/v1") && !context.Request.Path.StartsWithSegments(ChatRealtime.HubPath)
+        // SignalR's negotiate POST is a connection handshake and a typing signal stores nothing: neither is a mutation.
+        if (context.Request.Path.StartsWithSegments("/v1") && !context.Request.Path.StartsWithSegments(ChatRealtime.HubPath) && !IsTypingSignal(context.Request.Path)
             && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
         {
             await Error(context, 400, "IDEMPOTENCY_KEY_REQUIRED");
@@ -285,6 +288,9 @@ memberV1.MapGet("/messages/{messageId}/attachment", async (HttpContext c, string
     return Results.Stream(value.Content, value.MediaType, value.FileName, entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue(value.ETag), enableRangeProcessing: true);
 })
     .WithName("GetMessageAttachment").WithTags("Chat").Produces<byte[]>(200, contentType: "application/octet-stream").Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapPost("/conversations/{conversationId}/typing", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => { await s.StartTypingAsync(Member(c), conversationId, ct); return Results.Accepted(); })
+    .WithMetadata(new NoIdempotencyMetadata())
+    .WithName("StartTyping").WithTags("Chat").Produces(202);
 memberV1.MapPut("/messages/{messageId}/receipt", async (HttpContext c, string messageId, MessageReceiptRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SaveMessageReceiptAsync(Member(c), messageId, body, Idempotency(c), ct)))
     .WithName("SaveMessageReceipt").WithTags("Chat").Produces<MessageReceiptResponse>(200);
 memberV1.MapDelete("/messages/{messageId}", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) => { await s.DeleteMessageAsync(Member(c), messageId, ct); return Results.NoContent(); })
@@ -387,7 +393,11 @@ string Member(HttpContext context)
 static bool IsChatAttachmentUpload(PathString path) =>
     path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "attachments"];
 
-string Idempotency(HttpContext context) =>context.Request.Headers[idempotencyKeyHeader].ToString();
+// POST /v1/conversations/{id}/typing: an ephemeral realtime signal.
+static bool IsTypingSignal(PathString path) =>
+    path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "typing"];
+
+string Idempotency(HttpContext context) => context.Request.Headers[idempotencyKeyHeader].ToString();
 
 static void AddHeaderParameter(OpenApiOperation operation, string name, bool required, string description, int? maxLength = null)
 {
@@ -452,3 +462,5 @@ public partial class Program { }
 internal sealed class MemberContextMetadata { }
 internal sealed class OptionalMemberContextMetadata { }
 internal sealed class IfMatchMetadata { }
+// A POST that changes nothing stored, so it needs no Idempotency-Key.
+internal sealed class NoIdempotencyMetadata { }

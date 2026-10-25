@@ -1633,6 +1633,30 @@ public sealed class CoreServiceTests
         Assert.True(session.ActiveUntil <= evt.EndsAt);
     }
 
+    [Fact]
+    public async Task Typing_reaches_the_other_member_only_while_they_can_chat()
+    {
+        await using var db = Db(); SeedMembersAndEvent(db); db.MemberProfiles.Add(new MemberProfile { MemberId = "C", DisplayName = "C", Status = "ACTIVE" }); await db.SaveChangesAsync();
+        var typing = new RecordingTypingPublisher();
+        var service = new CoreService(db, IdentityProtector, typingPublisher: typing);
+        var conversationId = await ConnectAsync(service, "A", "B");
+
+        await service.StartTypingAsync("A", conversationId, default);
+        Assert.Equal(("A", "B", conversationId), Assert.Single(typing.Sent));
+        await AssertCode("CONVERSATION_FORBIDDEN", 403, () => service.StartTypingAsync("C", conversationId, default));
+        await AssertCode("CONVERSATION_NOT_FOUND", 404, () => service.StartTypingAsync("A", "unknown", default));
+        db.ChatConversations.Single().Status = "RESTRICTED"; await db.SaveChangesAsync();
+        await AssertCode("CONVERSATION_FORBIDDEN", 403, () => service.StartTypingAsync("B", conversationId, default));
+        Assert.Single(typing.Sent);
+        Assert.Empty(db.OutboxEvents.Where(x => x.EventType == ChatRealtime.TypingStarted));
+    }
+
+    private sealed class RecordingTypingPublisher : IChatTypingPublisher
+    {
+        public List<(string MemberId, string RecipientMemberId, string ConversationId)> Sent { get; } = [];
+        public Task PublishAsync(string memberId, string recipientMemberId, string conversationId, CancellationToken ct) { Sent.Add((memberId, recipientMemberId, conversationId)); return Task.CompletedTask; }
+    }
+
     private static void SeedMembersAndEvent(CoreDbContext db)
     {
         db.MemberProfiles.AddRange(new MemberProfile { MemberId = "A", DisplayName = "A", Status = "ACTIVE" }, new MemberProfile { MemberId = "B", DisplayName = "B", Status = "ACTIVE" });

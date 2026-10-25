@@ -101,6 +101,8 @@ public interface ICoreService
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
     // Either participant of an open conversation; served only once the file has been scanned clean.
     Task<ChatFileContent> GetMessageAttachmentAsync(string memberId, string messageId, CancellationToken ct);
+    // Tells the other member "typing…" in realtime; nothing is stored. Forbidden like sending.
+    Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
     Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
@@ -151,7 +153,7 @@ public interface IIdentityProtector
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
-public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null) : ICoreService
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null, IChatTypingPublisher? typingPublisher = null) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -1020,6 +1022,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var stream = await (chatFileStorage ?? throw new InvalidOperationException("Chat file storage is not configured."))
             .OpenReadAsync(asset.BlobPath, ct);
         return new(stream, asset.MediaType, asset.FileName, $"\"{asset.FileAssetId}\"");
+    }
+
+    public async Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct)
+    {
+        var connection = RequireCanSend(memberId, conversationId);
+        if (typingPublisher is not null) await typingPublisher.PublishAsync(memberId, OtherMember(connection, memberId), conversationId, ct);
     }
 
     public async Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct)
