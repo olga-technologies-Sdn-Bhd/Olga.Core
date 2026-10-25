@@ -154,7 +154,21 @@ app.UseSwaggerUI(options =>
 app.MapHealthChecks("/health");
 app.UseMiddleware<RealtimeMemberMiddleware>();
 app.MapHub<ChatHub>(ChatRealtime.HubPath);
-app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503))
+app.MapGet("/ready", async (CoreDbContext db, ILoggerFactory loggerFactory, CancellationToken ct) =>
+    {
+        try
+        {
+            return await db.Database.CanConnectAsync(ct)
+                ? Results.Ok(new { status = "ready" })
+                : Results.StatusCode(503);
+        }
+        catch (Exception ex) when (PostgreSqlConfiguration.IsUnavailable(ex))
+        {
+            loggerFactory.CreateLogger("Olga.Core.Api.Readiness")
+                .LogError(ex, "PostgreSQL readiness check failed.");
+            return Results.StatusCode(503);
+        }
+    })
     .WithName("GetReadiness").WithTags("Operations").Produces(200).Produces(503);
 
 var v1 = app.MapGroup("/v1");

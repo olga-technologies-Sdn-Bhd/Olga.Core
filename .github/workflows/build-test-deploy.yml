@@ -213,6 +213,53 @@ jobs:
             --output tsv)
           [[ "$worker_min_replicas" =~ ^[1-9][0-9]*$ ]] || { echo "Core worker must have at least one replica" >&2; exit 1; }
 
+          dump_container_app_diagnostics() {
+            local app_name="$1"
+            local latest_revision
+
+            echo "::group::Container App diagnostics: $app_name"
+            az containerapp show \
+              --name "$app_name" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "{provisioningState:properties.provisioningState,latestRevisionName:properties.latestRevisionName,latestReadyRevisionName:properties.latestReadyRevisionName}" \
+              --output yaml || true
+            az containerapp revision list \
+              --name "$app_name" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "sort_by(@, &properties.createdTime)[-3:].{name:name,provisioningState:properties.provisioningState,runningState:properties.runningState,healthState:properties.healthState,createdTime:properties.createdTime}" \
+              --output table || true
+            latest_revision=$(az containerapp revision list \
+              --name "$app_name" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --query "sort_by(@, &properties.createdTime)[-1].name" \
+              --output tsv 2>/dev/null || true)
+            if [[ -n "$latest_revision" ]]; then
+              az containerapp logs show \
+                --name "$app_name" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --revision "$latest_revision" \
+                --type system \
+                --tail 100 || true
+              az containerapp logs show \
+                --name "$app_name" \
+                --resource-group "$AZURE_RESOURCE_GROUP" \
+                --revision "$latest_revision" \
+                --type console \
+                --tail 100 || true
+            fi
+            echo "::endgroup::"
+          }
+
+          deployment_failed() {
+            local exit_code=$?
+            trap - ERR
+            echo "::error::Core deployment failed; collecting revision and container diagnostics."
+            dump_container_app_diagnostics "$CONTAINER_APP_NAME"
+            dump_container_app_diagnostics "$WORKER_CONTAINER_APP_NAME"
+            exit "$exit_code"
+          }
+          trap deployment_failed ERR
+
           image_ref="${ACR_LOGIN_SERVER}/${IMAGE_NAME}@${IMAGE_DIGEST}"
           worker_image_ref="${ACR_LOGIN_SERVER}/${WORKER_IMAGE_NAME}@${WORKER_IMAGE_DIGEST}"
           revision_suffix="${GITHUB_SHA:0:8}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
