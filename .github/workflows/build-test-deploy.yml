@@ -206,6 +206,11 @@ jobs:
           [[ "$worker_signalr_required" == "true" ]] || { echo "Core worker must set SignalR__Required=true" >&2; exit 1; }
           [[ "$outbox_enabled" == "true" ]] || { echo "Core worker must set Outbox__Enabled=true" >&2; exit 1; }
 
+          api_min_replicas=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "properties.template.scale.minReplicas" \
+            --output tsv)
           worker_min_replicas=$(az containerapp show \
             --name "$WORKER_CONTAINER_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
@@ -219,32 +224,20 @@ jobs:
           include_exception_details=false
           [[ "$DEPLOY_ENVIRONMENT" == "dev" ]] && include_exception_details=true
 
-          if ! az containerapp update \
+          az containerapp update \
             --name "$CONTAINER_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --image "$image_ref" \
             --revision-suffix "$revision_suffix" \
             --set-env-vars "Diagnostics__IncludeExceptionDetails=$include_exception_details" \
-            --output none; then
-            echo "::error::Core API update failed."
-            az containerapp revision list --name "$CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --output table || true
-            az containerapp logs show --name "$CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --type system --tail 50 || true
-            az containerapp logs show --name "$CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --type console --tail 50 || true
-            exit 1
-          fi
+            --output none
 
-          if ! az containerapp update \
+          az containerapp update \
             --name "$WORKER_CONTAINER_APP_NAME" \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --image "$worker_image_ref" \
             --revision-suffix "$revision_suffix" \
-            --output none; then
-            echo "::error::Core worker update failed."
-            az containerapp revision list --name "$WORKER_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --output table || true
-            az containerapp logs show --name "$WORKER_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --type system --tail 50 || true
-            az containerapp logs show --name "$WORKER_CONTAINER_APP_NAME" --resource-group "$AZURE_RESOURCE_GROUP" --type console --tail 50 || true
-            exit 1
-          fi
+            --output none
 
           revision=$(az containerapp show \
             --name "$CONTAINER_APP_NAME" \
@@ -257,16 +250,22 @@ jobs:
             --query properties.latestRevisionName \
             --output tsv)
 
+          api_state_property="healthState"
+          api_ready_state="Healthy"
+          if [[ "$api_min_replicas" == "0" ]]; then
+            api_state_property="provisioningState"
+            api_ready_state="Provisioned"
+          fi
           for attempt in {1..20}; do
-            health=$(az containerapp revision show \
+            api_state=$(az containerapp revision show \
               --name "$CONTAINER_APP_NAME" \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --revision "$revision" \
-              --query properties.healthState \
+              --query "properties.$api_state_property" \
               --output tsv)
-            [[ "$health" == "Healthy" ]] && break
-            [[ "$health" == "Unhealthy" || "$health" == "Failed" ]] && exit 1
-            [[ "$attempt" == "20" ]] && exit 1
+            [[ "$api_state" == "$api_ready_state" ]] && break
+            [[ "$api_state" == "Unhealthy" || "$api_state" == "Failed" ]] && { echo "Core API revision state: $api_state" >&2; exit 1; }
+            [[ "$attempt" == "20" ]] && { echo "Core API revision did not reach $api_ready_state; last state: $api_state" >&2; exit 1; }
             sleep 15
           done
 
