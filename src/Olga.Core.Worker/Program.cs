@@ -67,7 +67,7 @@ if (!string.IsNullOrWhiteSpace(signalREndpoint)
     && (!Uri.TryCreate(signalREndpoint, UriKind.Absolute, out var signalRUri) || signalRUri.Scheme != Uri.UriSchemeHttps))
     throw new InvalidOperationException("SignalR:Endpoint must be an absolute HTTPS URI.");
 var realtime = !string.IsNullOrWhiteSpace(signalREndpoint);
-if (realtime) builder.Services.AddSingleton<IChatRealtimeSender, AzureSignalRChatSender>();
+if (realtime) builder.Services.AddSingleton<IChatRealtimeSender>(sp => new AzureSignalRChatSender(sp.GetRequiredService<HttpClient>(), sp.GetRequiredService<IConfiguration>()));
 // Push needs Notification Hubs and the identity protection key that decrypts the stored push tokens.
 var push = builder.Configuration.GetSection(PushOptions.SectionName).Get<PushOptions>() ?? new PushOptions();
 var tokenKey = ReadIdentityKey(builder.Configuration["IdentityProtection:MasterKeyBase64"]);
@@ -104,6 +104,3 @@ static byte[]? ReadIdentityKey(string? encoded)
     try { return Convert.FromBase64String(encoded ?? "") is { Length: 32 } key ? key : null; }
     catch (FormatException) { return null; }
 }
-
-// SignalR brings in ASP.NET Core, whose generator would make Program public and clash with the API's Program in tests.
-internal partial class Program;

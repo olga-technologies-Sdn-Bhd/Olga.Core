@@ -93,6 +93,56 @@ public sealed class ChatRealtimeTests
         await publisher.PublishAsync("A", "B", "c2", default);
     }
 
+    [Fact]
+    public async Task Worker_sends_each_member_through_the_SignalR_REST_API_with_a_bearer_token()
+    {
+        var handler = new RecordingHandler();
+        var sender = new AzureSignalRChatSender(new HttpClient(handler), "https://sigr.example.net/", new FixedToken());
+        using var envelope = JsonDocument.Parse("""{"event_type":"MessageCreated.v1","data":{"message_id":"m1"}}""");
+
+        await sender.SendAsync(["A", "B", "A"], envelope.RootElement, default);
+
+        Assert.Equal(["https://sigr.example.net/api/hubs/ChatHub/users/A/:send?api-version=2022-11-01", "https://sigr.example.net/api/hubs/ChatHub/users/B/:send?api-version=2022-11-01"], handler.Requests.Select(r => r.Url));
+        Assert.All(handler.Requests, r => Assert.Equal("Bearer token-1", r.Authorization));
+        using var body = JsonDocument.Parse(handler.Requests[0].Body);
+        Assert.Equal("event", body.RootElement.GetProperty("target").GetString());
+        Assert.Equal("m1", body.RootElement.GetProperty("arguments")[0].GetProperty("data").GetProperty("message_id").GetString());
+    }
+
+    [Fact]
+    public async Task A_rejected_REST_send_fails_so_the_publisher_logs_it()
+    {
+        var sender = new AzureSignalRChatSender(new HttpClient(new RecordingHandler { Status = HttpStatusCode.Forbidden }), "https://sigr.example.net", new FixedToken());
+        using var envelope = JsonDocument.Parse("{}");
+        var error = await Assert.ThrowsAsync<HttpRequestException>(() => sender.SendAsync(["A"], envelope.RootElement, default));
+        Assert.Equal(HttpStatusCode.Forbidden, error.StatusCode);
+    }
+
+    // The worker image is the plain .NET runtime, which has no ASP.NET Core shared framework.
+    [Fact]
+    public void Worker_does_not_need_ASP_NET_Core()
+    {
+        var assemblies = new[] { typeof(AzureSignalRChatSender), typeof(Olga.Core.Infrastructure.CoreDbContext), typeof(ChatRealtime) }.Select(t => t.Assembly);
+        Assert.DoesNotContain(assemblies.SelectMany(a => a.GetReferencedAssemblies()), a => a.Name!.StartsWith("Microsoft.AspNetCore", StringComparison.Ordinal));
+    }
+
+    private sealed class RecordingHandler : HttpMessageHandler
+    {
+        public HttpStatusCode Status { get; init; } = HttpStatusCode.Accepted;
+        public List<(string Url, string? Authorization, string Body)> Requests { get; } = [];
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Requests.Add((request.RequestUri!.ToString(), request.Headers.Authorization?.ToString(), await request.Content!.ReadAsStringAsync(cancellationToken)));
+            return new HttpResponseMessage(Status);
+        }
+    }
+
+    private sealed class FixedToken : Azure.Core.TokenCredential
+    {
+        public override Azure.Core.AccessToken GetToken(Azure.Core.TokenRequestContext requestContext, CancellationToken cancellationToken) => new("token-1", DateTimeOffset.UtcNow.AddHours(1));
+        public override ValueTask<Azure.Core.AccessToken> GetTokenAsync(Azure.Core.TokenRequestContext requestContext, CancellationToken cancellationToken) => ValueTask.FromResult(GetToken(requestContext, cancellationToken));
+    }
+
     private sealed class ManualTime : TimeProvider
     {
         public DateTimeOffset Now { get; set; } = new(2026, 10, 25, 9, 0, 0, TimeSpan.Zero);
