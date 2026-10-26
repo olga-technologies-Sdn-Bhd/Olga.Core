@@ -276,7 +276,7 @@ jobs:
               --revision "$worker_revision" \
               --query properties.runningState \
               --output tsv)
-            [[ "$worker_state" == "Running" ]] && break
+            [[ "$worker_state" == "Running" || "$worker_state" == "RunningAtMaxScale" ]] && break
             [[ "$worker_state" == "Failed" || "$worker_state" == "Degraded" ]] && exit 1
             [[ "$attempt" == "20" ]] && exit 1
             sleep 15
