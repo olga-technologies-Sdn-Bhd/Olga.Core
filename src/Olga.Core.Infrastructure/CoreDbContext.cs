@@ -297,23 +297,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
                 };
             }
 
-            // chat.save_message only writes the legacy chat.message.created event, so MessageCreated.v1 is added in the same
-            // transaction. The event ID is derived from the message ID, so an idempotent replay adds nothing.
-            await using (var outbox = CreateCommand("""
-                INSERT INTO ops.outbox_event(outbox_event_id, aggregate_type, aggregate_id, event_type, payload_json)
-                SELECT @event_id, 'MESSAGE', m.message_id, 'MessageCreated.v1',
-                       jsonb_build_object('message_id', m.message_id, 'conversation_id', m.conversation_id, 'sender_member_id', m.sender_member_id,
-                                          'recipient_member_id', p.member_id, 'server_sequence', m.server_sequence)
-                FROM chat.message m
-                JOIN chat.conversation_participant p ON p.conversation_id = m.conversation_id AND p.member_id <> m.sender_member_id
-                WHERE m.message_id = @message_id
-                LIMIT 1
-                ON CONFLICT (outbox_event_id) DO NOTHING
-                """, transaction))
-            {
-                AddVarchar(outbox, "event_id", MessageCreatedEventId(message.MessageId), 64); AddVarchar(outbox, "message_id", message.MessageId, 64);
-                await outbox.ExecuteNonQueryAsync(ct);
-            }
+            // chat.save_message writes MessageCreated.v1 to the outbox itself (DB v2.7), so Core adds no event here.
             if (request.FileAssetId is not null)
             {
                 // A replay finds the link already there. Once sent, the upload no longer expires.
@@ -332,9 +316,6 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
-
-    private static string MessageCreatedEventId(string messageId) =>
-        $"msgc_{Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes($"MessageCreated.v1\n{messageId}"))).ToLowerInvariant()[..59]}";
 
     async Task<IReadOnlyList<MatchScore>> ICoreStore.GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct)
     {
