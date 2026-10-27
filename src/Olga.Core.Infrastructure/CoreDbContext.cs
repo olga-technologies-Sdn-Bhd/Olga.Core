@@ -14,6 +14,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 {
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
+    public DbSet<MemberProfileImage> MemberProfileImages => Set<MemberProfileImage>();
     public DbSet<MemberAccount> MemberAccounts => Set<MemberAccount>();
     public DbSet<MemberIdentity> MemberIdentities => Set<MemberIdentity>();
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
@@ -31,14 +32,21 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     public DbSet<ConversationParticipant> ConversationParticipants => Set<ConversationParticipant>();
     public DbSet<Message> ChatMessages => Set<Message>();
     public DbSet<MessageReceipt> MessageReceipts => Set<MessageReceipt>();
+    public DbSet<FileAsset> FileAssets => Set<FileAsset>();
+    public DbSet<FileAssetLink> FileAssetLinks => Set<FileAssetLink>();
     public DbSet<NotificationPreference> Preferences => Set<NotificationPreference>();
+    public DbSet<MemberDevice> MemberDevices => Set<MemberDevice>();
+    public DbSet<PushToken> PushTokens => Set<PushToken>();
     public DbSet<PrivacyRequest> MemberPrivacyRequests => Set<PrivacyRequest>();
+    public DbSet<PrivacyRequestTask> PrivacyRequestTasks => Set<PrivacyRequestTask>();
     public DbSet<SyncChange> Changes => Set<SyncChange>();
     public DbSet<ModerationCase> ModerationCases => Set<ModerationCase>();
     public DbSet<MemberReport> MemberReports => Set<MemberReport>();
     public DbSet<OutboxEvent> OutboxEvents => Set<OutboxEvent>();
+    public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
+    IQueryable<MemberProfileImage> ICoreStore.ProfileImages => MemberProfileImages;
     IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
     IQueryable<MemberIdentity> ICoreStore.Identities => MemberIdentities;
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
@@ -56,11 +64,16 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     IQueryable<ConversationParticipant> ICoreStore.ConversationParticipants => ConversationParticipants;
     IQueryable<Message> ICoreStore.Messages => ChatMessages;
     IQueryable<MessageReceipt> ICoreStore.MessageReceipts => MessageReceipts;
+    IQueryable<FileAsset> ICoreStore.FileAssets => FileAssets;
+    IQueryable<FileAssetLink> ICoreStore.FileAssetLinks => FileAssetLinks;
     IQueryable<NotificationPreference> ICoreStore.NotificationPreferences => Preferences;
+    IQueryable<MemberDevice> ICoreStore.Devices => MemberDevices;
+    IQueryable<PushToken> ICoreStore.PushTokens => PushTokens;
     IQueryable<PrivacyRequest> ICoreStore.PrivacyRequests => MemberPrivacyRequests;
     IQueryable<SyncChange> ICoreStore.SyncChanges => Changes;
     IQueryable<ModerationCase> ICoreStore.ModerationCases => ModerationCases;
     IQueryable<MemberReport> ICoreStore.MemberReports => MemberReports;
+    IQueryable<IdempotencyRecord> ICoreStore.IdempotencyRecords => IdempotencyRecords;
 
     void ICoreStore.Add<T>(T entity) => Set<T>().Add(entity);
     void ICoreStore.Remove<T>(T entity) => Set<T>().Remove(entity);
@@ -234,24 +247,72 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     async Task<Message> ICoreStore.SaveMessageAsync(string memberId, string conversationId, Contracts.MessageCreateRequest request, string idempotencyKey, string requestHash, CancellationToken ct)
     {
-        await using var command = CreateCommand("SELECT * FROM chat.save_message(@message_id, @conversation_id, @sender_id, @message_type, @body, @client_sent_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
-        AddVarchar(command, "message_id", request.MessageId, 64); AddVarchar(command, "conversation_id", conversationId, 64); AddVarchar(command, "sender_id", memberId, 64); AddVarchar(command, "message_type", request.MessageType, 20);
-        command.Parameters.Add(new NpgsqlParameter("body", NpgsqlDbType.Text) { Value = request.Body is null ? DBNull.Value : request.Body });
-        command.Parameters.Add(new NpgsqlParameter("client_sent_at", NpgsqlDbType.TimestampTz) { Value = request.ClientSentAt is null ? DBNull.Value : request.ClientSentAt.Value.ToUniversalTime() });
-        AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
-        AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
         var close = await OpenIfNeededAsync(ct);
         try
         {
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("save_message returned no result.");
-            return new Message
+            await using var transaction = await ((NpgsqlConnection)Database.GetDbConnection()).BeginTransactionAsync(ct);
+            // A FILE message's upload is locked until commit, so it can only ever be attached to one message.
+            if (request.FileAssetId is not null)
             {
-                MessageId = reader.GetString(reader.GetOrdinal("message_id")), ConversationId = reader.GetString(reader.GetOrdinal("conversation_id")), SenderMemberId = reader.GetString(reader.GetOrdinal("sender_member_id")),
-                MessageType = reader.GetString(reader.GetOrdinal("message_type")), Body = GetNullableString(reader, "body"), ClientSentAt = GetNullableInstant(reader, "client_sent_at"),
-                ServerSequence = reader.GetInt64(reader.GetOrdinal("server_sequence")), ModerationStatus = reader.GetString(reader.GetOrdinal("moderation_status")), DeletedAt = GetNullableInstant(reader, "deleted_at"),
-                CreatedAt = GetInstant(reader, "created_at"), UpdatedAt = GetInstant(reader, "updated_at"), RowVersion = reader.GetInt64(reader.GetOrdinal("row_version"))
-            };
+                await using var lookup = CreateCommand("""
+                    SELECT f.owner_member_id, f.purpose_code, f.blob_path, f.scan_status, f.lifecycle_status, f.expires_at,
+                           (SELECT l.resource_id FROM storage.file_asset_link l
+                            WHERE l.file_asset_id = f.file_asset_id AND l.resource_type = 'MESSAGE' AND l.removed_at IS NULL LIMIT 1) AS linked_message_id
+                    FROM storage.file_asset f WHERE f.file_asset_id = @file_asset_id
+                    FOR UPDATE OF f
+                    """, transaction);
+                AddVarchar(lookup, "file_asset_id", request.FileAssetId, 64);
+                FileAsset? asset = null; string? linkedMessageId = null;
+                await using (var reader = await lookup.ExecuteReaderAsync(ct))
+                {
+                    if (await reader.ReadAsync(ct))
+                    {
+                        asset = new FileAsset
+                        {
+                            FileAssetId = request.FileAssetId, OwnerMemberId = GetNullableString(reader, "owner_member_id"), PurposeCode = reader.GetString(reader.GetOrdinal("purpose_code")),
+                            BlobPath = reader.GetString(reader.GetOrdinal("blob_path")), ScanStatus = reader.GetString(reader.GetOrdinal("scan_status")),
+                            LifecycleStatus = reader.GetString(reader.GetOrdinal("lifecycle_status")), ExpiresAt = GetNullableInstant(reader, "expires_at")
+                        };
+                        linkedMessageId = GetNullableString(reader, "linked_message_id");
+                    }
+                }
+                ChatFiles.EnsureAttachable(asset, linkedMessageId, memberId, conversationId, request.MessageId, DateTimeOffset.UtcNow);
+            }
+            await using var command = CreateCommand("SELECT * FROM chat.save_message(@message_id, @conversation_id, @sender_id, @message_type, @body, @client_sent_at, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)", transaction);
+            AddVarchar(command, "message_id", request.MessageId, 64); AddVarchar(command, "conversation_id", conversationId, 64); AddVarchar(command, "sender_id", memberId, 64); AddVarchar(command, "message_type", request.MessageType, 20);
+            command.Parameters.Add(new NpgsqlParameter("body", NpgsqlDbType.Text) { Value = request.Body is null ? DBNull.Value : request.Body });
+            command.Parameters.Add(new NpgsqlParameter("client_sent_at", NpgsqlDbType.TimestampTz) { Value = request.ClientSentAt is null ? DBNull.Value : request.ClientSentAt.Value.ToUniversalTime() });
+            AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+            AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
+            Message message;
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("save_message returned no result.");
+                message = new Message
+                {
+                    MessageId = reader.GetString(reader.GetOrdinal("message_id")), ConversationId = reader.GetString(reader.GetOrdinal("conversation_id")), SenderMemberId = reader.GetString(reader.GetOrdinal("sender_member_id")),
+                    MessageType = reader.GetString(reader.GetOrdinal("message_type")), Body = GetNullableString(reader, "body"), ClientSentAt = GetNullableInstant(reader, "client_sent_at"),
+                    ServerSequence = reader.GetInt64(reader.GetOrdinal("server_sequence")), ModerationStatus = reader.GetString(reader.GetOrdinal("moderation_status")), DeletedAt = GetNullableInstant(reader, "deleted_at"),
+                    CreatedAt = GetInstant(reader, "created_at"), UpdatedAt = GetInstant(reader, "updated_at"), RowVersion = reader.GetInt64(reader.GetOrdinal("row_version"))
+                };
+            }
+
+            // chat.save_message writes MessageCreated.v1 to the outbox itself (DB v2.7), so Core adds no event here.
+            if (request.FileAssetId is not null)
+            {
+                // A replay finds the link already there. Once sent, the upload no longer expires.
+                await using var link = CreateCommand("""
+                    INSERT INTO storage.file_asset_link(file_asset_id, resource_type, resource_id, relationship_type, linked_by)
+                    VALUES (@file_asset_id, 'MESSAGE', @message_id, 'PRIMARY', @member_id)
+                    ON CONFLICT (file_asset_id, resource_type, resource_id, relationship_type) DO NOTHING;
+                    UPDATE storage.file_asset SET expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE file_asset_id = @file_asset_id AND expires_at IS NOT NULL;
+                    """, transaction);
+                AddVarchar(link, "file_asset_id", request.FileAssetId, 64); AddVarchar(link, "message_id", message.MessageId, 64); AddVarchar(link, "member_id", memberId, 64);
+                await link.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+            return message;
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
@@ -271,6 +332,27 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         }
         // The score is optional; without read access to the NLP schema it is simply left out.
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.InsufficientPrivilege) { return []; }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task<IReadOnlyList<Contracts.ExportIntent>> ICoreStore.GetMemberIntentsAsync(string memberId, CancellationToken ct)
+    {
+        if (!Database.IsRelational()) return [];
+        await using var command = CreateCommand("""
+            SELECT intent_id, context_id, intent_type, original_text, status, category, industry, geography, expires_at, created_at
+            FROM nlp.nlp_intent WHERE member_id = @member_id ORDER BY created_at DESC
+            """);
+        AddVarchar(command, "member_id", memberId, 64);
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            var intents = new List<Contracts.ExportIntent>();
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                intents.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4),
+                    GetNullableString(reader, "category"), GetNullableString(reader, "industry"), GetNullableString(reader, "geography"), GetInstant(reader, "expires_at"), GetInstant(reader, "created_at")));
+            return intents;
+        }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
@@ -316,6 +398,7 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     {
         model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
         model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
+        model.Entity<MemberProfileImage>(e => { e.ToTable("member_profile_image", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("profile_image_id").UseIdentityAlwaysColumn(); e.Property(x => x.ImageId).HasColumnName("image_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.OriginalBlobPath).HasColumnName("source_blob_path").HasMaxLength(1024); e.Property(x => x.DisplayBlobPath).HasMaxLength(1024); e.Property(x => x.ThumbnailBlobPath).HasMaxLength(1024); e.Property(x => x.DeclaredContentType).HasColumnName("content_type").HasMaxLength(100); e.Property(x => x.ContentLength).HasColumnName("size_bytes"); e.Property(x => x.ContentSha256).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.FailureCode).HasColumnName("rejection_reason").HasMaxLength(240); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ImageId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberConsent>(e => { e.ToTable("member_consent", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_consent_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.EvidenceJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberId, x.PolicyId, x.CapturedAt }); });
@@ -332,11 +415,19 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         model.Entity<ConversationParticipant>(e => { e.ToTable("conversation_participant", "chat"); e.HasKey(x => new { x.ConversationId, x.MemberId }); });
         model.Entity<Message>(e => { e.ToTable("message", "chat"); e.HasKey(x => x.MessageId); e.Property(x => x.MessageId).HasMaxLength(64); e.Property(x => x.Body).HasColumnType("text"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.ConversationId, x.ServerSequence }).IsUnique(); });
         model.Entity<MessageReceipt>(e => { e.ToTable("message_receipt", "chat"); e.HasKey(x => new { x.MessageId, x.MemberId }); });
+        model.Entity<FileAsset>(e => { e.ToTable("file_asset", "storage"); e.HasKey(x => x.FileAssetId); e.Property(x => x.FileAssetId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.OwnerMemberId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(32); e.Property(x => x.ContainerName).HasMaxLength(128); e.Property(x => x.BlobPath).HasMaxLength(1024); e.Property(x => x.BlobPathHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.FileName).HasMaxLength(255); e.Property(x => x.MediaType).HasMaxLength(128); e.Property(x => x.Sha256).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Classification).HasMaxLength(24); e.Property(x => x.ScanStatus).HasMaxLength(24); e.Property(x => x.LifecycleStatus).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.BlobPathHash).IsUnique(); });
+        model.Entity<FileAssetLink>(e => { e.ToTable("file_asset_link", "storage"); e.HasKey(x => x.FileAssetLinkId); e.Property(x => x.FileAssetLinkId).UseIdentityByDefaultColumn(); e.Property(x => x.FileAssetId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.RelationshipType).HasMaxLength(32); e.Property(x => x.LinkedBy).HasMaxLength(64); e.HasIndex(x => new { x.ResourceType, x.ResourceId, x.RemovedAt }); });
         model.Entity<NotificationPreference>(e => { e.ToTable("notification_preference", "notification"); e.HasKey(x => new { x.MemberId, x.PurposeCode }); ConfigureVersion(e.Property(x => x.RowVersion)); });
+        model.Entity<MemberDevice>(e => { e.ToTable("member_device", "iam"); e.HasKey(x => x.DeviceId); e.Property(x => x.DeviceId).HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Platform).HasMaxLength(16); e.Property(x => x.AppVersion).HasMaxLength(32); e.Property(x => x.Status).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.Status }); });
+        // The foreign key makes EF insert a new device before its token in one save.
+        model.Entity<PushToken>(e => { e.ToTable("push_token", "notification"); e.HasKey(x => x.PushTokenId); e.Property(x => x.PushTokenId).UseIdentityByDefaultColumn(); e.Property(x => x.DeviceId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(24); e.Property(x => x.TokenCiphertext).HasColumnType("bytea"); e.Property(x => x.TokenFingerprint).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.TokenFingerprint).IsUnique(); e.HasOne<MemberDevice>().WithMany().HasForeignKey(x => x.DeviceId); });
         model.Entity<ModerationCase>(e => { e.ToTable("moderation_case", "moderation"); e.HasKey(x => x.ModerationCaseId); e.Property(x => x.ModerationCaseId).HasMaxLength(64); e.Property(x => x.SourceType).HasMaxLength(32); e.Property(x => x.SourceId).HasMaxLength(64); e.Property(x => x.SubjectMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Priority).HasMaxLength(16); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.AssignedTo).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<MemberReport>(e => { e.ToTable("member_report", "social"); e.HasKey(x => x.ReportId); e.Property(x => x.ReportId).HasMaxLength(64); e.Property(x => x.ReporterMemberId).HasMaxLength(64); e.Property(x => x.ReportedMemberId).HasMaxLength(64); e.Property(x => x.ResourceType).HasMaxLength(32); e.Property(x => x.ResourceId).HasMaxLength(64); e.Property(x => x.Category).HasMaxLength(64); e.Property(x => x.Description).HasMaxLength(2000); e.Property(x => x.Status).HasMaxLength(24); ConfigureVersion(e.Property(x => x.RowVersion)); });
         model.Entity<PrivacyRequest>(e => { e.ToTable("privacy_request", "consent"); e.HasKey(x => x.PrivacyRequestId); e.Property(x => x.PrivacyRequestId).HasMaxLength(64); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
+        // The foreign key makes EF insert the request before its tasks in one save.
+        model.Entity<PrivacyRequestTask>(e => { e.ToTable("privacy_request_task", "consent"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("privacy_request_task_id").UseIdentityByDefaultColumn(); e.HasOne<PrivacyRequest>().WithMany().HasForeignKey(x => x.PrivacyRequestId); });
         model.Entity<SyncChange>(e => { e.ToTable("sync_change", "ops"); e.HasKey(x => x.SyncSequence); e.Property(x => x.SyncSequence).ValueGeneratedOnAdd(); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.MemberScopeId, x.SyncSequence }); });
+        model.Entity<IdempotencyRecord>(e => { e.ToTable("idempotency_record", "ops"); e.HasKey(x => new { x.Scope, x.ActorId, x.IdempotencyKey }); e.Property(x => x.RequestHash).HasMaxLength(64).IsFixedLength(); });
         model.Entity<OutboxEvent>(e => { e.ToTable("outbox_event", "ops"); e.HasKey(x => x.OutboxEventId); e.Property(x => x.OutboxEventId).HasMaxLength(64); e.Property(x => x.PayloadJson).HasColumnType("jsonb"); e.HasIndex(x => new { x.PublishedAt, x.OccurredAt }); });
 
         foreach (var entity in model.Model.GetEntityTypes())

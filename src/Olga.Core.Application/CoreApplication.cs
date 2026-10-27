@@ -8,6 +8,7 @@ public interface ICoreStore
 {
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
+    IQueryable<MemberProfileImage> ProfileImages { get; }
     IQueryable<MemberAccount> Accounts { get; }
     IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
@@ -25,11 +26,16 @@ public interface ICoreStore
     IQueryable<ConversationParticipant> ConversationParticipants { get; }
     IQueryable<Message> Messages { get; }
     IQueryable<MessageReceipt> MessageReceipts { get; }
+    IQueryable<FileAsset> FileAssets { get; }
+    IQueryable<FileAssetLink> FileAssetLinks { get; }
     IQueryable<NotificationPreference> NotificationPreferences { get; }
+    IQueryable<MemberDevice> Devices { get; }
+    IQueryable<PushToken> PushTokens { get; }
     IQueryable<PrivacyRequest> PrivacyRequests { get; }
     IQueryable<SyncChange> SyncChanges { get; }
     IQueryable<ModerationCase> ModerationCases { get; }
     IQueryable<MemberReport> MemberReports { get; }
+    IQueryable<IdempotencyRecord> IdempotencyRecords { get; }
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
@@ -40,6 +46,8 @@ public interface ICoreStore
     Task<MessageReceipt> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
     // Reads nlp.nlp_match_result scores; empty when the store has no NLP data.
     Task<IReadOnlyList<MatchScore>> GetMatchScoresAsync(long[] matchResultIds, CancellationToken ct);
+    // Reads the member's own nlp.nlp_intent rows; empty when the store has no NLP data.
+    Task<IReadOnlyList<ExportIntent>> GetMemberIntentsAsync(string memberId, CancellationToken ct);
 }
 
 public sealed record MatchScore(long MatchResultId, string RequesterId, string CandidateId, decimal Score);
@@ -52,6 +60,9 @@ public interface ICoreService
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
+    Task<ProfileImageUploadResponse> UploadProfileImageAsync(string memberId, Stream content, long contentLength, string declaredContentType, string idempotencyKey, string? ifMatch, CancellationToken ct);
+    Task<ProfileResponse> DeleteProfileImageAsync(string memberId, string idempotencyKey, string? ifMatch, CancellationToken ct);
+    Task<ProfileImageContent> GetVisibleProfileImageAsync(string actorId, string memberId, string size, CancellationToken ct);
     Task<ConsentResponse> RecordConsentAsync(string memberId, ConsentRequest request, CancellationToken ct);
     Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct);
     // memberId is optional: when supplied, each event carries registration state for that member.
@@ -60,6 +71,8 @@ public interface ICoreService
     Task<EventAttendeesResponse> GetEventAttendeesAsync(string memberId, string eventId, CancellationToken ct);
     Task<LiveModeResponse> StartLiveModeAsync(string memberId, string eventId, LiveModeRequest request, CancellationToken ct);
     Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct);
+    // A retry with the same Idempotency-Key returns the session without extending it again.
+    Task<LiveModeResponse> ExtendLiveModeAsync(string memberId, string eventId, LiveModeExtendRequest request, string idempotencyKey, CancellationToken ct);
     Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct);
     // With context_id set the request is a Commit for that event.
     Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct);
@@ -69,21 +82,52 @@ public interface ICoreService
     Task<IReadOnlyList<MeetingSpotResponse>> GetMeetingSpotsAsync(string memberId, string eventId, CancellationToken ct);
     Task<IReadOnlyList<IncomingCommitResponse>> GetIncomingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
     Task<IReadOnlyList<OutgoingCommitResponse>> GetOutgoingCommitsAsync(string memberId, string? eventId, CancellationToken ct);
+    // Report or block the sender of a Commit sent to me, by request ID, so the sender is never revealed. 404 COMMIT_NOT_FOUND unless I am the recipient.
+    Task<MemberReportResponse> ReportIncomingCommitAsync(string memberId, string requestId, CommitReportRequest request, CancellationToken ct);
+    Task BlockIncomingCommitSenderAsync(string memberId, string requestId, CancellationToken ct);
     Task BlockAsync(string memberId, BlockRequest request, CancellationToken ct);
+    // Members I blocked and haven't unblocked, newest first.
+    Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct);
+    // Restores nothing: a connection or chat ended by the block stays ended.
+    Task UnblockAsync(string memberId, string blockedMemberId, CancellationToken ct);
     Task<IReadOnlyList<ConnectionResponse>> GetConnectionsAsync(string memberId, CancellationToken ct);
     // Newest activity first; cursor is the opaque next_cursor from the previous page.
     Task<ConversationListResponse> GetConversationsAsync(string memberId, string? cursor, int limit, CancellationToken ct);
     Task<ConversationResponse> GetConversationAsync(string memberId, string conversationId, CancellationToken ct);
     Task<ConversationResponse> MarkConversationReadAsync(string memberId, string conversationId, ConversationReadRequest request, string idempotencyKey, CancellationToken ct);
     Task<ConversationResponse> MuteConversationAsync(string memberId, string conversationId, ConversationMuteRequest request, CancellationToken ct);
+    // Stores a photo, PDF or voice note for a FILE message in this conversation; it expires unless sent.
+    Task<ChatAttachmentUploadResponse> UploadChatAttachmentAsync(string memberId, string conversationId, Stream content, long contentLength, string? declaredContentType, string? fileName, string idempotencyKey, CancellationToken ct);
     Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct);
+    // Either participant of an open conversation; served only once the file has been scanned clean.
+    Task<ChatFileContent> GetMessageAttachmentAsync(string memberId, string messageId, CancellationToken ct);
+    // Tells the other member "typing…" in realtime; nothing is stored. Forbidden like sending.
+    Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct);
     Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct);
     Task DeleteMessageAsync(string memberId, string messageId, CancellationToken ct);
     Task<MessageReportResponse> ReportMessageAsync(string memberId, string messageId, MessageReportRequest request, CancellationToken ct);
+    Task<MemberReportResponse> ReportMemberAsync(string memberId, string reportedMemberId, MemberReportRequest request, CancellationToken ct);
     Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct);
     Task<NotificationPreferenceResponse> SetNotificationPreferenceAsync(string memberId, NotificationPreferenceRequest request, CancellationToken ct);
+    // Registers or refreshes this installation for the member; with a push token, replaces the device's previous token.
+    Task<DeviceResponse> RegisterDeviceAsync(string memberId, string deviceId, DeviceRegistrationRequest request, CancellationToken ct);
+    // Sign-out: the device stops receiving pushes. 404 DEVICE_NOT_FOUND unless the device is the member's.
+    Task RevokeDeviceAsync(string memberId, string deviceId, CancellationToken ct);
     Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct);
+    Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct);
+    // Also records a completed EXPORT privacy request so admin can see it happened.
+    Task<DataExportResponse> ExportMyDataAsync(string memberId, CancellationToken ct);
     Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct);
+}
+
+public sealed record ProfileImageContent(Stream Content, string ContentType, string ETag);
+
+public interface IProfileImageStorage
+{
+    Task UploadAsync(string blobPath, Stream content, string contentType, CancellationToken ct);
+    Task<Stream> OpenReadAsync(string blobPath, CancellationToken ct);
+    Task<MalwareScanResult> GetMalwareScanResultAsync(string blobPath, CancellationToken ct);
+    Task DeleteIfExistsAsync(string blobPath, CancellationToken ct);
 }
 
 public sealed record ProtectedIdentity(string Provider, string SubjectHash, byte[] SubjectCiphertext, string DisplayHint, bool IsPrimary, bool IsVerified);
@@ -105,10 +149,12 @@ public interface IIdentityProtector
     ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
     // Keyed lookup hash for an email, identical to the SubjectHash ProtectEmail stores.
     string EmailLookupHash(string email);
+    // SubjectHash is the token's keyed fingerprint; DisplayHint is empty.
+    ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token);
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
-public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector) : ICoreService
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null, IChatTypingPublisher? typingPublisher = null) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -127,6 +173,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var identities = new List<ProtectedIdentity>(2);
         if (!string.IsNullOrWhiteSpace(request.Email)) identities.Add(identityProtector.ProtectEmail(memberId, request.Email, true));
         if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0));
+        // An email or phone whose member is waiting for deletion can't come back as that member or a new one.
+        foreach (var identity in identities)
+        {
+            var existing = store.Identities.Where(x => x.Provider == identity.Provider && x.ProviderSubjectHash == identity.SubjectHash).Select(x => x.MemberId).FirstOrDefault();
+            if (existing is not null && IsDeletionPending(existing)) throw DeletionPending(existing);
+        }
 
         var member = new NewMemberRegistration(
             memberId,
@@ -153,6 +205,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Where(x => x.Provider == "EMAIL" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE")
             .Select(x => x.MemberId)
             .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        if (IsDeletionPending(memberId)) throw DeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
         var mapped = Map(profile);
         return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
@@ -167,6 +220,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        EnsureNotDeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
         return Task.FromResult(WithContactHints(Map(profile)));
     }
@@ -182,10 +236,98 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(actorId == memberId || IsConnected(actorId, memberId) ? mapped : mapped with { DisplayName = null });
     }
 
+    public async Task<ProfileImageUploadResponse> UploadProfileImageAsync(string memberId, Stream content, long contentLength, string declaredContentType, string idempotencyKey, string? ifMatch, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (contentLength is <= 0 or > 5 * 1024 * 1024) throw new DomainException("PROFILE_IMAGE_SIZE_INVALID", 413);
+        var contentType = declaredContentType.Trim().ToLowerInvariant();
+        if (contentType is not ("image/jpeg" or "image/png" or "image/webp")) throw new DomainException("PROFILE_IMAGE_TYPE_INVALID", 415);
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        var imageId = $"img_{Hash("core.profile_image", memberId, idempotencyKey)[..32]}";
+        var existing = store.ProfileImages.SingleOrDefault(x => x.ImageId == imageId);
+        if (existing is not null)
+        {
+            if (existing.ContentLength != contentLength || !string.Equals(existing.DeclaredContentType, contentType, StringComparison.Ordinal))
+                throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return new(existing.ImageId, existing.Status, $"\"{profile.Version}\"");
+        }
+        EnsureProfileEtag(profile, ifMatch);
+
+        var blobPath = OriginalImagePath(memberId, imageId);
+        await using var buffered = new MemoryStream((int)contentLength);
+        await content.CopyToAsync(buffered, ct);
+        if (buffered.Length != contentLength) throw new DomainException("PROFILE_IMAGE_SIZE_INVALID", 413);
+        var contentSha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(buffered.GetBuffer().AsSpan(0, (int)buffered.Length))).ToLowerInvariant();
+        buffered.Position = 0;
+        await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
+            .UploadAsync(blobPath, buffered, contentType, ct);
+        store.Add(new MemberProfileImage
+        {
+            ImageId = imageId,
+            MemberId = memberId,
+            OriginalBlobPath = blobPath,
+            DeclaredContentType = contentType,
+            ContentLength = contentLength,
+            ContentSha256 = contentSha256
+        });
+        TouchProfile(profile);
+        AddOutbox("PROFILE_IMAGE", imageId, "ProfileImageUploaded.v1", new { image_id = imageId, member_id = memberId });
+        await store.SaveAsync(ct);
+        return new(imageId, "PENDING", $"\"{profile.Version}\"");
+    }
+
+    public async Task<ProfileResponse> DeleteProfileImageAsync(string memberId, string idempotencyKey, string? ifMatch, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        const string scope = "core.profile_image.delete";
+        var requestHash = Hash(scope, memberId);
+        var replay = store.IdempotencyRecords.SingleOrDefault(x => x.Scope == scope && x.ActorId == memberId && x.IdempotencyKey == idempotencyKey);
+        if (replay is not null)
+        {
+            if (!string.Equals(replay.RequestHash, requestHash, StringComparison.Ordinal)) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return WithContactHints(Map(profile));
+        }
+        EnsureProfileEtag(profile, ifMatch);
+        var now = DateTimeOffset.UtcNow;
+        var affected = store.ProfileImages.Where(x => x.MemberId == memberId && (x.Id == profile.ProfileImageId || x.Status == "PENDING" || x.Status == "PROCESSING")).ToList();
+        foreach (var image in affected.Where(x => x.Status is "PENDING" or "PROCESSING"))
+        {
+            image.Status = "FAILED";
+            image.FailureCode = "PROFILE_IMAGE_REMOVED";
+            image.ProcessedAt = now;
+            image.UpdatedAt = now;
+            if (!store.IsRelational) image.RowVersion++;
+        }
+        profile.ProfileImageId = null;
+        TouchProfile(profile);
+        AddOutbox("MEMBER", memberId, "ProfileImageRemoved.v1", new { member_id = memberId, image_ids = affected.Select(x => x.ImageId).ToArray() });
+        store.Add(new IdempotencyRecord { Scope = scope, ActorId = memberId, IdempotencyKey = idempotencyKey, RequestHash = requestHash, StatusCode = 200, ExpiresAt = now.AddHours(24) });
+        await store.SaveAsync(ct);
+        return WithContactHints(Map(profile));
+    }
+
+    public async Task<ProfileImageContent> GetVisibleProfileImageAsync(string actorId, string memberId, string size, CancellationToken ct)
+    {
+        _ = await GetVisibleProfileAsync(actorId, memberId, ct);
+        var normalizedSize = size.Trim().ToLowerInvariant();
+        var pixels = normalizedSize switch { "thumbnail" => 64, "small" => 256, "large" => 512, _ => throw new DomainException("PROFILE_IMAGE_SIZE_INVALID") };
+        var profile = FindProfile(memberId);
+        if (profile.ProfileImageId is null) throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
+        var image = store.ProfileImages.SingleOrDefault(x => x.Id == profile.ProfileImageId && x.MemberId == memberId && x.Status == "APPROVED")
+            ?? throw new DomainException("PROFILE_IMAGE_NOT_FOUND", 404);
+        var stream = await (profileImageStorage ?? throw new InvalidOperationException("Profile image storage is not configured."))
+            .OpenReadAsync(DerivativeImagePath(memberId, image.ImageId, pixels), ct);
+        return new(stream, "image/webp", $"\"{image.RowVersion}\"");
+    }
+
     public async Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(request.DisplayName) || request.DisplayName.Length > 200) throw new DomainException("PROFILE_INVALID");
         if (request.Visibility is not ("PUBLIC" or "MEMBERS" or "CONNECTED" or "HIDDEN")) throw new DomainException("PROFILE_VISIBILITY_INVALID");
+        EnsureNotDeletionPending(memberId);
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId);
         if (profile is null)
         {
@@ -232,6 +374,20 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         };
     }
 
+    private void EnsureProfileEtag(MemberProfile profile, string? ifMatch)
+    {
+        var isInitialDraft = profile.Status == "DRAFT" && profile.PublishedAt is null && string.IsNullOrWhiteSpace(profile.DisplayName);
+        if (string.IsNullOrWhiteSpace(ifMatch) && !isInitialDraft) throw new DomainException("IF_MATCH_REQUIRED", 428);
+        if (!string.IsNullOrWhiteSpace(ifMatch) && !string.Equals(ifMatch.Trim('"'), profile.Version.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal))
+            throw new DomainException("RESOURCE_VERSION_CONFLICT", 409);
+    }
+
+    private void TouchProfile(MemberProfile profile)
+    {
+        profile.UpdatedAt = DateTimeOffset.UtcNow;
+        if (!store.IsRelational) profile.Version++;
+    }
+
     public Task<ActiveConsentPolicyResponse> GetActiveConsentPolicyAsync(string memberId, string purposeCode, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -257,6 +413,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (request.Decision is not ("GRANTED" or "WITHDRAWN" or "DENIED") || string.IsNullOrWhiteSpace(request.PurposeCode))
             throw new DomainException("CONSENT_INVALID");
         if (request.CaptureChannel is not ("MOBILE" or "WEB_ADMIN" or "SUPPORT")) throw new DomainException("CONSENT_CAPTURE_CHANNEL_INVALID");
+        // Withdrawing stays possible after a deletion request; granting doesn't.
+        if (request.Decision == "GRANTED") EnsureNotDeletionPending(memberId);
         var now = DateTimeOffset.UtcNow;
         var policy = store.ConsentPolicies.Where(x => x.PurposeCode == request.PurposeCode && x.Version == request.PolicyVersion && x.EffectiveFrom <= now && (x.RetiredAt == null || x.RetiredAt > now)).OrderByDescending(x => x.EffectiveFrom).FirstOrDefault()
             ?? throw new DomainException("CONSENT_POLICY_NOT_ACTIVE", 409);
@@ -337,8 +495,8 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .Where(x => x.RemovedAt == null && ((x.BlockerMemberId == memberId && ids.Contains(x.BlockedMemberId)) || (x.BlockedMemberId == memberId && ids.Contains(x.BlockerMemberId))))
             .Select(x => x.BlockerMemberId == memberId ? x.BlockedMemberId : x.BlockerMemberId)
             .ToHashSet();
-        var profiles = store.Profiles
-            .Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE" && x.Visibility != "HIDDEN")
+        var profiles = ActiveProfileRows
+            .Where(x => ids.Contains(x.MemberId) && x.Visibility != "HIDDEN")
             .ToDictionary(x => x.MemberId);
 
         var visible = registrations
@@ -352,6 +510,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<RegistrationResponse> RegisterAsync(string memberId, string eventId, CancellationToken ct)
     {
         _ = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
         var row = store.Registrations.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId);
         if (row is null) { row = new EventRegistration { EventId = eventId, MemberId = memberId }; store.Add(row); }
         AddChange(memberId, "EVENT_REGISTRATION", eventId, "UPSERT", new { event_id = eventId, status = row.Status });
@@ -366,7 +525,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
         // Mirror event.enforce_live_mode_session_consent so callers get a specific code, not RESOURCE_STATE_CONFLICT.
         var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
-        if (account is not null && account.Status != "ACTIVE") throw new DomainException("MEMBER_NOT_ACTIVE", 403);
+        if (account is not null && (account.Status != "ACTIVE" || account.DeletedAt is not null)) throw new DomainException("MEMBER_NOT_ACTIVE", 403);
         if (!store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN")))
             throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         if (!HasConsent(memberId, "LIVE_MODE")) throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
@@ -392,6 +551,36 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Map(row);
     }
 
+    public async Task<LiveModeResponse> ExtendLiveModeAsync(string memberId, string eventId, LiveModeExtendRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (request.DurationMinutes is < 5 or > 240) throw new DomainException("LIVE_MODE_DURATION_INVALID");
+        var evt = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
+        var now = DateTimeOffset.UtcNow;
+        var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE");
+        const string scope = "event.extend_live_mode";
+        var requestHash = Hash(scope, memberId, eventId, request.DurationMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var replay = store.IdempotencyRecords.SingleOrDefault(x => x.Scope == scope && x.ActorId == memberId && x.IdempotencyKey == idempotencyKey);
+        if (replay is not null)
+        {
+            if (replay.RequestHash != requestHash) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return session?.SessionId == replay.ResponseRef ? Map(session!) : throw new DomainException("LIVE_MODE_NOT_ACTIVE", 409);
+        }
+        if (session is null || session.ActiveUntil <= now || evt.EndsAt <= now) throw new DomainException("LIVE_MODE_NOT_ACTIVE", 409);
+        if (!evt.LiveModeEnabled) throw new DomainException("LIVE_MODE_DISABLED", 409);
+        // Same rule as Go Live: the database rejects an active session on an older or withdrawn LIVE_MODE consent.
+        var consent = LatestGrantedConsent(memberId, "LIVE_MODE") ?? throw new DomainException("LIVE_MODE_CONSENT_REQUIRED", 403);
+        // Only active_until moves: no new match request, so the member keeps the same matches.
+        session.ActiveUntil = Min(session.ActiveUntil.AddMinutes(request.DurationMinutes), evt.EndsAt);
+        session.ConsentRecordId = consent.Id;
+        store.Add(new IdempotencyRecord { Scope = scope, IdempotencyKey = idempotencyKey, ActorId = memberId, RequestHash = requestHash, StatusCode = 200, ResponseRef = session.SessionId, ExpiresAt = now.AddHours(24) });
+        AddChange(memberId, "LIVE_MODE", eventId, "UPSERT", new { session.SessionId, event_id = eventId, session.Status, session.ActiveUntil });
+        AddOutbox("LIVE_MODE", session.SessionId, "LiveModeChanged.v1", new { session_id = session.SessionId, event_id = eventId, member_id = memberId, session.Status, session.ActiveUntil });
+        await store.SaveAsync(ct);
+        return Map(session);
+    }
+
     public async Task StopLiveModeAsync(string memberId, string eventId, CancellationToken ct)
     {
         var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE") ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 404);
@@ -404,6 +593,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task RecordPresenceAsync(string memberId, string eventId, PresenceRequest request, CancellationToken ct)
     {
         _ = FindEventFor(memberId, eventId);
+        EnsureNotDeletionPending(memberId);
         if (string.IsNullOrWhiteSpace(request.CoarseCell) || request.CoarseCell.Length > 32 || request.Source is not ("CHECK_IN" or "FOREGROUND_GEO" or "VENUE_ZONE")) throw new DomainException("PRESENCE_INVALID");
         var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE" && x.ActiveUntil > DateTimeOffset.UtcNow)
             ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 403);
@@ -417,6 +607,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     public async Task<ConnectionRequestResponse> CreateConnectionRequestAsync(string senderId, ConnectionRequestCreate request, string idempotencyKey, CancellationToken ct)
     {
         if (senderId == request.RecipientMemberId) throw new DomainException("SELF_CONNECTION_INVALID");
+        EnsureNotDeletionPending(senderId);
         if (request.ContextId is not null) return await CreateCommitAsync(senderId, request, idempotencyKey, ct);
         _ = FindProfile(senderId);
         _ = FindProfile(request.RecipientMemberId);
@@ -451,7 +642,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (plan.WhereType == "SPOT") throw new DomainException("MEETING_SPOT_NOT_FOUND", 404);
         _ = FindProfile(senderId);
         // A blocked or hidden recipient looks like an unknown one, so a block is never revealed.
-        if (!store.Profiles.Any(x => x.MemberId == request.RecipientMemberId && x.Status == "ACTIVE") || IsBlocked(senderId, request.RecipientMemberId))
+        if (!ActiveProfileRows.Any(x => x.MemberId == request.RecipientMemberId) || IsBlocked(senderId, request.RecipientMemberId))
             throw new DomainException("PROFILE_NOT_FOUND", 404);
         if (!IsAttending(evt.EventId, senderId)) throw new DomainException("EVENT_REGISTRATION_REQUIRED", 403);
         var now = DateTimeOffset.UtcNow;
@@ -501,7 +692,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var rows = store.ConnectionRequests
             .Where(x => x.RecipientMemberId == memberId && x.Status == "PENDING" && x.ExpiresAt > now && x.ContextId != null && (eventId == null || x.ContextId == eventId))
             .OrderByDescending(x => x.CreatedAt).Take(100).ToArray();
-        var blocked = BlockedAmong(memberId, rows.Select(x => x.SenderMemberId).Distinct().ToArray());
+        var senders = rows.Select(x => x.SenderMemberId).Distinct().ToArray();
+        var blocked = BlockedAmong(memberId, senders);
+        blocked.UnionWith(store.Accounts.Where(x => senders.Contains(x.MemberId) && x.DeletedAt != null).Select(x => x.MemberId));
         rows = rows.Where(x => !blocked.Contains(x.SenderMemberId)).ToArray();
         var events = CommitEvents(rows);
         var profiles = ActiveProfiles(rows.Select(x => x.SenderMemberId));
@@ -546,7 +739,10 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<ConnectionResponse?> DecideConnectionRequestAsync(string memberId, string requestId, ConnectionDecisionRequest request, string idempotencyKey, CancellationToken ct)
     {
+        EnsureNotDeletionPending(memberId);
         var row = store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId && x.RecipientMemberId == memberId) ?? throw new DomainException("CONNECTION_REQUEST_NOT_FOUND", 404);
+        // A request from a member who is deleting their account is gone, as it is in the incoming list.
+        if (IsDeletionPending(row.SenderMemberId)) throw new DomainException("CONNECTION_REQUEST_NOT_FOUND", 404);
         var isCommit = row.ContextId is not null;
         if (isCommit && row.Status != "PENDING") throw new DomainException("COMMIT_NOT_PENDING", 409);
         if (isCommit && row.ExpiresAt <= DateTimeOffset.UtcNow) throw new DomainException("COMMIT_EXPIRED", 409);
@@ -595,6 +791,45 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         foreach (var connection in store.Connections.Where(x => x.Status == "ACTIVE" && ((x.MemberLowId == memberId && x.MemberHighId == request.MemberId) || (x.MemberLowId == request.MemberId && x.MemberHighId == memberId))).ToArray()) { connection.Status = "DISCONNECTED"; connection.DisconnectedAt = DateTimeOffset.UtcNow; }
         foreach (var id in new[] { memberId, request.MemberId }) AddChange(id, "CONNECTION", PairKey(memberId, request.MemberId), "DELETE", null);
         AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, request.MemberId).Low, Pair(memberId, request.MemberId).High), "MemberBlocked.v1", new { actor_member_id = memberId, target_member_id = request.MemberId });
+        await store.SaveAsync(ct);
+    }
+
+    public Task<MemberReportResponse> ReportIncomingCommitAsync(string memberId, string requestId, CommitReportRequest request, CancellationToken ct)
+    {
+        var commit = RequireIncomingCommit(memberId, requestId);
+        return ReportMemberAsync(memberId, commit.SenderMemberId, new(request.Category, request.Description, "REQUEST", requestId), ct);
+    }
+
+    public Task BlockIncomingCommitSenderAsync(string memberId, string requestId, CancellationToken ct)
+    {
+        var commit = RequireIncomingCommit(memberId, requestId);
+        // Declined silently: the sender's outgoing list shows a decline exactly like a pending Commit.
+        if (commit.Status == "PENDING") { commit.Status = "DECLINED"; commit.RespondedAt = DateTimeOffset.UtcNow; commit.UpdatedAt = commit.RespondedAt.Value; }
+        return BlockAsync(memberId, new(commit.SenderMemberId), ct);
+    }
+
+    // Any status counts, so a declined, expired or accepted Commit can still be reported or blocked.
+    private ConnectionRequest RequireIncomingCommit(string memberId, string requestId) =>
+        store.ConnectionRequests.SingleOrDefault(x => x.RequestId == requestId && x.RecipientMemberId == memberId && x.ContextId != null) ?? throw new DomainException("COMMIT_NOT_FOUND", 404);
+
+    public Task<IReadOnlyList<BlockedMemberResponse>> GetBlocksAsync(string memberId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var blocks = store.Blocks.Where(x => x.BlockerMemberId == memberId && x.RemovedAt == null).OrderByDescending(x => x.CreatedAt).ThenByDescending(x => x.Id).ToArray();
+        var ids = blocks.Select(x => x.BlockedMemberId).ToArray();
+        // Any profile row, not only active ones, so a hidden member can still be found and unblocked.
+        var names = store.Profiles.Where(x => ids.Contains(x.MemberId)).ToDictionary(x => x.MemberId, x => x.DisplayName);
+        IReadOnlyList<BlockedMemberResponse> result = blocks
+            .Select(x => new BlockedMemberResponse(x.BlockedMemberId, string.IsNullOrWhiteSpace(names.GetValueOrDefault(x.BlockedMemberId)) ? null : names[x.BlockedMemberId], x.CreatedAt))
+            .ToArray();
+        return Task.FromResult(result);
+    }
+
+    public async Task UnblockAsync(string memberId, string blockedMemberId, CancellationToken ct)
+    {
+        var block = store.Blocks.FirstOrDefault(x => x.BlockerMemberId == memberId && x.BlockedMemberId == blockedMemberId && x.RemovedAt == null) ?? throw new DomainException("BLOCK_NOT_FOUND", 404);
+        block.RemovedAt = DateTimeOffset.UtcNow;
+        AddOutbox("MEMBER_RELATIONSHIP", AggregateKey(Pair(memberId, blockedMemberId).Low, Pair(memberId, blockedMemberId).High), "MemberUnblocked.v1", new { actor_member_id = memberId, target_member_id = blockedMemberId });
         await store.SaveAsync(ct);
     }
 
@@ -648,6 +883,12 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             // Per-message keys and hashes leave out readAt so a retry of the same request replays cleanly.
             foreach (var message in unread)
                 await store.SaveMessageReceiptAsync(memberId, message.MessageId, new(ReadAt: readAt), $"read:{Hash(idempotencyKey, message.MessageId)[..59]}", Hash("chat.conversation_read", memberId, message.MessageId, idempotencyKey), ct);
+            // Written after the receipts, so a crash in between loses only this event; clients recover through REST.
+            if (unread.Length > 0)
+            {
+                AddConversationRead(memberId, connection, conversationId, unread[^1], readAt);
+                await store.SaveAsync(ct);
+            }
         }
         else if (unread.Length > 0)
         {
@@ -660,6 +901,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var participant = store.ConversationParticipants.SingleOrDefault(x => x.ConversationId == conversationId && x.MemberId == memberId);
             var current = participant?.LastReadMessageId is null ? 0 : store.Messages.Where(x => x.MessageId == participant.LastReadMessageId).Select(x => x.ServerSequence).SingleOrDefault();
             if (participant is not null && unread[^1].ServerSequence > current) participant.LastReadMessageId = unread[^1].MessageId;
+            AddConversationRead(memberId, connection, conversationId, unread[^1], readAt);
             await store.SaveAsync(ct);
         }
         return BuildConversations(memberId, [connection]).Single(x => x.ConversationId == conversationId);
@@ -678,23 +920,122 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     public async Task<MessageResponse> SendMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))) throw new DomainException("MESSAGE_INVALID");
+        var isFile = request.MessageType == "FILE";
+        if (string.IsNullOrWhiteSpace(request.MessageId) || request.MessageType is not ("TEXT" or "FILE" or "SYSTEM") || request.Body?.Length > 4000 || (request.MessageType == "TEXT" && string.IsNullOrWhiteSpace(request.Body))
+            || isFile != !string.IsNullOrWhiteSpace(request.FileAssetId) || request.FileAssetId?.Length > 64) throw new DomainException("MESSAGE_INVALID");
+        EnsureNotDeletionPending(memberId);
         if (store.IsRelational)
-            return Map(await store.SaveMessageAsync(memberId, conversationId, request, idempotencyKey, Hash(memberId, conversationId, request.MessageId, request.MessageType, request.Body, request.ClientSentAt?.ToString("O")), ct));
+        {
+            // The file asset joins the hash only when present, so TEXT hashes are unchanged.
+            string?[] hashed = [memberId, conversationId, request.MessageId, request.MessageType, request.Body, request.ClientSentAt?.ToString("O"), .. isFile ? new[] { request.FileAssetId } : []];
+            var saved = await store.SaveMessageAsync(memberId, conversationId, request, idempotencyKey, Hash(hashed), ct);
+            return Map(saved, AttachmentsFor([saved]));
+        }
         var conversation = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404);
         var connection = store.Connections.Single(x => x.ConnectionId == conversation.ConnectionId);
         if (connection.Status != "ACTIVE" || (connection.MemberLowId != memberId && connection.MemberHighId != memberId)) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
         var other = connection.MemberLowId == memberId ? connection.MemberHighId : connection.MemberLowId;
         if (IsBlocked(memberId, other)) throw new DomainException("CONVERSATION_FORBIDDEN", 403);
         var existing = store.Messages.SingleOrDefault(x => x.MessageId == request.MessageId);
-        if (existing is not null) return Map(existing);
+        if (existing is not null) return Map(existing, AttachmentsFor([existing]));
+        FileAsset? asset = null;
+        if (isFile)
+        {
+            asset = store.FileAssets.SingleOrDefault(x => x.FileAssetId == request.FileAssetId);
+            var linked = store.FileAssetLinks.Where(x => x.FileAssetId == request.FileAssetId && x.ResourceType == "MESSAGE" && x.RemovedAt == null).Select(x => x.ResourceId).FirstOrDefault();
+            ChatFiles.EnsureAttachable(asset, linked, memberId, conversationId, request.MessageId, DateTimeOffset.UtcNow);
+        }
         var sequence = store.Messages.Where(x => x.ConversationId == conversationId).Select(x => x.ServerSequence).DefaultIfEmpty().Max() + 1;
         var row = new Message { MessageId = request.MessageId, ConversationId = conversationId, SenderMemberId = memberId, MessageType = request.MessageType, Body = request.Body, ClientSentAt = request.ClientSentAt, ServerSequence = sequence };
         store.Add(row);
+        if (asset is not null)
+        {
+            store.Add(new FileAssetLink { FileAssetId = asset.FileAssetId, ResourceType = "MESSAGE", ResourceId = row.MessageId, LinkedBy = memberId });
+            asset.ExpiresAt = null; asset.UpdatedAt = DateTimeOffset.UtcNow;
+        }
         foreach (var id in new[] { memberId, other }) AddChange(id, "MESSAGE", row.MessageId, "UPSERT", new { row.MessageId, row.ConversationId, row.SenderMemberId, row.Body, row.ServerSequence, row.CreatedAt });
         AddOutbox("MESSAGE", row.MessageId, "MessageCreated.v1", new { message_id = row.MessageId, conversation_id = conversationId, sender_member_id = memberId, recipient_member_id = other, row.ServerSequence });
         await store.SaveAsync(ct);
-        return Map(row);
+        return Map(row, AttachmentsFor([row]));
+    }
+
+    public async Task<ChatAttachmentUploadResponse> UploadChatAttachmentAsync(string memberId, string conversationId, Stream content, long contentLength, string? declaredContentType, string? fileName, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        var options = chatFileOptions ?? new ChatFileOptions();
+        if (contentLength <= 0) throw new DomainException("ATTACHMENT_REQUIRED");
+        if (contentLength > options.MaxBytes) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        EnsureNotDeletionPending(memberId);
+        RequireCanSend(memberId, conversationId);
+        var fileAssetId = $"fil_{Hash("chat.attachment", memberId, idempotencyKey)[..32]}";
+        var blobPath = ChatFiles.BlobPath(conversationId, fileAssetId);
+        var existing = store.FileAssets.SingleOrDefault(x => x.FileAssetId == fileAssetId);
+        if (existing is not null)
+        {
+            if (existing.BlobPath != blobPath || existing.SizeBytes != contentLength) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            return new(existing.FileAssetId, existing.MediaType, existing.SizeBytes, existing.FileName);
+        }
+
+        // Read at most one byte past the limit, so a wrong Content-Length can't push a larger file through.
+        using var buffer = new MemoryStream((int)contentLength);
+        var chunk = new byte[81920];
+        int read;
+        while ((read = await content.ReadAsync(chunk, ct)) > 0)
+        {
+            buffer.Write(chunk, 0, read);
+            if (buffer.Length > options.MaxBytes) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        }
+        var bytes = buffer.GetBuffer().AsMemory(0, (int)buffer.Length);
+        var detected = ChatFiles.Detect(bytes.Span, declaredContentType) ?? throw new DomainException("ATTACHMENT_TYPE_INVALID", 415);
+        if (bytes.Length > ChatFiles.MaxBytes(options, detected.Kind)) throw new DomainException("ATTACHMENT_TOO_LARGE", 413);
+        if (detected.DurationMs > options.AudioMaxSeconds * 1000L) throw new DomainException("ATTACHMENT_TOO_LONG", 413);
+
+        var safeName = ChatFiles.SafeFileName(fileName, detected);
+        await (chatFileStorage ?? throw new InvalidOperationException("Chat file storage is not configured."))
+            .UploadAsync(blobPath, new MemoryStream(buffer.GetBuffer(), 0, (int)buffer.Length, writable: false), detected.MediaType, ct);
+        var now = DateTimeOffset.UtcNow;
+        store.Add(new FileAsset
+        {
+            FileAssetId = fileAssetId,
+            CommunityId = MemberCommunity(memberId) ?? "",
+            OwnerMemberId = memberId,
+            PurposeCode = ChatFiles.Purpose,
+            ContainerName = ChatFiles.ContainerName,
+            BlobPath = blobPath,
+            BlobPathHash = Hash(ChatFiles.ContainerName, blobPath),
+            FileName = safeName,
+            MediaType = detected.MediaType,
+            SizeBytes = bytes.Length,
+            Sha256 = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes.Span)).ToLowerInvariant(),
+            ExpiresAt = now.AddHours(options.UnsentFileExpiryHours),
+            CreatedAt = now,
+            UpdatedAt = now
+        });
+        // For the scanner that will move scan_status from PENDING; downloads wait for CLEAN.
+        AddOutbox("FILE_ASSET", fileAssetId, "ChatFileUploaded.v1", new { file_asset_id = fileAssetId, conversation_id = conversationId, owner_member_id = memberId, container_name = ChatFiles.ContainerName, media_type = detected.MediaType, size_bytes = bytes.Length });
+        await store.SaveAsync(ct);
+        return new(fileAssetId, detected.MediaType, bytes.Length, safeName);
+    }
+
+    public async Task<ChatFileContent> GetMessageAttachmentAsync(string memberId, string messageId, CancellationToken ct)
+    {
+        var message = store.Messages.SingleOrDefault(x => x.MessageId == messageId && x.DeletedAt == null) ?? throw new DomainException("MESSAGE_NOT_FOUND", 404);
+        RequireCanSend(memberId, message.ConversationId);
+        var asset = (from link in store.FileAssetLinks
+                     join file in store.FileAssets on link.FileAssetId equals file.FileAssetId
+                     where link.ResourceType == "MESSAGE" && link.ResourceId == messageId && link.RemovedAt == null
+                     select file).FirstOrDefault();
+        if (asset is null || asset.LifecycleStatus is "DELETED" or "EXPIRED" or "QUARANTINED") throw new DomainException("ATTACHMENT_NOT_FOUND", 404);
+        if (asset.ScanStatus != "CLEAN") throw new DomainException("ATTACHMENT_NOT_AVAILABLE", 409);
+        var stream = await (chatFileStorage ?? throw new InvalidOperationException("Chat file storage is not configured."))
+            .OpenReadAsync(asset.BlobPath, ct);
+        return new(stream, asset.MediaType, asset.FileName, $"\"{asset.FileAssetId}\"");
+    }
+
+    public async Task StartTypingAsync(string memberId, string conversationId, CancellationToken ct)
+    {
+        var connection = RequireCanSend(memberId, conversationId);
+        if (typingPublisher is not null) await typingPublisher.PublishAsync(memberId, OtherMember(connection, memberId), conversationId, ct);
     }
 
     public async Task<MessageReceiptResponse> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, CancellationToken ct)
@@ -730,7 +1071,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         // Soft delete: the body stays in the database for moderation but is never returned again.
         var now = DateTimeOffset.UtcNow;
         message.DeletedAt = now; message.UpdatedAt = now;
-        foreach (var id in new[] { memberId, OtherMember(connection, memberId) }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        var other = OtherMember(connection, memberId);
+        foreach (var id in new[] { memberId, other }) AddChange(id, "MESSAGE", messageId, "DELETE", null);
+        AddOutbox("MESSAGE", messageId, "MessageDeleted.v1", new { message_id = messageId, conversation_id = message.ConversationId, sender_member_id = memberId, recipient_member_id = other, server_sequence = message.ServerSequence, deleted_at = now });
         await store.SaveAsync(ct);
     }
 
@@ -753,11 +1096,45 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return new(report.ReportId, messageId, report.Category, report.Status, report.CreatedAt);
     }
 
+    public async Task<MemberReportResponse> ReportMemberAsync(string memberId, string reportedMemberId, MemberReportRequest request, CancellationToken ct)
+    {
+        if (memberId == reportedMemberId) throw new DomainException("SELF_REPORT_INVALID");
+        var category = request.Category?.Trim().ToUpperInvariant();
+        var resourceType = string.IsNullOrWhiteSpace(request.ResourceType) ? null : request.ResourceType.Trim().ToUpperInvariant();
+        var resourceId = string.IsNullOrWhiteSpace(request.ResourceId) ? null : request.ResourceId.Trim();
+        if (category is not ("SPAM" or "HARASSMENT" or "INAPPROPRIATE" or "FAKE_PROFILE" or "OTHER") || request.Description?.Length > 2000
+            || resourceType is not (null or "PROFILE" or "REQUEST" or "MESSAGE") || resourceId?.Length > 64 || (resourceId is not null && resourceType is null))
+            throw new DomainException("MEMBER_REPORT_INVALID");
+        // Any profile row counts, so a member who blocked or hid from the reporter can still be reported without revealing it.
+        if (!store.Profiles.Any(x => x.MemberId == reportedMemberId)) throw new DomainException("PROFILE_NOT_FOUND", 404);
+        // A named resource must belong to the reported member and involve the reporter.
+        var resourceValid = (resourceType, resourceId) switch
+        {
+            (_, null) => true,
+            ("PROFILE", _) => resourceId == reportedMemberId,
+            ("REQUEST", _) => store.ConnectionRequests.Any(x => x.RequestId == resourceId && ((x.SenderMemberId == reportedMemberId && x.RecipientMemberId == memberId) || (x.SenderMemberId == memberId && x.RecipientMemberId == reportedMemberId))),
+            _ => store.Messages.Any(x => x.MessageId == resourceId && x.SenderMemberId == reportedMemberId
+                && store.Conversations.Any(c => c.ConversationId == x.ConversationId && store.Connections.Any(n => n.ConnectionId == c.ConnectionId && (n.MemberLowId == memberId || n.MemberHighId == memberId))))
+        };
+        if (!resourceValid) throw new DomainException("MEMBER_REPORT_INVALID");
+        // One open report per reporter and member: open until admin actions or closes its case.
+        var open = store.MemberReports.Any(x => x.ReporterMemberId == memberId && x.ReportedMemberId == reportedMemberId && x.Status == "OPEN"
+            && store.ModerationCases.Any(c => c.SourceType == "MEMBER_REPORT" && c.SourceId == x.ReportId && (c.Status == "OPEN" || c.Status == "TRIAGED")));
+        if (open) throw new DomainException("REPORT_ALREADY_OPEN", 409);
+        var report = new MemberReport { ReporterMemberId = memberId, ReportedMemberId = reportedMemberId, ResourceType = resourceType ?? "PROFILE", ResourceId = resourceId ?? reportedMemberId, Category = category, Description = string.IsNullOrWhiteSpace(request.Description) ? null : request.Description.Trim() };
+        store.Add(report);
+        store.Add(new ModerationCase { SourceType = "MEMBER_REPORT", SourceId = report.ReportId, SubjectMemberId = reportedMemberId, ResourceType = report.ResourceType, ResourceId = report.ResourceId });
+        await store.SaveAsync(ct);
+        return new(report.ReportId, report.Category, report.Status, report.CreatedAt);
+    }
+
     public Task<IReadOnlyList<MessageResponse>> GetMessagesAsync(string memberId, string conversationId, long after, int limit, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         _ = RequireConversationMember(memberId, conversationId);
-        IReadOnlyList<MessageResponse> result = store.Messages.Where(x => x.ConversationId == conversationId && x.ServerSequence > after).OrderBy(x => x.ServerSequence).Take(Math.Clamp(limit, 1, 100)).AsEnumerable().Select(Map).ToArray();
+        var page = store.Messages.Where(x => x.ConversationId == conversationId && x.ServerSequence > after).OrderBy(x => x.ServerSequence).Take(Math.Clamp(limit, 1, 100)).ToArray();
+        var attachments = AttachmentsFor(page);
+        IReadOnlyList<MessageResponse> result = page.Select(x => Map(x, attachments)).ToArray();
         return Task.FromResult(result);
     }
 
@@ -772,15 +1149,148 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return new(row.PurposeCode, row.PushEnabled, row.EmailEnabled, row.QuietStartLocal, row.QuietEndLocal, row.TimezoneId, $"\"{row.RowVersion}\"", row.UpdatedAt);
     }
 
+    public async Task<DeviceResponse> RegisterDeviceAsync(string memberId, string deviceId, DeviceRegistrationRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId) || deviceId.Length > 64 || request.Platform is not ("IOS" or "ANDROID")
+            || string.IsNullOrWhiteSpace(request.AppVersion) || request.AppVersion.Length > 32
+            || (request.PushProvider is null) != string.IsNullOrWhiteSpace(request.PushToken)
+            || request.PushProvider is not (null or "APNS" or "FCM") || request.PushToken?.Length > 4096)
+            throw new DomainException("DEVICE_REGISTRATION_INVALID");
+        EnsureNotDeletionPending(memberId);
+        var now = DateTimeOffset.UtcNow;
+        var device = store.Devices.SingleOrDefault(x => x.DeviceId == deviceId);
+        if (device is null) { device = new MemberDevice { DeviceId = deviceId, CreatedAt = now }; store.Add(device); }
+        // The same installation signing in as another member moves to that member; tokens follow the device.
+        device.MemberId = memberId; device.Platform = request.Platform; device.AppVersion = request.AppVersion.Trim();
+        device.Status = "ACTIVE"; device.RevokedAt = null; device.LastSeenAt = now; device.UpdatedAt = now;
+
+        if (request.PushProvider is not null)
+        {
+            var token = identityProtector.ProtectPushToken(deviceId, request.PushProvider, request.PushToken!.Trim());
+            // A token is unique across devices: if the app was reinstalled the old installation's row moves here.
+            var row = store.PushTokens.SingleOrDefault(x => x.TokenFingerprint == token.SubjectHash);
+            if (row is null) { row = new PushToken { TokenFingerprint = token.SubjectHash, CreatedAt = now }; store.Add(row); }
+            row.DeviceId = deviceId; row.Provider = request.PushProvider; row.TokenCiphertext = token.SubjectCiphertext;
+            row.Status = "ACTIVE"; row.InvalidatedAt = null; row.UpdatedAt = now;
+            // The provider rotated the token: the device's older ones stop being used.
+            foreach (var old in store.PushTokens.Where(x => x.DeviceId == deviceId && x.Status == "ACTIVE" && x.TokenFingerprint != token.SubjectHash))
+            { old.Status = "INVALID"; old.InvalidatedAt = now; old.UpdatedAt = now; }
+        }
+        await store.SaveAsync(ct);
+        return MapDevice(device);
+    }
+
+    public async Task RevokeDeviceAsync(string memberId, string deviceId, CancellationToken ct)
+    {
+        var device = store.Devices.SingleOrDefault(x => x.DeviceId == deviceId && x.MemberId == memberId) ?? throw new DomainException("DEVICE_NOT_FOUND", 404);
+        if (device.Status == "REVOKED") return;
+        var now = DateTimeOffset.UtcNow;
+        device.Status = "REVOKED"; device.RevokedAt = now; device.UpdatedAt = now;
+        foreach (var token in store.PushTokens.Where(x => x.DeviceId == deviceId && x.Status == "ACTIVE"))
+        { token.Status = "INVALID"; token.InvalidatedAt = now; token.UpdatedAt = now; }
+        await store.SaveAsync(ct);
+    }
+
+    private DeviceResponse MapDevice(MemberDevice x) =>
+        new(x.DeviceId, x.Platform, x.AppVersion, x.Status, x.Status == "ACTIVE" && store.PushTokens.Any(t => t.DeviceId == x.DeviceId && t.Status == "ACTIVE"), x.LastSeenAt);
+
     public async Task<PrivacyRequestResponse> CreatePrivacyRequestAsync(string memberId, PrivacyRequestCreate request, CancellationToken ct)
     {
         if (request.RequestType is not ("ACCESS" or "CORRECT" or "DELETE" or "EXPORT" or "CONSENT_SUPPORT")) throw new DomainException("PRIVACY_REQUEST_INVALID");
+        var isDelete = request.RequestType == "DELETE";
+        if (isDelete && store.PrivacyRequests.Any(x => x.MemberId == memberId && x.RequestType == "DELETE" && OpenPrivacyStatuses.Contains(x.Status)))
+            throw new DomainException("PRIVACY_REQUEST_ALREADY_OPEN", 409);
         var row = new PrivacyRequest { MemberId = memberId, RequestType = request.RequestType, DueAt = DateTimeOffset.UtcNow.AddDays(30) };
         store.Add(row);
+        if (isDelete) StartDeletion(memberId);
         AddChange(memberId, "PRIVACY_REQUEST", row.PrivacyRequestId, "UPSERT", new { row.PrivacyRequestId, row.RequestType, row.Status, row.CreatedAt, row.DueAt });
         AddOutbox("PRIVACY_REQUEST", row.PrivacyRequestId, "PrivacyRequestCreated.v1", new { privacy_request_id = row.PrivacyRequestId, member_id = memberId, row.RequestType });
         await store.SaveAsync(ct);
         return Map(row);
+    }
+
+    public Task<IReadOnlyList<PrivacyRequestResponse>> GetPrivacyRequestsAsync(string memberId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        IReadOnlyList<PrivacyRequestResponse> result = store.PrivacyRequests.Where(x => x.MemberId == memberId).OrderByDescending(x => x.CreatedAt).Take(50).AsEnumerable().Select(Map).ToArray();
+        return Task.FromResult(result);
+    }
+
+    // What GET /v1/me/export covers: IAM (consents, privacy requests), profile, event registrations, social (Commits, connections), chat and NLP intents.
+    private static readonly string[] ExportDomains = ["IAM", "PROFILE", "EVENT", "SOCIAL", "CHAT", "NLP"];
+
+    public async Task<DataExportResponse> ExportMyDataAsync(string memberId, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var profileRow = store.Profiles.SingleOrDefault(x => x.MemberId == memberId);
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (profileRow is null && account is null) throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var profile = profileRow is null ? null : WithContactHints(Map(profileRow));
+        var intents = await store.GetMemberIntentsAsync(memberId, ct);
+
+        var registrations = store.Registrations.Where(x => x.MemberId == memberId).OrderByDescending(x => x.RegisteredAt).ToArray();
+        var eventIds = registrations.Select(x => x.EventId).ToArray();
+        var eventNames = store.Events.Where(x => eventIds.Contains(x.EventId)).ToDictionary(x => x.EventId, x => x.Name);
+
+        // Another member is named only while connected; before that they stay anonymous, as in the app.
+        var connections = store.Connections.Where(x => x.MemberLowId == memberId || x.MemberHighId == memberId).OrderByDescending(x => x.ConnectedAt).ToArray();
+        var connectedIds = connections.Where(x => x.Status == "ACTIVE").Select(x => OtherMember(x, memberId)).ToHashSet();
+        var names = store.Profiles.Where(x => connectedIds.Contains(x.MemberId)).ToDictionary(x => x.MemberId, x => x.DisplayName);
+        string? NameOf(string id) => connectedIds.Contains(id) ? names.GetValueOrDefault(id) : null;
+
+        var requests = store.ConnectionRequests.Where(x => x.SenderMemberId == memberId || x.RecipientMemberId == memberId).OrderByDescending(x => x.CreatedAt).ToArray();
+        ExportRequest Request(ConnectionRequest x, bool sent)
+        {
+            var other = sent ? x.RecipientMemberId : x.SenderMemberId;
+            var isCommit = x.ContextId is not null;
+            var status = sent && isCommit && x.Status != "ACCEPTED" ? (x.Status is "PENDING" or "DECLINED" && x.ExpiresAt > now ? "PENDING" : "EXPIRED") : x.Status;
+            var known = connectedIds.Contains(other) || (sent && !isCommit);
+            return new ExportRequest(x.RequestId, x.ContextId, status, isCommit ? PlanOf(x) : null, sent && !isCommit ? x.Note : null, known ? other : null, NameOf(other), x.CreatedAt, x.ExpiresAt);
+        }
+
+        var messages = store.Messages.Where(x => x.SenderMemberId == memberId).OrderBy(x => x.CreatedAt).AsEnumerable()
+            .Select(x => new ExportMessage(x.MessageId, x.ConversationId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.CreatedAt, x.DeletedAt)).ToArray();
+        var consents = (from consent in store.Consents
+                        join policy in store.ConsentPolicies on consent.PolicyId equals policy.PolicyId
+                        where consent.MemberId == memberId
+                        orderby consent.CapturedAt descending
+                        select new ExportConsent(policy.PurposeCode, policy.Version, consent.Decision, consent.CapturedAt, consent.WithdrawnAt)).ToArray();
+
+        // The export itself is recorded as a completed EXPORT request, so it is part of this file too. The database
+        // completes a request only once each domain task is completed with evidence, so the tasks are saved first.
+        var record = new PrivacyRequest { MemberId = memberId, RequestType = "EXPORT", Status = "PROCESSING", VerifiedAt = now, DueAt = now };
+        store.Add(record);
+        foreach (var domain in ExportDomains)
+            store.Add(new PrivacyRequestTask { PrivacyRequestId = record.PrivacyRequestId, DomainCode = domain, ActionType = "EXPORT", Status = "COMPLETED", AttemptCount = 1, EvidenceCode = "CORE_SELF_SERVICE_EXPORT", StartedAt = now, CompletedAt = now });
+        AddOutbox("PRIVACY_REQUEST", record.PrivacyRequestId, "PrivacyRequestCreated.v1", new { privacy_request_id = record.PrivacyRequestId, member_id = memberId, record.RequestType });
+        await store.SaveAsync(ct);
+        record.Status = "COMPLETED"; record.CompletedAt = now; record.UpdatedAt = now;
+        AddChange(memberId, "PRIVACY_REQUEST", record.PrivacyRequestId, "UPSERT", new { record.PrivacyRequestId, record.RequestType, record.Status, record.CreatedAt, record.DueAt });
+        await store.SaveAsync(ct);
+        var privacy = store.PrivacyRequests.Where(x => x.MemberId == memberId).OrderByDescending(x => x.CreatedAt).AsEnumerable().Select(Map).ToArray();
+
+        return new DataExportResponse(now, memberId, profile, intents,
+            registrations.Select(x => new ExportRegistration(x.EventId, eventNames.GetValueOrDefault(x.EventId), x.Status, x.RegisteredAt, x.CheckedInAt)).ToArray(),
+            requests.Where(x => x.SenderMemberId == memberId).Select(x => Request(x, true)).ToArray(),
+            requests.Where(x => x.RecipientMemberId == memberId).Select(x => Request(x, false)).ToArray(),
+            connections.Select(x => { var other = OtherMember(x, memberId); return new ExportConnection(x.ConnectionId, x.Status, connectedIds.Contains(other) ? other : null, NameOf(other), x.ConnectedAt, x.DisconnectedAt); }).ToArray(),
+            messages, consents, privacy);
+    }
+
+    // A deletion request starts the erasure workflow (iam.member.deleted_at). From then on the member is out of
+    // matching (NLP excludes deleted_at), profiles, attendee lists and Commits, and can't go live, send Commits or
+    // messages. The data itself is erased when the request is completed; rejecting the request restores the member.
+    private void StartDeletion(string memberId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var account = store.Accounts.SingleOrDefault(x => x.MemberId == memberId);
+        if (account is not null) account.DeletedAt ??= now;
+        foreach (var session in store.LiveSessions.Where(x => x.MemberId == memberId && x.Status == "ACTIVE").ToArray())
+        {
+            session.Status = "DISABLED"; session.RevokedAt = now;
+            AddChange(memberId, "LIVE_MODE", session.EventId, "DELETE", null);
+            AddOutbox("LIVE_MODE", session.SessionId, "LiveModeChanged.v1", new { session_id = session.SessionId, event_id = session.EventId, member_id = memberId, session.Status });
+        }
     }
 
     public Task<SyncResponse> GetChangesAsync(string memberId, long after, int limit, CancellationToken ct)
@@ -794,7 +1304,22 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(new SyncResponse(page, page.Length == 0 ? null : EncodeCursor(page[^1].Sequence), hasMore));
     }
 
-    private MemberProfile FindProfile(string id) => store.Profiles.SingleOrDefault(x => x.MemberId == id && x.Status == "ACTIVE") ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+    private static readonly string[] OpenPrivacyStatuses = ["OPEN", "VERIFIED", "PROCESSING"];
+    // Active profiles of members who haven't asked to delete their account.
+    private IQueryable<MemberProfile> ActiveProfileRows => store.Profiles.Where(p => p.Status == "ACTIVE" && !store.Accounts.Any(a => a.MemberId == p.MemberId && a.DeletedAt != null));
+    private bool IsDeletionPending(string memberId) => store.Accounts.Any(x => x.MemberId == memberId && x.DeletedAt != null);
+    private void EnsureNotDeletionPending(string memberId) { if (IsDeletionPending(memberId)) throw new DomainException("MEMBER_NOT_ACTIVE", 403); }
+    // Sign-in and sign-up answer for a member waiting for deletion; due_at comes from their latest deletion request still in force.
+    private DomainException DeletionPending(string memberId)
+    {
+        var dueAt = store.PrivacyRequests
+            .Where(x => x.MemberId == memberId && x.RequestType == "DELETE" && x.Status != "REJECTED")
+            .OrderByDescending(x => x.CreatedAt)
+            .Select(x => x.DueAt)
+            .FirstOrDefault();
+        return new DomainException("MEMBER_DELETION_PENDING", 409) { Details = new DeletionPendingDetails(dueAt) };
+    }
+    private MemberProfile FindProfile(string id) => ActiveProfileRows.SingleOrDefault(x => x.MemberId == id) ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
     // A member only sees events in their own community; others behave as unknown (the database
     // refuses Live Mode across communities). Unknown accounts (InMemory fixtures) aren't scoped.
     private string? MemberCommunity(string memberId) => store.Accounts.Where(x => x.MemberId == memberId).Select(x => x.CommunityId).FirstOrDefault();
@@ -810,6 +1335,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private bool IsBlocked(string a, string b) => store.Blocks.Any(x => x.RemovedAt == null && ((x.BlockerMemberId == a && x.BlockedMemberId == b) || (x.BlockerMemberId == b && x.BlockedMemberId == a)));
     private bool IsConnected(string a, string b) { var p = Pair(a, b); return store.Connections.Any(x => x.MemberLowId == p.Low && x.MemberHighId == p.High && x.Status == "ACTIVE"); }
     private Connection RequireConversationMember(string memberId, string conversationId) { var c = store.Conversations.SingleOrDefault(x => x.ConversationId == conversationId) ?? throw new DomainException("CONVERSATION_NOT_FOUND", 404); var link = store.Connections.Single(x => x.ConnectionId == c.ConnectionId); return link.Status == "ACTIVE" && (link.MemberLowId == memberId || link.MemberHighId == memberId) ? link : throw new DomainException("CONVERSATION_FORBIDDEN", 403); }
+    // A participant of an open conversation, with no block either way: the same rule as chat.vw_authorized_conversation.can_send.
+    private Connection RequireCanSend(string memberId, string conversationId)
+    {
+        var connection = RequireConversationMember(memberId, conversationId);
+        if (store.Conversations.Any(x => x.ConversationId == conversationId && x.Status != "ACTIVE") || IsBlocked(memberId, OtherMember(connection, memberId)))
+            throw new DomainException("CONVERSATION_FORBIDDEN", 403);
+        return connection;
+    }
     // Every Commit sent in the event counts, whatever happened to it.
     private int CommitsUsed(string senderId, string eventId) => store.ConnectionRequests.Count(x => x.SenderMemberId == senderId && x.ContextId == eventId);
     private bool IsAttending(string eventId, string memberId) => store.Registrations.Any(x => x.EventId == eventId && x.MemberId == memberId && (x.Status == "REGISTERED" || x.Status == "CHECKED_IN"));
@@ -822,7 +1355,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private Dictionary<string, MemberProfile> ActiveProfiles(IEnumerable<string> memberIds)
     {
         var ids = memberIds.Distinct().ToArray();
-        return store.Profiles.Where(x => ids.Contains(x.MemberId) && x.Status == "ACTIVE").ToDictionary(x => x.MemberId);
+        return ActiveProfileRows.Where(x => ids.Contains(x.MemberId)).ToDictionary(x => x.MemberId);
     }
     // Commits sent before plans existed default to "their choice, now".
     private static CommitPlanResponse PlanOf(ConnectionRequest x) => CommitPlans.ToResponse(CommitPlans.Decode(x.Note) ?? new(CommitPlans.TheirChoice, null, "NOW"), x.ContextId);
@@ -867,7 +1400,18 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .ToDictionary(x => x.ConversationId, x => x.MutedUntil);
         var requestIds = connections.Select(x => x.AcceptedRequestId).ToArray();
         var plans = store.ConnectionRequests.Where(x => requestIds.Contains(x.RequestId) && x.ContextId != null).AsEnumerable().ToDictionary(x => x.RequestId, PlanOf);
+        // Receipts on my messages can only come from the other member. Read marks everything up to a message,
+        // so the highest receipted sequence is a watermark for the whole conversation.
+        var myReceipts = from m in store.Messages
+                         join r in store.MessageReceipts on m.MessageId equals r.MessageId
+                         where conversationIds.Contains(m.ConversationId) && m.SenderMemberId == memberId && r.MemberId != memberId
+                         select new { m.ConversationId, m.ServerSequence, r.DeliveredAt, r.ReadAt };
+        var deliveredThrough = myReceipts.Where(x => x.DeliveredAt != null).GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) }).ToDictionary(x => x.ConversationId, x => (long?)x.Sequence);
+        var readThrough = myReceipts.Where(x => x.ReadAt != null).GroupBy(x => x.ConversationId)
+            .Select(g => new { ConversationId = g.Key, Sequence = g.Max(x => x.ServerSequence) }).ToDictionary(x => x.ConversationId, x => (long?)x.Sequence);
 
+        var lastAttachments = AttachmentsFor(lastMessages.Values);
         return conversations.Select(c =>
         {
             var connection = byConnection[c.ConnectionId];
@@ -875,8 +1419,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             var profile = profiles.GetValueOrDefault(otherId);
             var last = lastMessages.GetValueOrDefault(c.ConversationId);
             return new ConversationResponse(c.ConversationId, c.ConnectionId, c.Status, otherId, profile?.DisplayName, profile?.Headline, profile?.Sector,
-                last is null ? null : Map(last), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
-                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId));
+                last is null ? null : Map(last, lastAttachments), unread.GetValueOrDefault(c.ConversationId), last?.CreatedAt ?? c.CreatedAt,
+                c.Status == "ACTIVE" && connection.Status == "ACTIVE" && !blocked.Contains(otherId), mutedUntil.GetValueOrDefault(c.ConversationId), plans.GetValueOrDefault(connection.AcceptedRequestId),
+                deliveredThrough.GetValueOrDefault(c.ConversationId), readThrough.GetValueOrDefault(c.ConversationId));
         }).ToArray();
     }
 
@@ -896,6 +1441,9 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     }
 
     private void AddChange(string? memberId, string type, string id, string change, object? payload) => store.Add(new SyncChange { MemberScopeId = memberId, ResourceType = type, ResourceId = id, ChangeType = change, PayloadJson = payload is null ? null : JsonSerializer.Serialize(payload, JsonOptions) });
+    // Tells the sender's devices that the reader has read their messages up to last_read_server_sequence.
+    private void AddConversationRead(string readerId, Connection connection, string conversationId, Message lastRead, DateTimeOffset readAt) =>
+        AddOutbox("CONVERSATION", conversationId, "ConversationRead.v1", new { conversation_id = conversationId, reader_member_id = readerId, sender_member_id = OtherMember(connection, readerId), last_read_message_id = lastRead.MessageId, last_read_server_sequence = lastRead.ServerSequence, read_at = readAt });
     private void AddOutbox(string aggregateType, string aggregateId, string eventType, object payload) => store.Add(new OutboxEvent { AggregateType = aggregateType, AggregateId = aggregateId, EventType = eventType, PayloadJson = JsonSerializer.Serialize(payload, JsonOptions) });
     private static (string Low, string High) Pair(string a, string b) => string.CompareOrdinal(a, b) < 0 ? (a, b) : (b, a);
     // ops.outbox_event.aggregate_id is varchar(64). Keep the readable "a:b" key when it fits;
@@ -911,7 +1459,18 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
-    private static ProfileResponse Map(MemberProfile x) => new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt);
+    private ProfileResponse Map(MemberProfile x)
+    {
+        var latest = store.ProfileImages
+            .Where(i => i.MemberId == x.MemberId && (i.Id == x.ProfileImageId || i.Status == "PENDING" || i.Status == "PROCESSING"))
+            .OrderByDescending(i => i.CreatedAt)
+            .FirstOrDefault();
+        var imageUrl = x.ProfileImageId is null ? null : $"/v1/members/{Uri.EscapeDataString(x.MemberId)}/profile-picture?size=thumbnail";
+        var imageStatus = latest?.Status == "APPROVED" ? "READY" : latest?.Status;
+        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, imageStatus);
+    }
+    public static string OriginalImagePath(string memberId, string imageId) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/original";
+    public static string DerivativeImagePath(string memberId, string imageId, int pixels) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/avatar-{pixels}.webp";
     private static EventResponse Map(EventRecord x, bool checkInRequired, string? venue, int attendeeCount, int liveCount, bool? isRegistered, string? registrationStatus) => new(
         x.EventId, x.Name, x.StartsAt, x.EndsAt, x.Status, x.LiveModeEnabled, checkInRequired, venue,
         attendeeCount, liveCount, isRegistered, registrationStatus);
@@ -920,5 +1479,19 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     // The sender sees a declined Commit as PENDING.
     private static ConnectionRequestResponse Map(ConnectionRequest x, int commitsRemaining) => new(x.RequestId, x.SenderMemberId, x.RecipientMemberId, x.Status == "DECLINED" ? "PENDING" : x.Status, x.ExpiresAt, Math.Max(0, commitsRemaining));
     private static MessageResponse Map(Message x) => new(x.MessageId, x.ConversationId, x.SenderMemberId, x.MessageType, x.DeletedAt is null ? x.Body : null, x.ServerSequence, x.ModerationStatus, x.CreatedAt, x.DeletedAt);
+    private static MessageResponse Map(Message x, IReadOnlyDictionary<string, MessageAttachment> attachments) => Map(x) with { Attachment = x.DeletedAt is null ? attachments.GetValueOrDefault(x.MessageId) : null };
+    // The attached file of each FILE message, by message ID.
+    private Dictionary<string, MessageAttachment> AttachmentsFor(IEnumerable<Message> messages)
+    {
+        var ids = messages.Where(x => x.MessageType == "FILE" && x.DeletedAt == null).Select(x => x.MessageId).ToArray();
+        if (ids.Length == 0) return [];
+        return (from link in store.FileAssetLinks
+                join file in store.FileAssets on link.FileAssetId equals file.FileAssetId
+                where link.ResourceType == "MESSAGE" && ids.Contains(link.ResourceId) && link.RemovedAt == null
+                select new { link.ResourceId, file.FileAssetId, file.MediaType, file.SizeBytes, file.FileName })
+            .AsEnumerable()
+            .GroupBy(x => x.ResourceId)
+            .ToDictionary(g => g.Key, g => { var x = g.First(); return new MessageAttachment(x.FileAssetId, x.MediaType, x.SizeBytes, x.FileName); });
+    }
     private static PrivacyRequestResponse Map(PrivacyRequest x) => new(x.PrivacyRequestId, x.RequestType, x.Status, x.CreatedAt, x.DueAt);
 }

@@ -8,12 +8,14 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 
 - Atomic member registration with encrypted email/phone identities and a private draft profile.
 - Profile reads and optimistic-concurrency updates with ETags.
+- Asynchronous profile-image upload, content validation, sanitized WebP variants, visibility-aware delivery, and delayed replacement cleanup.
 - Active consent-policy discovery and append-only consent decisions, including immediate Live Mode revocation.
 - Event listing, registration, attendee check-in, configurable matching eligibility, bounded Live Mode, and expiring coarse presence.
 - Connection request, acceptance, canonical connection, conversation creation, and blocking.
 - Idempotent client message IDs and server message ordering.
 - Notification preferences, privacy-request initiation, and authorization-filtered sync changes.
-- Transactional outbox records published as versioned Service Bus envelopes by the Core worker.
+- Transactional outbox records published as versioned Service Bus envelopes by the Core worker
+  using bounded batch claims, expiring leases, lease renewal, jittered retry, and explicit exhaustion.
 - Consumption of `NlpMatchRequestCompleted.v1` into authorization-scoped sync projections and policy-resolved match notifications.
 - Transactional integration events that allow NLP to refresh its read-only eligibility projections without proxying NLP requests through Core.
 - EF Core InMemory local development and PostgreSQL configuration through `ConnectionStrings__PostgreSql`.
@@ -21,7 +23,11 @@ The repository is independent from `Olga.Nlp` and can be versioned, built, teste
 
 ## What is intentionally not implemented yet
 
-This foundation is not the full product backlog. Entra token validation and external-identity linking, fine-grained permissions, private file lifecycle, provider notification delivery, privacy task orchestration, retention execution, moderation/admin APIs, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
+This foundation is not the full product backlog. Entra token validation and external-identity linking, fine-grained permissions, general private-file lifecycle, provider notification delivery, privacy task orchestration, retention execution, database migrations, OpenTelemetry, and remaining production assets remain delivery work. See [Senior architecture review](docs/SENIOR_ARCHITECT_REVIEW.md).
+
+PostgreSQL deployments must be at schema v2.6. The database repository owns the generated v2.4
+baseline and the ordered v2.5 profile-image and v2.6 outbox-leasing migrations; application startup
+does not perform DDL.
 
 ## Run locally
 
@@ -142,6 +148,10 @@ PostgreSQL deployments must provide `IdentityProtection__MasterKeyBase64` as a K
 
 Do not commit the master key, print it in logs, or rotate/delete it without a migration that re-encrypts existing identity rows. Losing the key makes existing ciphertext unrecoverable.
 
+## Profile-image storage configuration
+
+PostgreSQL deployments of the API and worker must set `Storage__BlobServiceEndpoint`. Optional settings are `Storage__ManagedIdentityClientId`, `Storage__PendingProfileImagesContainerName` (default `pending-profile-images`), `Storage__ProfileImagesContainerName` (default `profile-images`), and `Storage__ChatFilesContainerName` (default `chat-files`). Blob access uses `DefaultAzureCredential`; no account keys or SAS URLs are returned to clients. The worker consumes `ServiceBus__ContentScanQueueName` (default `content-scan`) for profile and chat uploads. With `MalwareScanning__Required=true`, it waits for the Defender for Storage blob-index malware verdict, then sends safely decoded and normalized images to `ContentSafety__Endpoint`. Images that meet a configured severity threshold and every malicious or failed malware scan are quarantined; an attachment is downloadable only after its aggregate scan status is `CLEAN`. Keep both scanning controls enabled for production. `MalwareScanning__Required=false` is honored only in the Development runtime and is an explicit bypass for Azure regions where Defender for Storage is unavailable; Content Safety remains enforced for images.
+
 ## MVP request headers
 
 Swagger displays each applicable header on the operation that consumes it:
@@ -150,13 +160,13 @@ Swagger displays each applicable header on the operation that consumes it:
 | --- | --- | --- |
 | `X-Member-Id` | Member-scoped operations | Optional MVP member selector; defaults to `Mvp__DefaultMemberId` and is limited to 64 characters. The ID must already exist in `iam.member`. |
 | `Idempotency-Key` | Every `POST`, `PUT`, `PATCH`, and `DELETE` under `/v1` | Required, maximum 128 characters. Generate a UUID for each new logical action and reuse that same value for retries of that action. Never reuse it with a different payload. |
-| `If-Match` | `PATCH /v1/me/profile` | Send the ETag returned by `GET /v1/me/profile`. It may be omitted only while completing the initial empty draft. |
+| `If-Match` | `PATCH /v1/me/profile`, `PUT/DELETE /v1/me/profile-picture` | Send the ETag returned by `GET /v1/me/profile`. It may be omitted only while completing the initial empty draft. |
 
 The UI or other calling client generates `Idempotency-Key`; identity/onboarding supplies the member ID. Durable replay storage is currently implemented only for selected transactional operations, as recorded in the senior architecture review, so extending it to every mutation remains a production-readiness requirement.
 
 ## Endpoint groups
 
-- Member, profile, and consent: `POST /v1/members`, `GET/PATCH /v1/me/profile`, `GET /v1/members/{memberId}`, `GET /v1/consent-policies/{purposeCode}`, `POST /v1/me/consents`
+- Member, profile, and consent: `POST /v1/members`, `GET/PATCH /v1/me/profile`, `PUT/DELETE /v1/me/profile-picture`, `GET /v1/members/{memberId}`, `GET /v1/members/{memberId}/profile-picture`, `GET /v1/consent-policies/{purposeCode}`, `POST /v1/me/consents`
 - Events: `GET /v1/events`, `POST /v1/events/{id}/register`, `POST/DELETE /v1/events/{id}/live-mode`, `POST /v1/events/{id}/presence`
 - Admin event matching and attendance: `PUT /v1/admin/events/{id}/matching-policy`, `GET /v1/admin/events/{id}/attendees`, `POST /v1/admin/events/{id}/attendees/{memberId}/check-in`
 - Social: `POST/PATCH /v1/connection-requests`, `GET /v1/connections`, `POST /v1/members/block`

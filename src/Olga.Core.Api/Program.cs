@@ -1,7 +1,9 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Azure.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.SignalR;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi;
 using Npgsql;
@@ -16,9 +18,25 @@ builder.Services.ConfigureHttpJsonOptions(o => { o.SerializerOptions.PropertyNam
 const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
+const string adminCorsPolicy = "AdminPortal";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
 var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
+var adminOrigins = builder.Configuration
+    .GetSection("Cors:AdminOrigins")
+    .GetChildren()
+    .Select(section => section.Value)
+    .Where(value => !string.IsNullOrWhiteSpace(value))
+    .Cast<string>()
+    .ToArray();
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(adminCorsPolicy, policy => policy
+        .WithOrigins(adminOrigins)
+        .AllowAnyMethod()
+        .AllowAnyHeader()
+        .WithExposedHeaders("ETag", "X-Correlation-Id"));
+});
 builder.Services.AddOpenApi(options =>
 {
     options.AddDocumentTransformer((document, _, _) =>
@@ -38,7 +56,7 @@ builder.Services.AddOpenApi(options =>
 
         var method = context.Description.HttpMethod;
         if (context.Description.RelativePath?.StartsWith("v1/", StringComparison.OrdinalIgnoreCase) == true
-            && method is "POST" or "PUT" or "PATCH" or "DELETE")
+            && method is "POST" or "PUT" or "PATCH" or "DELETE" && !metadata.OfType<NoIdempotencyMetadata>().Any())
             AddHeaderParameter(operation, idempotencyKeyHeader, true, "Unique key for this logical mutation. Reuse the same key only when retrying the same request.", 128);
 
         if (metadata.OfType<IfMatchMetadata>().Any())
@@ -48,6 +66,19 @@ builder.Services.AddOpenApi(options =>
     });
 });
 builder.Services.AddHealthChecks();
+// Realtime chat through Azure SignalR when SignalR:Endpoint is set (keyless, managed identity); in-process otherwise.
+var signalR = builder.Services.AddSignalR();
+var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
+var signalRRequired = builder.Configuration.GetValue<bool>("SignalR:Required");
+if (signalRRequired && string.IsNullOrWhiteSpace(signalREndpoint))
+    throw new InvalidOperationException("SignalR:Endpoint is required when SignalR:Required is enabled.");
+if (!string.IsNullOrWhiteSpace(signalREndpoint))
+{
+    if (!Uri.TryCreate(signalREndpoint, UriKind.Absolute, out var signalRUri) || signalRUri.Scheme != Uri.UriSchemeHttps)
+        throw new InvalidOperationException("SignalR:Endpoint must be an absolute HTTPS URI.");
+    var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions { ManagedIdentityClientId = builder.Configuration["SignalR:ManagedIdentityClientId"] });
+    signalR.AddAzureSignalR(options => options.Endpoints = [new ServiceEndpoint(signalRUri, credential)]);
+}
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
 if (local) builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseInMemoryDatabase("olga-core-local"));
@@ -56,28 +87,43 @@ var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
+var chatFileOptions = builder.Configuration.GetSection(ChatFileOptions.SectionName).Get<ChatFileOptions>() ?? new ChatFileOptions();
+builder.Services.AddSingleton(chatFileOptions);
+if (local) builder.Services.AddSingleton<IChatFileStorage, InMemoryChatFileStorage>();
+else builder.Services.AddSingleton<IChatFileStorage, AzureChatFileStorage>();
+if (local) builder.Services.AddSingleton<IProfileImageStorage, InMemoryProfileImageStorage>();
+else builder.Services.AddSingleton<IProfileImageStorage, AzureProfileImageStorage>();
 builder.Services.AddScoped<ICoreStore>(sp => sp.GetRequiredService<CoreDbContext>());
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<ChatTypingThrottle>();
+builder.Services.AddSingleton<IChatTypingPublisher, SignalRChatTypingPublisher>();
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
+app.UseCors(adminCorsPolicy);
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
     try
     {
-        if (context.Request.ContentLength is > 256_000) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
+        var requestLimit = context.Request.Path.StartsWithSegments("/v1/me/profile-picture") ? 5_500_000
+            : IsChatAttachmentUpload(context.Request.Path) ? chatFileOptions.MaxBytes + 512_000
+            : 256_000;
+        if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
-        if (context.Request.Path.StartsWithSegments("/v1") && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
+        // SignalR's negotiate POST is a connection handshake and a typing signal stores nothing: neither is a mutation.
+        if (context.Request.Path.StartsWithSegments("/v1") && !context.Request.Path.StartsWithSegments(ChatRealtime.HubPath) && !IsTypingSignal(context.Request.Path)
+            && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
         {
             await Error(context, 400, "IDEMPOTENCY_KEY_REQUIRED");
             return;
         }
         await next();
     }
-    catch (DomainException ex) { await Error(context, ex.StatusCode, ex.Code); }
+    catch (DomainException ex) { await Error(context, ex.StatusCode, ex.Code, details: ex.Details); }
     catch (DbUpdateConcurrencyException) { await Error(context, 409, "RESOURCE_VERSION_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsUniqueViolation(ex)) { await Error(context, 409, "RESOURCE_CONFLICT"); }
     catch (DbUpdateException ex) when (PostgreSqlConfiguration.IsForeignKeyViolation(ex)) { await Error(context, 409, "RESOURCE_REFERENCE_NOT_FOUND"); }
@@ -106,6 +152,8 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json", "OLGA Core API v1");
 });
 app.MapHealthChecks("/health");
+app.UseMiddleware<RealtimeMemberMiddleware>();
+app.MapHub<ChatHub>(ChatRealtime.HubPath);
 app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503))
     .WithName("GetReadiness").WithTags("Operations").Produces(200).Produces(503);
 
@@ -137,8 +185,38 @@ profileV1.MapGet("", async (HttpContext c, ICoreService s, CancellationToken ct)
 profileV1.MapPatch("", async (HttpContext c, ProfileUpdateRequest body, ICoreService s, CancellationToken ct) => { var value = await s.UpdateProfileAsync(Member(c), body, c.Request.Headers.IfMatch.FirstOrDefault(), ct); c.Response.Headers.ETag = value.ETag; return Results.Ok(value); })
     .WithMetadata(new IfMatchMetadata())
     .WithName("UpdateOwnProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapPut("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    if (!c.Request.HasFormContentType) throw new DomainException("PROFILE_IMAGE_MULTIPART_REQUIRED", 415);
+    var form = await c.Request.ReadFormAsync(ct);
+    var file = form.Files.GetFile("file") ?? (form.Files.Count == 1 ? form.Files[0] : null)
+        ?? throw new DomainException("PROFILE_IMAGE_REQUIRED");
+    await using var content = file.OpenReadStream();
+    var value = await s.UploadProfileImageAsync(Member(c), content, file.Length, file.ContentType, Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Accepted(value: value);
+})
+    .WithMetadata(new IfMatchMetadata(), new RequestSizeLimitAttribute(5_500_000))
+    .DisableAntiforgery()
+    .Accepts<IFormFile>("multipart/form-data")
+    .WithName("UploadOwnProfileImage").WithTags("Members").Produces<ProfileImageUploadResponse>(202).Produces<ApiError>(413).Produces<ApiError>(415);
+memberV1.MapDelete("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.DeleteProfileImageAsync(Member(c), Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
+    .WithMetadata(new IfMatchMetadata())
+    .WithName("DeleteOwnProfileImage").WithTags("Members").Produces<ProfileResponse>(200);
 memberV1.MapGet("/members/{memberId}", async (HttpContext c, string memberId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetVisibleProfileAsync(Member(c), memberId, ct)))
     .WithName("GetMemberProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapGet("/members/{memberId}/profile-picture", async (HttpContext c, string memberId, [FromQuery] string? size, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.GetVisibleProfileImageAsync(Member(c), memberId, size ?? "thumbnail", ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Stream(value.Content, value.ContentType, enableRangeProcessing: true);
+})
+    .WithName("GetMemberProfileImage").WithTags("Members").Produces<byte[]>(200, contentType: "image/webp").Produces<ApiError>(404);
 memberV1.MapPost("/me/consents", async (HttpContext c, ConsentRequest body, ICoreService s, CancellationToken ct) => Results.Created("/v1/me/consents", await s.RecordConsentAsync(Member(c), body, ct)))
     .WithName("RecordConsent").WithTags("Members").Produces<ConsentResponse>(201);
 memberV1.MapGet("/consent-policies/{purposeCode}", async (HttpContext c, string purposeCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetActiveConsentPolicyAsync(Member(c), purposeCode, ct)))
@@ -152,6 +230,8 @@ memberV1.MapPost("/events/{eventId}/register", async (HttpContext c, string even
     .WithName("RegisterForEvent").WithTags("Events").Produces<RegistrationResponse>(200);
 memberV1.MapPost("/events/{eventId}/live-mode", async (HttpContext c, string eventId, LiveModeRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.StartLiveModeAsync(Member(c), eventId, body, ct)))
     .WithName("StartLiveMode").WithTags("Events").Produces<LiveModeResponse>(200);
+memberV1.MapPost("/events/{eventId}/live-mode/extend", async (HttpContext c, string eventId, LiveModeExtendRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.ExtendLiveModeAsync(Member(c), eventId, body, Idempotency(c), ct)))
+    .WithName("ExtendLiveMode").WithTags("Events").Produces<LiveModeResponse>(200);
 memberV1.MapDelete("/events/{eventId}/live-mode", async (HttpContext c, string eventId, ICoreService s, CancellationToken ct) => { await s.StopLiveModeAsync(Member(c), eventId, ct); return Results.NoContent(); })
     .WithName("StopLiveMode").WithTags("Events").Produces(204);
 memberV1.MapPost("/events/{eventId}/presence", async (HttpContext c, string eventId, PresenceRequest body, ICoreService s, CancellationToken ct) => { await s.RecordPresenceAsync(Member(c), eventId, body, ct); return Results.Accepted(); })
@@ -166,12 +246,20 @@ memberV1.MapGet("/events/{eventId}/meeting-spots", async (HttpContext c, string 
     .WithName("ListMeetingSpots").WithTags("Commits").Produces<IReadOnlyList<MeetingSpotResponse>>(200);
 memberV1.MapGet("/me/commits/incoming", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIncomingCommitsAsync(Member(c), eventId, ct)))
     .WithName("ListIncomingCommits").WithTags("Commits").Produces<IReadOnlyList<IncomingCommitResponse>>(200);
+memberV1.MapPost("/me/commits/incoming/{requestId}/report", async (HttpContext c, string requestId, CommitReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/me/commits/incoming/{requestId}/report", await s.ReportIncomingCommitAsync(Member(c), requestId, body, ct)))
+    .WithName("ReportIncomingCommitSender").WithTags("Commits").Produces<MemberReportResponse>(201);
+memberV1.MapPost("/me/commits/incoming/{requestId}/block", async (HttpContext c, string requestId, ICoreService s, CancellationToken ct) => { await s.BlockIncomingCommitSenderAsync(Member(c), requestId, ct); return Results.NoContent(); })
+    .WithName("BlockIncomingCommitSender").WithTags("Commits").Produces(204);
 memberV1.MapGet("/me/commits/outgoing", async (HttpContext c, [FromQuery(Name = "event_id")] string? eventId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetOutgoingCommitsAsync(Member(c), eventId, ct)))
     .WithName("ListOutgoingCommits").WithTags("Commits").Produces<IReadOnlyList<OutgoingCommitResponse>>(200);
 memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConnectionsAsync(Member(c), ct)))
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
     .WithName("BlockMember").WithTags("Social").Produces(204);
+memberV1.MapDelete("/members/block/{memberId}", async (HttpContext c, string memberId, ICoreService s, CancellationToken ct) => { await s.UnblockAsync(Member(c), memberId, ct); return Results.NoContent(); })
+    .WithName("UnblockMember").WithTags("Social").Produces(204);
+memberV1.MapGet("/me/blocks", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetBlocksAsync(Member(c), ct)))
+    .WithName("ListBlockedMembers").WithTags("Social").Produces<IReadOnlyList<BlockedMemberResponse>>(200);
 memberV1.MapGet("/conversations", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationsAsync(Member(c), cursor, limit ?? 20, ct)))
     .WithName("ListConversations").WithTags("Chat").Produces<ConversationListResponse>(200);
 memberV1.MapGet("/conversations/{conversationId}", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConversationAsync(Member(c), conversationId, ct)))
@@ -184,16 +272,56 @@ memberV1.MapGet("/conversations/{conversationId}/messages", async (HttpContext c
     .WithName("ListMessages").WithTags("Chat").Produces<IReadOnlyList<MessageResponse>>(200);
 memberV1.MapPost("/conversations/{conversationId}/messages", async (HttpContext c, string conversationId, MessageCreateRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/conversations/{conversationId}/messages/{body.MessageId}", await s.SendMessageAsync(Member(c), conversationId, body, Idempotency(c), ct)))
     .WithName("SendMessage").WithTags("Chat").Produces<MessageResponse>(201);
+memberV1.MapPost("/conversations/{conversationId}/attachments", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) =>
+{
+    if (!c.Request.HasFormContentType) throw new DomainException("ATTACHMENT_MULTIPART_REQUIRED", 415);
+    var form = await c.Request.ReadFormAsync(ct);
+    var file = form.Files.GetFile("file") ?? (form.Files.Count == 1 ? form.Files[0] : null)
+        ?? throw new DomainException("ATTACHMENT_REQUIRED");
+    await using var content = file.OpenReadStream();
+    return Results.Created((string?)null, await s.UploadChatAttachmentAsync(Member(c), conversationId, content, file.Length, file.ContentType, file.FileName, Idempotency(c), ct));
+})
+    .WithMetadata(new RequestSizeLimitAttribute(chatFileOptions.MaxBytes + 512_000))
+    .DisableAntiforgery()
+    .Accepts<IFormFile>("multipart/form-data")
+    .WithName("UploadChatAttachment").WithTags("Chat").Produces<ChatAttachmentUploadResponse>(201).Produces<ApiError>(413).Produces<ApiError>(415);
+memberV1.MapGet("/messages/{messageId}/attachment", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.GetMessageAttachmentAsync(Member(c), messageId, ct);
+    c.Response.Headers.CacheControl = "private, max-age=86400";
+    c.Response.Headers.XContentTypeOptions = "nosniff";
+    return Results.Stream(value.Content, value.MediaType, value.FileName, entityTag: new Microsoft.Net.Http.Headers.EntityTagHeaderValue(value.ETag), enableRangeProcessing: true);
+})
+    .WithName("GetMessageAttachment").WithTags("Chat").Produces<byte[]>(200, contentType: "application/octet-stream").Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapPost("/conversations/{conversationId}/typing", async (HttpContext c, string conversationId, ICoreService s, CancellationToken ct) => { await s.StartTypingAsync(Member(c), conversationId, ct); return Results.Accepted(); })
+    .WithMetadata(new NoIdempotencyMetadata())
+    .WithName("StartTyping").WithTags("Chat").Produces(202);
 memberV1.MapPut("/messages/{messageId}/receipt", async (HttpContext c, string messageId, MessageReceiptRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SaveMessageReceiptAsync(Member(c), messageId, body, Idempotency(c), ct)))
     .WithName("SaveMessageReceipt").WithTags("Chat").Produces<MessageReceiptResponse>(200);
 memberV1.MapDelete("/messages/{messageId}", async (HttpContext c, string messageId, ICoreService s, CancellationToken ct) => { await s.DeleteMessageAsync(Member(c), messageId, ct); return Results.NoContent(); })
     .WithName("DeleteMessage").WithTags("Chat").Produces(204);
 memberV1.MapPost("/messages/{messageId}/report", async (HttpContext c, string messageId, MessageReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/messages/{messageId}/report", await s.ReportMessageAsync(Member(c), messageId, body, ct)))
     .WithName("ReportMessage").WithTags("Chat").Produces<MessageReportResponse>(201);
+memberV1.MapPost("/members/{memberId}/report", async (HttpContext c, string memberId, MemberReportRequest body, ICoreService s, CancellationToken ct) => Results.Created($"/v1/members/{memberId}/report", await s.ReportMemberAsync(Member(c), memberId, body, ct)))
+    .WithName("ReportMember").WithTags("Social").Produces<MemberReportResponse>(201);
 memberV1.MapPatch("/me/notification-preferences", async (HttpContext c, NotificationPreferenceRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.SetNotificationPreferenceAsync(Member(c), body, ct)))
     .WithName("SetNotificationPreference").WithTags("Preferences and privacy").Produces<NotificationPreferenceResponse>(200);
+memberV1.MapPut("/me/devices/{deviceId}", async (HttpContext c, string deviceId, DeviceRegistrationRequest body, ICoreService s, CancellationToken ct) => Results.Ok(await s.RegisterDeviceAsync(Member(c), deviceId, body, ct)))
+    .WithName("RegisterDevice").WithTags("Devices").Produces<DeviceResponse>(200);
+memberV1.MapDelete("/me/devices/{deviceId}", async (HttpContext c, string deviceId, ICoreService s, CancellationToken ct) => { await s.RevokeDeviceAsync(Member(c), deviceId, ct); return Results.NoContent(); })
+    .WithName("RevokeDevice").WithTags("Devices").Produces(204);
 memberV1.MapPost("/me/privacy-requests", async (HttpContext c, PrivacyRequestCreate body, ICoreService s, CancellationToken ct) => Results.Accepted("/v1/me/privacy-requests", await s.CreatePrivacyRequestAsync(Member(c), body, ct)))
     .WithName("CreatePrivacyRequest").WithTags("Preferences and privacy").Produces<PrivacyRequestResponse>(202);
+memberV1.MapGet("/me/privacy-requests", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetPrivacyRequestsAsync(Member(c), ct)))
+    .WithName("ListPrivacyRequests").WithTags("Preferences and privacy").Produces<IReadOnlyList<PrivacyRequestResponse>>(200);
+memberV1.MapGet("/me/export", async (HttpContext c, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.ExportMyDataAsync(Member(c), ct);
+    c.Response.Headers.ContentDisposition = $"attachment; filename=\"olga-export-{value.ExportedAt:yyyy-MM-dd}.json\"";
+    c.Response.Headers.CacheControl = "no-store";
+    return Results.Ok(value);
+})
+    .WithName("ExportMyData").WithTags("Preferences and privacy").Produces<DataExportResponse>(200);
 memberV1.MapGet("/sync/changes", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetChangesAsync(Member(c), DecodeCursor(cursor), limit ?? 100, ct)))
     .WithName("GetSyncChanges").WithTags("Offline sync").Produces<SyncResponse>(200);
 
@@ -237,6 +365,10 @@ adminV1.MapGet("/events/{eventId}/attendees", async (string eventId, IAdminEvent
     .WithName("AdminListEventAttendees").WithTags("Admin events").Produces<IReadOnlyList<AdminAttendeeResponse>>(200);
 adminV1.MapPost("/events/{eventId}/attendees/{memberId}/check-in", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.CheckInAsync(eventId, memberId, ct)))
     .WithName("AdminCheckInEventAttendee").WithTags("Admin events").Produces<RegistrationResponse>(200);
+adminV1.MapGet("/events/{eventId}/live-sessions", async (string eventId, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetLiveSessionsAsync(eventId, ct)))
+    .WithName("AdminListLiveSessions").WithTags("Admin events").Produces<IReadOnlyList<AdminLiveSessionResponse>>(200);
+adminV1.MapPost("/events/{eventId}/live-sessions/{memberId}/end", async (string eventId, string memberId, IAdminEventService s, CancellationToken ct) => { await s.EndLiveSessionAsync(eventId, memberId, ct); return Results.NoContent(); })
+    .WithName("AdminEndLiveSession").WithTags("Admin events").Produces(204);
 adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetVenuesAsync(ct)))
     .WithName("AdminListVenues").WithTags("Admin venues").Produces<IReadOnlyList<AdminVenueResponse>>(200);
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); })
@@ -261,6 +393,14 @@ string Member(HttpContext context)
     if (id.Length > 64) throw new DomainException("MEMBER_ID_INVALID");
     return id;
 }
+
+// POST /v1/conversations/{id}/attachments carries a file, so it gets the chat file limit instead of the JSON one.
+static bool IsChatAttachmentUpload(PathString path) =>
+    path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "attachments"];
+
+// POST /v1/conversations/{id}/typing: an ephemeral realtime signal.
+static bool IsTypingSignal(PathString path) =>
+    path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "typing"];
 
 string Idempotency(HttpContext context) => context.Request.Headers[idempotencyKeyHeader].ToString();
 
@@ -294,7 +434,7 @@ static long DecodeCursor(string? cursor)
     catch (FormatException) { throw new DomainException("SYNC_CURSOR_INVALID"); }
 }
 
-static async Task Error(HttpContext context, int status, string code, Exception? exception = null, bool includeStackTrace = false)
+static async Task Error(HttpContext context, int status, string code, Exception? exception = null, bool includeStackTrace = false, object? details = null)
 {
     if (context.Response.HasStarted) return;
     context.Response.StatusCode = status; context.Response.ContentType = "application/problem+json";
@@ -308,7 +448,7 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         "INTERNAL_ERROR" => "The request could not be completed.",
         _ => "The request is invalid or cannot be completed in its current state."
     };
-    await context.Response.WriteAsJsonAsync(new ApiError(code, message, context.TraceIdentifier, StackTrace: includeStackTrace ? exception?.ToString() : null));
+    await context.Response.WriteAsJsonAsync(new ApiError(code, message, context.TraceIdentifier, StackTrace: includeStackTrace ? exception?.ToString() : null, Details: details));
 }
 
 static byte[] ReadIdentityMasterKey(IConfiguration configuration)
@@ -327,3 +467,5 @@ public partial class Program { }
 internal sealed class MemberContextMetadata { }
 internal sealed class OptionalMemberContextMetadata { }
 internal sealed class IfMatchMetadata { }
+// A POST that changes nothing stored, so it needs no Idempotency-Key.
+internal sealed class NoIdempotencyMetadata { }

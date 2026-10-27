@@ -6,6 +6,8 @@ public sealed class MemberAccount
     public string MemberId { get; set; } = "";
     public string CommunityId { get; set; } = "";
     public string Status { get; set; } = "ACTIVE";
+    // Set when the member asks to delete their account (the erasure workflow start); NLP matching excludes them from then on.
+    public DateTimeOffset? DeletedAt { get; set; }
 }
 
 public sealed class MemberProfile
@@ -19,9 +21,29 @@ public sealed class MemberProfile
     public string Status { get; set; } = "DRAFT";
     public decimal CompletenessScore { get; set; }
     public DateTimeOffset? PublishedAt { get; set; }
+    public long? ProfileImageId { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public long Version { get; set; } = 1;
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class MemberProfileImage
+{
+    public long Id { get; set; }
+    public string ImageId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public string OriginalBlobPath { get; set; } = "";
+    public string? DisplayBlobPath { get; set; }
+    public string? ThumbnailBlobPath { get; set; }
+    public string DeclaredContentType { get; set; } = "";
+    public long ContentLength { get; set; }
+    public string ContentSha256 { get; set; } = "";
+    public string Status { get; set; } = "PENDING";
+    public string? FailureCode { get; set; }
+    public DateTimeOffset? ProcessedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class ConsentPolicy
@@ -221,6 +243,43 @@ public sealed class Message
     public long RowVersion { get; set; } = 1;
 }
 
+// storage.file_asset: a private blob and its scan and lifecycle state. Only AVAILABLE once scan_status is CLEAN.
+public sealed class FileAsset
+{
+    public string FileAssetId { get; set; } = "";
+    public string CommunityId { get; set; } = "";
+    public string? OwnerMemberId { get; set; }
+    public string PurposeCode { get; set; } = "CHAT_FILE";
+    public string ContainerName { get; set; } = "";
+    public string BlobPath { get; set; } = "";
+    public string BlobPathHash { get; set; } = "";
+    public string FileName { get; set; } = "";
+    public string MediaType { get; set; } = "";
+    public long SizeBytes { get; set; }
+    public string Sha256 { get; set; } = "";
+    public string Classification { get; set; } = "CONFIDENTIAL";
+    public string ScanStatus { get; set; } = "PENDING";
+    public string LifecycleStatus { get; set; } = "UPLOADING";
+    public DateTimeOffset? ExpiresAt { get; set; }
+    public DateTimeOffset? DeletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+// storage.file_asset_link: attaches a file to a resource, e.g. a chat message (resource_type MESSAGE).
+public sealed class FileAssetLink
+{
+    public long FileAssetLinkId { get; set; }
+    public string FileAssetId { get; set; } = "";
+    public string ResourceType { get; set; } = "";
+    public string ResourceId { get; set; } = "";
+    public string RelationshipType { get; set; } = "PRIMARY";
+    public string? LinkedBy { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? RemovedAt { get; set; }
+}
+
 public sealed class MessageReceipt
 {
     public string MessageId { get; set; } = "";
@@ -259,6 +318,23 @@ public sealed class PrivacyRequest
     public long RowVersion { get; set; } = 1;
 }
 
+// consent.privacy_request_task: one domain's work for a privacy request. The database lets a request complete
+// only when every task is COMPLETED or EXEMPTED with completed_at and evidence_code.
+public sealed class PrivacyRequestTask
+{
+    public long Id { get; set; }
+    public string PrivacyRequestId { get; set; } = "";
+    public string DomainCode { get; set; } = "";
+    public string ActionType { get; set; } = "";
+    public string Status { get; set; } = "PENDING";
+    public short AttemptCount { get; set; }
+    public string? EvidenceCode { get; set; }
+    public DateTimeOffset? StartedAt { get; set; }
+    public DateTimeOffset? CompletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
 public sealed class SyncChange
 {
     public long SyncSequence { get; set; }
@@ -271,6 +347,50 @@ public sealed class SyncChange
     public string? PayloadJson { get; set; }
     public DateTimeOffset OccurredAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset ExpiresAt { get; set; } = DateTimeOffset.UtcNow.AddDays(30);
+}
+
+// ops.idempotency_record: replay boundary for writes that aren't naturally idempotent.
+public sealed class IdempotencyRecord
+{
+    public string Scope { get; set; } = "";
+    public string IdempotencyKey { get; set; } = "";
+    public string ActorId { get; set; } = "";
+    public string RequestHash { get; set; } = "";
+    public short? StatusCode { get; set; }
+    public string? ResponseRef { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset ExpiresAt { get; set; }
+}
+
+// iam.member_device: one app installation. A re-login on the same installation moves it to the new member.
+public sealed class MemberDevice
+{
+    public string DeviceId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public string Platform { get; set; } = "";
+    public string AppVersion { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset LastSeenAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? RevokedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+// notification.push_token: an encrypted APNS/FCM token, unique by its keyed fingerprint.
+public sealed class PushToken
+{
+    public long PushTokenId { get; set; }
+    public string DeviceId { get; set; } = "";
+    public string Provider { get; set; } = "";
+    public byte[] TokenCiphertext { get; set; } = [];
+    public string TokenFingerprint { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset? LastSuccessAt { get; set; }
+    public DateTimeOffset? InvalidatedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
 }
 
 public sealed class OutboxEvent
@@ -290,6 +410,8 @@ public sealed class DomainException(string code, int statusCode = 400) : Excepti
 {
     public string Code { get; } = code;
     public int StatusCode { get; } = statusCode;
+    // Extra fields for the client, returned as "details" in the error body.
+    public object? Details { get; init; }
 }
 
 public sealed class MemberReport

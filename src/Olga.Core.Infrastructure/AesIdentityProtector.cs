@@ -31,6 +31,9 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
 
     public string EmailLookupHash(string email) => LookupHash("EMAIL", NormalizeEmail(email));
 
+    // Bound to the device, so Unprotect(deviceId, provider, ciphertext) reads it back.
+    public ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token) => Protect(provider, deviceId, token, "", false, false);
+
     public string Unprotect(string memberId, string provider, byte[] envelope)
     {
         if (envelope.Length <= 1 + NonceSize + TagSize || envelope[0] != 1) throw new CryptographicException("Unsupported identity ciphertext.");

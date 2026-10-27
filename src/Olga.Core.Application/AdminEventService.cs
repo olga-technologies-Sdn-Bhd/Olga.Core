@@ -15,6 +15,10 @@ public interface IAdminEventService
     Task<AdminEventResponse> UpdateMatchingPolicyAsync(string eventId, AdminEventMatchingPolicyUpdateRequest request, CancellationToken ct);
     Task<IReadOnlyList<AdminAttendeeResponse>> GetAttendeesAsync(string eventId, CancellationToken ct);
     Task<RegistrationResponse> CheckInAsync(string eventId, string memberId, CancellationToken ct);
+    // Who is live now, soonest to expire first.
+    Task<IReadOnlyList<AdminLiveSessionResponse>> GetLiveSessionsAsync(string eventId, CancellationToken ct);
+    // Same effect as the member stopping Live Mode.
+    Task EndLiveSessionAsync(string eventId, string memberId, CancellationToken ct);
     Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct);
     Task<AdminVenueResponse> CreateVenueAsync(AdminVenueCreateRequest request, string idempotencyKey, CancellationToken ct);
 }
@@ -189,6 +193,39 @@ public sealed class AdminEventService(ICoreStore store) : IAdminEventService
         });
         await store.SaveAsync(ct);
         return new(row.EventId, row.MemberId, row.Status, row.RegisteredAt, row.CheckedInAt);
+    }
+
+    public Task<IReadOnlyList<AdminLiveSessionResponse>> GetLiveSessionsAsync(string eventId, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _ = FindEvent(eventId);
+        var now = DateTimeOffset.UtcNow;
+        var sessions = store.LiveSessions.Where(x => x.EventId == eventId && x.Status == "ACTIVE" && x.ActiveUntil > now).OrderBy(x => x.ActiveUntil).ToArray();
+        var memberIds = sessions.Select(x => x.MemberId).ToArray();
+        var names = store.Profiles.Where(x => memberIds.Contains(x.MemberId)).ToDictionary(x => x.MemberId, x => x.DisplayName);
+        IReadOnlyList<AdminLiveSessionResponse> result = sessions
+            .Select(x => new AdminLiveSessionResponse(x.MemberId, string.IsNullOrWhiteSpace(names.GetValueOrDefault(x.MemberId)) ? null : names[x.MemberId], x.SessionId, x.StartedAt, x.ActiveUntil))
+            .ToArray();
+        return Task.FromResult(result);
+    }
+
+    public async Task EndLiveSessionAsync(string eventId, string memberId, CancellationToken ct)
+    {
+        var evt = FindEvent(eventId);
+        var now = DateTimeOffset.UtcNow;
+        var session = store.LiveSessions.SingleOrDefault(x => x.EventId == eventId && x.MemberId == memberId && x.Status == "ACTIVE" && x.ActiveUntil > now)
+            ?? throw new DomainException("LIVE_MODE_NOT_ACTIVE", 404);
+        // Mirrors CoreService.StopLiveModeAsync so the app sees exactly what a member-ended session looks like.
+        session.Status = "DISABLED"; session.RevokedAt = now;
+        store.Add(new SyncChange { CommunityId = evt.CommunityId, MemberScopeId = memberId, ResourceType = "LIVE_MODE", ResourceId = eventId, ChangeType = "DELETE" });
+        store.Add(new OutboxEvent
+        {
+            AggregateType = "LIVE_MODE",
+            AggregateId = session.SessionId,
+            EventType = "LiveModeChanged.v1",
+            PayloadJson = JsonSerializer.Serialize(new { session_id = session.SessionId, event_id = eventId, member_id = memberId, session.Status, ended_by = "ADMIN" }, JsonOptions)
+        });
+        await store.SaveAsync(ct);
     }
 
     public Task<IReadOnlyList<AdminVenueResponse>> GetVenuesAsync(CancellationToken ct)
