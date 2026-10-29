@@ -21,15 +21,17 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
         return Protect("EMAIL", memberId, normalized, hint.Length <= 80 ? hint : hint[..80], isPrimary, true);
     }
 
-    public ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary)
+    public ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary, bool isVerified = false)
     {
         var normalized = NormalizePhone(value);
         var visible = Math.Min(4, normalized.Length - 1);
         var hint = new string('*', normalized.Length - visible) + normalized[^visible..];
-        return Protect("PHONE", memberId, normalized, hint, isPrimary, false);
+        return Protect("PHONE", memberId, normalized, hint, isPrimary, isVerified);
     }
 
     public string EmailLookupHash(string email) => LookupHash("EMAIL", NormalizeEmail(email));
+    public string PhoneLookupHash(string phone) => LookupHash("PHONE", NormalizePhone(phone));
+    public string PhoneVerificationRequestHash(string phone, string code) => LookupHash("PHONE_VERIFICATION", $"{NormalizePhone(phone)}\n{code}");
 
     // Bound to the device, so Unprotect(deviceId, provider, ciphertext) reads it back.
     public ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token) => Protect(provider, deviceId, token, "", false, false);

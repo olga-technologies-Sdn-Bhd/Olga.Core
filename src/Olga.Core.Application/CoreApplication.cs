@@ -36,6 +36,9 @@ public interface ICoreStore
     IQueryable<ModerationCase> ModerationCases { get; }
     IQueryable<MemberReport> MemberReports { get; }
     IQueryable<IdempotencyRecord> IdempotencyRecords { get; }
+    Task<IdempotencyClaim> ClaimIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, DateTimeOffset now, DateTimeOffset leaseExpiresAt, CancellationToken ct);
+    Task CompleteIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, short statusCode, string? responseRef, DateTimeOffset expiresAt, CancellationToken ct);
+    Task ReleaseIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, CancellationToken ct);
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
@@ -51,11 +54,15 @@ public interface ICoreStore
 }
 
 public sealed record MatchScore(long MatchResultId, string RequesterId, string CandidateId, decimal Score);
+public sealed record IdempotencyClaim(bool Acquired, string RequestHash, short? StatusCode, string? ResponseRef, DateTimeOffset ExpiresAt);
 
 public interface ICoreService
 {
     Task<MemberRegistrationResponse> RegisterMemberAsync(string communityId, MemberCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<MemberLookupResponse> LookupMemberByEmailAsync(MemberLookupRequest request, CancellationToken ct);
+    Task<MemberLookupResponse> LookupMemberByPhoneAsync(PhoneMemberLookupRequest request, CancellationToken ct);
+    Task<PhoneVerificationStartResponse> StartPhoneVerificationAsync(PhoneVerificationStartRequest request, string idempotencyKey, CancellationToken ct);
+    Task<PhoneVerificationCheckResponse> CheckPhoneVerificationAsync(PhoneVerificationCheckRequest request, string idempotencyKey, CancellationToken ct);
     Task ProvisionMemberAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
@@ -146,15 +153,27 @@ public sealed record NewMemberRegistration(
 public interface IIdentityProtector
 {
     ProtectedIdentity ProtectEmail(string memberId, string value, bool isPrimary);
-    ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary);
+    ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary, bool isVerified = false);
     // Keyed lookup hash for an email, identical to the SubjectHash ProtectEmail stores.
     string EmailLookupHash(string email);
+    string PhoneLookupHash(string phone);
+    string PhoneVerificationRequestHash(string phone, string code);
     // SubjectHash is the token's keyed fingerprint; DisplayHint is empty.
     ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token);
     string Unprotect(string memberId, string provider, byte[] ciphertext);
 }
 
-public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null, IChatTypingPublisher? typingPublisher = null) : ICoreService
+public sealed record PhoneVerificationProof(string Token, DateTimeOffset ExpiresAt);
+
+public interface IPhoneVerificationProvider
+{
+    Task StartAsync(string phone, string channel, string rateLimitValue, CancellationToken ct);
+    Task<PhoneVerificationProof> CheckAsync(string phone, string code, CancellationToken ct);
+    PhoneVerificationProof RestoreProof(string phone, DateTimeOffset expiresAt);
+    bool ValidateProof(string phone, string token);
+}
+
+public sealed class CoreService(ICoreStore store, IIdentityProtector identityProtector, IProfileImageStorage? profileImageStorage = null, IChatFileStorage? chatFileStorage = null, ChatFileOptions? chatFileOptions = null, IChatTypingPublisher? typingPublisher = null, IPhoneVerificationProvider? phoneVerificationProvider = null) : ICoreService
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web) { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
@@ -171,8 +190,16 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var memberHash = Hash("iam.register_member", communityId, idempotencyKey);
         var memberId = $"mem_{memberHash[..32]}";
         var identities = new List<ProtectedIdentity>(2);
+        if (request.PhoneVerificationToken is not null && string.IsNullOrWhiteSpace(request.Phone)) throw new DomainException("MEMBER_PHONE_INVALID");
+        var phoneVerified = false;
+        if (!string.IsNullOrWhiteSpace(request.PhoneVerificationToken))
+        {
+            phoneVerified = PhoneVerification().ValidateProof(request.Phone!, request.PhoneVerificationToken);
+            if (!phoneVerified) throw new DomainException("PHONE_VERIFICATION_INVALID", 403);
+        }
+        if (!string.IsNullOrWhiteSpace(request.Phone) && !phoneVerified) throw new DomainException("PHONE_VERIFICATION_REQUIRED", 403);
         if (!string.IsNullOrWhiteSpace(request.Email)) identities.Add(identityProtector.ProtectEmail(memberId, request.Email, true));
-        if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0));
+        if (!string.IsNullOrWhiteSpace(request.Phone)) identities.Add(identityProtector.ProtectPhone(memberId, request.Phone, identities.Count == 0, phoneVerified));
         // An email or phone whose member is waiting for deletion can't come back as that member or a new one.
         foreach (var identity in identities)
         {
@@ -209,6 +236,104 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
         var mapped = Map(profile);
         return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
+    }
+
+    public Task<MemberLookupResponse> LookupMemberByPhoneAsync(PhoneMemberLookupRequest request, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(request.Phone) || string.IsNullOrWhiteSpace(request.VerificationToken))
+            throw new DomainException("PHONE_VERIFICATION_REQUIRED", 403);
+        if (!PhoneVerification().ValidateProof(request.Phone, request.VerificationToken))
+            throw new DomainException("PHONE_VERIFICATION_INVALID", 403);
+        var subjectHash = identityProtector.PhoneLookupHash(request.Phone);
+        var memberId = store.Identities
+            .Where(x => x.Provider == "PHONE" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE" && x.VerifiedAt != null)
+            .Select(x => x.MemberId)
+            .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        if (IsDeletionPending(memberId)) throw DeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var mapped = Map(profile);
+        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
+    }
+
+    public async Task<PhoneVerificationStartResponse> StartPhoneVerificationAsync(PhoneVerificationStartRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (string.IsNullOrWhiteSpace(request.Phone)) throw new DomainException("MEMBER_PHONE_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Channel)) throw new DomainException("PHONE_VERIFICATION_CHANNEL_INVALID");
+        var channel = request.Channel.Trim().ToLowerInvariant();
+        if (channel != "sms") throw new DomainException("PHONE_VERIFICATION_CHANNEL_INVALID");
+        const string scope = "iam.phone_verification.start";
+        const string actor = "ANONYMOUS";
+        var phoneHash = identityProtector.PhoneLookupHash(request.Phone);
+        var requestHash = Hash(scope, phoneHash, channel);
+        var now = DateTimeOffset.UtcNow;
+        var claim = await store.ClaimIdempotencyAsync(scope, actor, idempotencyKey, requestHash, now, now.AddMinutes(1), ct);
+        if (!claim.Acquired)
+        {
+            EnsureReplayMatches(claim, requestHash);
+            if (claim.StatusCode == 202) return new("PENDING");
+            throw ReplayFailure(claim);
+        }
+        var providerCompleted = false;
+        try
+        {
+            await PhoneVerification().StartAsync(request.Phone, channel, phoneHash, ct);
+            providerCompleted = true;
+            await store.CompleteIdempotencyAsync(scope, actor, idempotencyKey, requestHash, 202, "PENDING", now.AddHours(24), CancellationToken.None);
+            return new("PENDING");
+        }
+        catch (DomainException ex) when (ex.StatusCode < 500 && ex.StatusCode != 429)
+        {
+            await store.CompleteIdempotencyAsync(scope, actor, idempotencyKey, requestHash, (short)ex.StatusCode, ex.Code, now.AddHours(24), CancellationToken.None);
+            throw;
+        }
+        catch
+        {
+            if (!providerCompleted) await store.ReleaseIdempotencyAsync(scope, actor, idempotencyKey, requestHash, CancellationToken.None);
+            throw;
+        }
+    }
+
+    public async Task<PhoneVerificationCheckResponse> CheckPhoneVerificationAsync(PhoneVerificationCheckRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        if (string.IsNullOrWhiteSpace(request.Phone)) throw new DomainException("MEMBER_PHONE_INVALID");
+        if (string.IsNullOrWhiteSpace(request.Code) || request.Code.Length is < 4 or > 10 || request.Code.Any(c => !char.IsAsciiDigit(c)))
+            throw new DomainException("PHONE_VERIFICATION_CODE_INVALID");
+        const string scope = "iam.phone_verification.check";
+        const string actor = "ANONYMOUS";
+        var requestHash = identityProtector.PhoneVerificationRequestHash(request.Phone, request.Code);
+        var now = DateTimeOffset.UtcNow;
+        var claim = await store.ClaimIdempotencyAsync(scope, actor, idempotencyKey, requestHash, now, now.AddMinutes(1), ct);
+        if (!claim.Acquired)
+        {
+            EnsureReplayMatches(claim, requestHash);
+            if (claim.StatusCode == 200 && long.TryParse(claim.ResponseRef, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var expiresUnix))
+            {
+                var restored = PhoneVerification().RestoreProof(request.Phone, DateTimeOffset.FromUnixTimeSeconds(expiresUnix));
+                return new(restored.Token, restored.ExpiresAt);
+            }
+            throw ReplayFailure(claim);
+        }
+        var providerCompleted = false;
+        try
+        {
+            var proof = await PhoneVerification().CheckAsync(request.Phone, request.Code, ct);
+            providerCompleted = true;
+            await store.CompleteIdempotencyAsync(scope, actor, idempotencyKey, requestHash, 200, proof.ExpiresAt.ToUnixTimeSeconds().ToString(System.Globalization.CultureInfo.InvariantCulture), proof.ExpiresAt, CancellationToken.None);
+            return new(proof.Token, proof.ExpiresAt);
+        }
+        catch (DomainException ex) when (ex.StatusCode < 500 && ex.StatusCode != 429)
+        {
+            await store.CompleteIdempotencyAsync(scope, actor, idempotencyKey, requestHash, (short)ex.StatusCode, ex.Code, now.AddHours(24), CancellationToken.None);
+            throw;
+        }
+        catch
+        {
+            if (!providerCompleted) await store.ReleaseIdempotencyAsync(scope, actor, idempotencyKey, requestHash, CancellationToken.None);
+            throw;
+        }
     }
 
     public Task ProvisionMemberAsync(string memberId, CancellationToken ct)
@@ -1458,6 +1583,14 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+    private static void EnsureReplayMatches(IdempotencyClaim claim, string requestHash)
+    {
+        if (!string.Equals(claim.RequestHash, requestHash, StringComparison.Ordinal)) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+    }
+    private static DomainException ReplayFailure(IdempotencyClaim claim) => claim.StatusCode is null
+        ? new DomainException("PHONE_VERIFICATION_IN_PROGRESS", 409)
+        : new DomainException(claim.ResponseRef ?? "PHONE_VERIFICATION_REJECTED", claim.StatusCode ?? 409);
+    private IPhoneVerificationProvider PhoneVerification() => phoneVerificationProvider ?? throw new DomainException("PHONE_VERIFICATION_UNAVAILABLE", 503);
     private static string Hash(params string?[] values) => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(string.Join('\n', values)))).ToLowerInvariant();
     private ProfileResponse Map(MemberProfile x)
     {

@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using Azure.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.SignalR;
@@ -19,6 +20,8 @@ const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
 const string adminCorsPolicy = "AdminPortal";
+const string phoneSendRateLimit = "PhoneVerificationSend";
+const string phoneCheckRateLimit = "PhoneVerificationCheck";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
 var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
@@ -66,6 +69,22 @@ builder.Services.AddOpenApi(options =>
     });
 });
 builder.Services.AddHealthChecks();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy(phoneSendRateLimit, context => RateLimitPartition.GetSlidingWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new SlidingWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), SegmentsPerWindow = 10, QueueLimit = 0, QueueProcessingOrder = QueueProcessingOrder.OldestFirst, AutoReplenishment = true }));
+    options.AddPolicy(phoneCheckRateLimit, context => RateLimitPartition.GetSlidingWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new SlidingWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromMinutes(10), SegmentsPerWindow = 10, QueueLimit = 0, QueueProcessingOrder = QueueProcessingOrder.OldestFirst, AutoReplenishment = true }));
+    options.OnRejected = async (context, ct) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            context.HttpContext.Response.Headers["Retry-After"] = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        await Error(context.HttpContext, 429, "PHONE_VERIFICATION_RATE_LIMITED");
+    };
+});
 // Realtime chat through Azure SignalR when SignalR:Endpoint is set (keyless, managed identity); in-process otherwise.
 var signalR = builder.Services.AddSignalR();
 var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
@@ -87,6 +106,22 @@ var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
+var twilioOptions = builder.Configuration.GetSection(TwilioVerifyOptions.SectionName).Get<TwilioVerifyOptions>() ?? new TwilioVerifyOptions();
+if (twilioOptions.ProofLifetimeMinutes is < 1 or > 30)
+    throw new InvalidOperationException("Twilio ProofLifetimeMinutes must be from 1 to 30.");
+if (string.IsNullOrWhiteSpace(twilioOptions.RateLimitName) || twilioOptions.RateLimitName.Length > 64
+    || twilioOptions.RateLimitName.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '_'))
+    throw new InvalidOperationException("Twilio RateLimitName must contain only ASCII letters, digits, or underscores and be at most 64 characters.");
+if (!local && (string.IsNullOrWhiteSpace(twilioOptions.AccountSid) || string.IsNullOrWhiteSpace(twilioOptions.AuthToken)
+    || string.IsNullOrWhiteSpace(twilioOptions.VerifyServiceSid)))
+    throw new InvalidOperationException("Twilio AccountSid, AuthToken, and VerifyServiceSid are required.");
+builder.Services.AddHttpClient<IPhoneVerificationProvider, TwilioPhoneVerificationProvider>(client =>
+{
+    client.BaseAddress = new Uri("https://verify.twilio.com/");
+    client.Timeout = TimeSpan.FromSeconds(10);
+});
+builder.Services.AddSingleton(twilioOptions);
+builder.Services.AddSingleton(identityMasterKey);
 var chatFileOptions = builder.Configuration.GetSection(ChatFileOptions.SectionName).Get<ChatFileOptions>() ?? new ChatFileOptions();
 builder.Services.AddSingleton(chatFileOptions);
 if (local) builder.Services.AddSingleton<IChatFileStorage, InMemoryChatFileStorage>();
@@ -104,6 +139,7 @@ builder.Services.AddScoped<IAdminService, AdminService>();
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
 app.UseCors(adminCorsPolicy);
+app.UseRateLimiter();
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
@@ -173,6 +209,21 @@ v1.MapPost("/members/lookup", async (HttpContext c, MemberLookupRequest body, IC
     return Results.Ok(value);
 })
     .WithName("LookupMember").WithTags("Members").Produces<MemberLookupResponse>(200);
+v1.MapPost("/members/lookup/phone", async (HttpContext c, PhoneMemberLookupRequest body, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.LookupMemberByPhoneAsync(body, ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
+    .WithName("LookupMemberByPhone").WithTags("Phone authentication").Produces<MemberLookupResponse>(200);
+v1.MapPost("/auth/phone/verifications", async (HttpContext c, PhoneVerificationStartRequest body, ICoreService s, CancellationToken ct) =>
+    Results.Accepted(value: await s.StartPhoneVerificationAsync(body, Idempotency(c), ct)))
+    .RequireRateLimiting(phoneSendRateLimit)
+    .WithName("StartPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationStartResponse>(202).Produces(429);
+v1.MapPost("/auth/phone/verification-checks", async (HttpContext c, PhoneVerificationCheckRequest body, ICoreService s, CancellationToken ct) =>
+    Results.Ok(await s.CheckPhoneVerificationAsync(body, Idempotency(c), ct)))
+    .RequireRateLimiting(phoneCheckRateLimit)
+    .WithName("CheckPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationCheckResponse>(200).Produces(429);
 var profileV1 = memberV1.MapGroup("/me/profile");
 profileV1.AddEndpointFilter(async (invocationContext, next) =>
 {

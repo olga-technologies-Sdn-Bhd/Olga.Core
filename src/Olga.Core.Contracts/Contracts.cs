@@ -17,10 +17,16 @@ public sealed record MemberCreateRequest(
     string? ProfessionalSummary = null,
     string? RoleCategory = null,
     string Locale = "en",
-    string Visibility = "MEMBERS");
+    string Visibility = "MEMBERS",
+    string? PhoneVerificationToken = null);
 public sealed record MemberRegistrationResponse(string MemberId, string? EmailHint, string? PhoneHint, string ProfileStatus, string ETag);
 public sealed record MemberLookupRequest(string? Email);
+public sealed record PhoneMemberLookupRequest(string? Phone, string? VerificationToken);
 public sealed record MemberLookupResponse(string MemberId, string DisplayName, string ProfileStatus, string ETag);
+public sealed record PhoneVerificationStartRequest(string? Phone, string Channel = "sms");
+public sealed record PhoneVerificationStartResponse(string Status);
+public sealed record PhoneVerificationCheckRequest(string? Phone, string? Code);
+public sealed record PhoneVerificationCheckResponse(string VerificationToken, DateTimeOffset ExpiresAt);
 // display_name is null when another member reads a profile they aren't connected to.
 // email_hint and phone_hint are the member's own masked contact details: set only on /v1/me/profile, never for another member.
 public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? ProfileImageUrl = null, string? ProfileImageStatus = null, string? EmailHint = null, string? PhoneHint = null);

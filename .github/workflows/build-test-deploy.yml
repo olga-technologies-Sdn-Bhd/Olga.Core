@@ -173,7 +173,7 @@ jobs:
             --query "properties.template.containers[0].env[].name" \
             --output tsv)
           has_api_env() { printf '%s\n' "${api_env_names[@]}" | grep -Fxq "$1"; }
-          for required_name in SignalR__Required SignalR__Endpoint SignalR__ManagedIdentityClientId; do
+          for required_name in SignalR__Required SignalR__Endpoint SignalR__ManagedIdentityClientId Twilio__AccountSid Twilio__AuthToken Twilio__VerifyServiceSid; do
             has_api_env "$required_name" || { echo "Core API is missing $required_name" >&2; exit 1; }
           done
 

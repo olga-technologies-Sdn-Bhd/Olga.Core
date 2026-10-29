@@ -15,7 +15,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var request = new MemberCreateRequest("New member", "Member@Example.com", "+919876543210");
+        var request = new MemberCreateRequest("New member", "Member@Example.com", "+919876543210", PhoneVerificationToken: "verified");
 
         var first = await service.RegisterMemberAsync("olga", request, "register-1", default);
         var replay = await service.RegisterMemberAsync("olga", request, "register-1", default);
@@ -32,7 +32,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "Asha@Example.com", "+60123456789"), "register-lookup", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "Asha@Example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-lookup", default);
 
         var exact = await service.LookupMemberByEmailAsync(new("asha@example.com"), default);
         var variant = await service.LookupMemberByEmailAsync(new("  ASHA@example.COM "), default);
@@ -47,7 +47,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        await service.RegisterMemberAsync("olga", new MemberCreateRequest("Phone only", Phone: "+60123456789"), "register-phone", default);
+        await service.RegisterMemberAsync("olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "verified"), "register-phone", default);
 
         var unknown = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("nobody@example.com"), default));
         var missing = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("  "), default));
@@ -85,11 +85,76 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Phone_registration_requires_a_valid_verification_proof_and_marks_the_identity_verified()
+    {
+        await using var db = Db();
+        var service = Service(db);
+
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Email and phone", "member@example.com", "+60123456789"), "phone-missing", default));
+        var invalid = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "invalid"), "phone-invalid", default));
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "verified"), "phone-valid", default);
+
+        Assert.Equal(("PHONE_VERIFICATION_REQUIRED", 403), (missing.Code, missing.StatusCode));
+        Assert.Equal(("PHONE_VERIFICATION_INVALID", 403), (invalid.Code, invalid.StatusCode));
+        Assert.NotNull(Assert.Single(db.MemberIdentities, x => x.MemberId == registered.MemberId).VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Verified_phone_lookup_returns_the_registered_member()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone lookup", "phone@example.com", "+60123456789", PhoneVerificationToken: "verified"), "phone-lookup", default);
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal(registered.MemberId, found.MemberId);
+        Assert.NotNull(Assert.Single(db.MemberIdentities, x => x.MemberId == registered.MemberId && x.Provider == "PHONE").VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Starting_phone_verification_replays_without_sending_another_sms()
+    {
+        await using var db = Db();
+        var provider = new FakePhoneVerificationProvider();
+        var service = new CoreService(db, IdentityProtector, phoneVerificationProvider: provider);
+
+        await service.StartPhoneVerificationAsync(new("+60123456789"), "send-code", default);
+        await service.StartPhoneVerificationAsync(new("+60123456789"), "send-code", default);
+        var reused = await Assert.ThrowsAsync<DomainException>(() =>
+            service.StartPhoneVerificationAsync(new("+60123456780"), "send-code", default));
+
+        Assert.Equal(1, provider.StartCount);
+        Assert.Equal(("IDEMPOTENCY_KEY_REUSED", 409), (reused.Code, reused.StatusCode));
+    }
+
+    [Fact]
+    public async Task Checking_phone_verification_replays_the_proof_without_calling_twilio_again()
+    {
+        await using var db = Db();
+        var provider = new FakePhoneVerificationProvider();
+        var service = new CoreService(db, IdentityProtector, phoneVerificationProvider: provider);
+
+        var first = await service.CheckPhoneVerificationAsync(new("+60123456789", "123456"), "check-code", default);
+        var replay = await service.CheckPhoneVerificationAsync(new("+60123456789", "123456"), "check-code", default);
+        var reused = await Assert.ThrowsAsync<DomainException>(() =>
+            service.CheckPhoneVerificationAsync(new("+60123456789", "654321"), "check-code", default));
+
+        Assert.Equal(first, replay);
+        Assert.Equal(1, provider.CheckCount);
+        Assert.Equal(("IDEMPOTENCY_KEY_REUSED", 409), (reused.Code, reused.StatusCode));
+    }
+
+    [Fact]
     public async Task Own_profile_returns_the_masked_contact_hints_from_registration()
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "Member@Example.com", "+919876543210"), "register-1", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "Member@Example.com", "+919876543210", PhoneVerificationToken: "verified"), "register-1", default);
 
         var own = await service.GetOwnProfileAsync(registered.MemberId, default);
         var updated = await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), own.ETag, default);
@@ -118,7 +183,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com", "+919876543210"), "register-1", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com", "+919876543210", PhoneVerificationToken: "verified"), "register-1", default);
         var other = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Other member", "other@example.com"), "register-2", default);
         await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), "\"1\"", default);
 
@@ -985,13 +1050,13 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-del", default);
         var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
 
         var lookup = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new(" ASHA@example.com"), default));
         var byEmail = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", "asha@example.com"), "register-del-2", default));
-        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789"), "register-del-3", default));
-        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default));
+        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789", PhoneVerificationToken: "verified"), "register-del-3", default));
+        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-del", default));
 
         foreach (var error in new[] { lookup, byEmail, byPhone, replay })
         {
@@ -1318,7 +1383,17 @@ public sealed class CoreServiceTests
     }
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
-    private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
+    private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector, phoneVerificationProvider: new FakePhoneVerificationProvider());
+
+    private sealed class FakePhoneVerificationProvider : IPhoneVerificationProvider
+    {
+        public int StartCount { get; private set; }
+        public int CheckCount { get; private set; }
+        public Task StartAsync(string phone, string channel, string rateLimitValue, CancellationToken ct) { StartCount++; return Task.CompletedTask; }
+        public Task<PhoneVerificationProof> CheckAsync(string phone, string code, CancellationToken ct) { CheckCount++; var expires = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds()); return Task.FromResult(new PhoneVerificationProof("verified", expires)); }
+        public PhoneVerificationProof RestoreProof(string phone, DateTimeOffset expiresAt) => new("verified", expiresAt);
+        public bool ValidateProof(string phone, string token) => token == "verified";
+    }
     [Fact]
     public async Task Event_list_marks_registration_only_for_the_supplied_member()
     {

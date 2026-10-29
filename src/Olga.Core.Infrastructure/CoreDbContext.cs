@@ -12,6 +12,7 @@ namespace Olga.Core.Infrastructure;
 
 public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbContext(options), ICoreStore
 {
+    private static readonly SemaphoreSlim IdempotencyGate = new(1, 1);
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
     public DbSet<MemberProfileImage> MemberProfileImages => Set<MemberProfileImage>();
@@ -93,6 +94,83 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
             if (mapped is null) entry.State = EntityState.Detached;
             else entry.Entity.ResourceType = mapped;
         }
+    }
+
+    async Task<IdempotencyClaim> ICoreStore.ClaimIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, DateTimeOffset now, DateTimeOffset leaseExpiresAt, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            await IdempotencyGate.WaitAsync(ct);
+            try
+            {
+                var existing = await IdempotencyRecords.SingleOrDefaultAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey, ct);
+                if (existing is not null && existing.ExpiresAt <= now) { IdempotencyRecords.Remove(existing); await SaveChangesAsync(ct); existing = null; }
+                if (existing is not null) return new(false, existing.RequestHash, existing.StatusCode, existing.ResponseRef, existing.ExpiresAt);
+                var created = new IdempotencyRecord { Scope = scope, ActorId = actorId, IdempotencyKey = idempotencyKey, RequestHash = requestHash, StatusCode = null, ExpiresAt = leaseExpiresAt };
+                IdempotencyRecords.Add(created);
+                await SaveChangesAsync(ct);
+                return new(true, requestHash, null, null, leaseExpiresAt);
+            }
+            finally { IdempotencyGate.Release(); }
+        }
+
+        var connection = (NpgsqlConnection)Database.GetDbConnection();
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using (var remove = CreateCommand("DELETE FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND expires_at <= @now", transaction))
+            {
+                AddVarchar(remove, "scope", scope, 64); AddVarchar(remove, "actor_id", actorId, 64); AddVarchar(remove, "idempotency_key", idempotencyKey, 128); AddTimestamp(remove, "now", now);
+                await remove.ExecuteNonQueryAsync(ct);
+            }
+            var acquired = false;
+            await using (var insert = CreateCommand("""
+                INSERT INTO ops.idempotency_record(scope, actor_id, idempotency_key, request_hash, status_code, created_at, expires_at)
+                VALUES (@scope, @actor_id, @idempotency_key, @request_hash, NULL, @now, @lease_expires_at)
+                ON CONFLICT (scope, actor_id, idempotency_key) DO NOTHING
+                """, transaction))
+            {
+                AddVarchar(insert, "scope", scope, 64); AddVarchar(insert, "actor_id", actorId, 64); AddVarchar(insert, "idempotency_key", idempotencyKey, 128); AddChar(insert, "request_hash", requestHash); AddTimestamp(insert, "now", now); AddTimestamp(insert, "lease_expires_at", leaseExpiresAt);
+                acquired = await insert.ExecuteNonQueryAsync(ct) == 1;
+            }
+            await using var select = CreateCommand("SELECT request_hash, status_code, response_ref, expires_at FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key", transaction);
+            AddVarchar(select, "scope", scope, 64); AddVarchar(select, "actor_id", actorId, 64); AddVarchar(select, "idempotency_key", idempotencyKey, 128);
+            await using var reader = await select.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("Idempotency claim was not persisted.");
+            var result = new IdempotencyClaim(acquired, reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetInt16(1), reader.IsDBNull(2) ? null : reader.GetString(2), GetInstant(reader, "expires_at"));
+            await reader.DisposeAsync();
+            await transaction.CommitAsync(ct);
+            return result;
+        }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task ICoreStore.CompleteIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, short statusCode, string? responseRef, DateTimeOffset expiresAt, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var row = await IdempotencyRecords.SingleAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey && x.RequestHash == requestHash && x.StatusCode == null, ct);
+            row.StatusCode = statusCode; row.ResponseRef = responseRef; row.ExpiresAt = expiresAt; await SaveChangesAsync(ct); return;
+        }
+        await using var command = CreateCommand("UPDATE ops.idempotency_record SET status_code = @status_code, response_ref = @response_ref, expires_at = @expires_at WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND request_hash = @request_hash AND status_code IS NULL");
+        command.Parameters.Add(new NpgsqlParameter("status_code", NpgsqlDbType.Smallint) { Value = statusCode }); AddNullableVarchar(command, "response_ref", responseRef, 128); AddTimestamp(command, "expires_at", expiresAt); AddVarchar(command, "scope", scope, 64); AddVarchar(command, "actor_id", actorId, 64); AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+        var close = await OpenIfNeededAsync(ct);
+        try { if (await command.ExecuteNonQueryAsync(ct) != 1) throw new InvalidOperationException("Idempotency claim is no longer active."); }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task ICoreStore.ReleaseIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var row = await IdempotencyRecords.SingleOrDefaultAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey && x.RequestHash == requestHash && x.StatusCode == null, ct);
+            if (row is not null) { IdempotencyRecords.Remove(row); await SaveChangesAsync(ct); }
+            return;
+        }
+        await using var command = CreateCommand("DELETE FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND request_hash = @request_hash AND status_code IS NULL");
+        AddVarchar(command, "scope", scope, 64); AddVarchar(command, "actor_id", actorId, 64); AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+        var close = await OpenIfNeededAsync(ct); try { await command.ExecuteNonQueryAsync(ct); } finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
     async Task ICoreStore.CreateMemberAsync(NewMemberRegistration member, CancellationToken ct)

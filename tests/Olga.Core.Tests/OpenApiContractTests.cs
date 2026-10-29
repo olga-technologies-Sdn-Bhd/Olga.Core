@@ -69,6 +69,18 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertNoHeader(lookupByEmail, "X-Member-Id");
         Assert.Equal("LookupMember", lookupByEmail.GetProperty("operationId").GetString());
 
+        var startPhoneVerification = Operation(document, "/v1/auth/phone/verifications", "post");
+        AssertHeader(startPhoneVerification, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(startPhoneVerification, "X-Member-Id");
+
+        var checkPhoneVerification = Operation(document, "/v1/auth/phone/verification-checks", "post");
+        AssertHeader(checkPhoneVerification, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(checkPhoneVerification, "X-Member-Id");
+
+        var lookupByPhone = Operation(document, "/v1/members/lookup/phone", "post");
+        AssertHeader(lookupByPhone, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(lookupByPhone, "X-Member-Id");
+
         var publicEvents = Operation(document, "/v1/events", "get");
         AssertHeader(publicEvents, "X-Member-Id", required: false, maxLength: 64);
 
