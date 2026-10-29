@@ -67,10 +67,13 @@ Configure the API container with the following exact environment-variable names:
 | `SignalR__Required` | No | Set to `true` in Azure so a missing realtime endpoint fails startup instead of silently selecting in-process SignalR |
 | `SignalR__Endpoint` | No | Azure SignalR HTTPS endpoint |
 | `SignalR__ManagedIdentityClientId` | No | Core API runtime identity client ID |
-| `Twilio__AccountSid` | No | Twilio account SID used for Verify API Basic authentication |
+| `Twilio__Enabled` | No | Feature gate. When `false`, Core does not register Twilio and the remaining Twilio credentials are not required. |
+| `Twilio__AccountSid` | No | Twilio account SID providing the account context for the restricted API key |
+| `Twilio__ApiKeySid` | No | Restricted Twilio API key SID used as the Basic authentication username |
 | `Twilio__VerifyServiceSid` | No | Twilio Verify service SID |
-| `Twilio__AuthToken` | Yes; use a Key Vault-backed Container Apps secret reference | Twilio API auth token; never expose it through GitHub variables or logs |
-| `Twilio__RateLimitName` | No | Optional Twilio Verify Programmable Rate Limit unique name; defaults to `olga_phone`, which must exist on the Verify Service |
+| `Twilio__ApiKeySecret` | Yes; map to Key Vault secret `twilio-api-key-secret` through a Container Apps secret reference | Restricted API key secret used as the Basic authentication password; never expose it through GitHub variables or logs |
+| `Twilio__TokenTtlSeconds` | No | Phone-bound verification-proof lifetime; defaults to `300`, allowed range `120`-`86400` |
+| `Twilio__RateLimitName` | No | Optional Twilio Verify Programmable Rate Limit unique name. Leave blank unless the matching rate limit exists on the Verify Service. |
 
 The API intentionally does not validate caller identity in this open MVP configuration. Requests may select any member with `X-Member-Id`, so the deployment must not be treated as suitable for public or sensitive member data. Never place database credentials or tokens in GitHub variables, workflow YAML, logs, or OpenAPI documents.
 

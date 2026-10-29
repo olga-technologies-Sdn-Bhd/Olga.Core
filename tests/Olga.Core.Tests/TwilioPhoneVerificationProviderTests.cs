@@ -9,10 +9,12 @@ public sealed class TwilioPhoneVerificationProviderTests
 {
     private static readonly TwilioVerifyOptions Options = new()
     {
+        Enabled = true,
         AccountSid = "AC00000000000000000000000000000000",
-        AuthToken = "secret",
+        ApiKeySid = "SK00000000000000000000000000000000",
+        ApiKeySecret = "secret",
         VerifyServiceSid = "VA00000000000000000000000000000000",
-        ProofLifetimeMinutes = 10
+        TokenTtlSeconds = 300
     };
 
     [Fact]
@@ -26,7 +28,9 @@ public sealed class TwilioPhoneVerificationProviderTests
         Assert.Equal(HttpMethod.Post, handler.Method);
         Assert.Equal("https://verify.twilio.com/v2/Services/VA00000000000000000000000000000000/Verifications", handler.Uri?.ToString());
         Assert.Equal("Basic", handler.Authorization?.Scheme);
-        Assert.Equal("To=%2B60123456789&Channel=sms&RateLimits%5Bolga_phone%5D=phone-hash&RiskCheck=enable", handler.Body);
+        Assert.Equal("SK00000000000000000000000000000000:secret",
+            Encoding.ASCII.GetString(Convert.FromBase64String(handler.Authorization!.Parameter!)));
+        Assert.Equal("To=%2B60123456789&Channel=sms&RiskCheck=enable", handler.Body);
     }
 
     [Fact]
@@ -36,7 +40,7 @@ public sealed class TwilioPhoneVerificationProviderTests
 
         var proof = await provider.CheckAsync("+60123456789", "123456", default);
 
-        Assert.Equal(new DateTimeOffset(2026, 10, 29, 0, 10, 0, TimeSpan.Zero), proof.ExpiresAt);
+        Assert.Equal(new DateTimeOffset(2026, 10, 29, 0, 5, 0, TimeSpan.Zero), proof.ExpiresAt);
         Assert.True(provider.ValidateProof("+60123456789", proof.Token));
         Assert.False(provider.ValidateProof("+60123456780", proof.Token));
         Assert.DoesNotContain("123456", proof.Token, StringComparison.Ordinal);

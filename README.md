@@ -47,11 +47,11 @@ The client calls member registration only after the upstream email OTP step succ
 
 Phone authentication uses Twilio Verify; Core never generates or stores OTP values. The client flow is:
 
-1. `POST /v1/auth/phone/verifications` with `{ "phone": "+919876543210", "channel": "sms" }` to send a code.
+1. `POST /v1/auth/phone/verifications` with `{ "phone": "+60123456789", "channel": "sms" }` to send a code.
 2. `POST /v1/auth/phone/verification-checks` with the same phone and the submitted `code`. A successful response contains a short-lived `verification_token` and `expires_at`.
 3. For a new phone-only member, pass that token as `phone_verification_token` to `POST /v1/members`. For an existing member, call `POST /v1/members/lookup/phone` with `phone` and `verification_token`.
 
-All three calls require a distinct `Idempotency-Key`. Proofs are signed, bound to the normalized E.164 phone number, and valid for 10 minutes by default. They contain no OTP or plaintext phone number and are not persisted. Every phone supplied during registration requires a valid proof; an unverified phone never reserves an identity or becomes eligible for phone sign-in.
+All three calls require a distinct `Idempotency-Key`. Proofs are signed, bound to the normalized E.164 phone number, and valid for 300 seconds by default. They contain no OTP or plaintext phone number and are not persisted. Every phone supplied during registration requires a valid proof; an unverified phone never reserves an identity or becomes eligible for phone sign-in.
 
 ### 1. Create the member
 
@@ -67,12 +67,12 @@ Content-Type: application/json
 {
   "display_name": "New Member",
   "email": "member@example.com",
-  "phone": "+919876543210",
+  "phone": "+60123456789",
   "phone_verification_token": "<token from the verification-check response>",
   "headline": "Software Engineer",
   "professional_summary": "Building professional connections",
   "role_category": "ENGINEERING",
-  "locale": "en-IN",
+  "locale": "en-MY",
   "visibility": "MEMBERS"
 }
 ```
@@ -161,11 +161,11 @@ Do not commit the master key, print it in logs, or rotate/delete it without a mi
 
 ## Twilio Verify configuration
 
-Production sets `Twilio__AccountSid`, `Twilio__VerifyServiceSid`, and the Key Vault-backed secret `Twilio__AuthToken` on the Core API Container App. `Twilio__ProofLifetimeMinutes` is optional (default `10`, allowed range `1`-`30`) and `Twilio__RateLimitName` defaults to `olga_phone`. Twilio Verify is always registered; non-local startup and the CI deployment guard fail when the required configuration is missing. The Twilio auth token must never be committed or logged.
+Set `Twilio__Enabled=true` only after the environment's credentials exist. An enabled environment requires `Twilio__AccountSid`, `Twilio__ApiKeySid`, `Twilio__VerifyServiceSid`, and the Key Vault-backed secret `Twilio__ApiKeySecret`. The provider authenticates with the restricted API key SID and secret; the account SID supplies the account context. `Twilio__TokenTtlSeconds` controls the phone-bound proof lifetime (default `300`, allowed range `120`-`86400`). Disabled environments do not register the provider or require its credentials. The API key secret must never be committed or logged.
 
-The Azure/Terraform repository that owns the Container App must add those environment-variable bindings and a Key Vault secret reference for `Twilio__AuthToken`; this repository does not own that infrastructure definition.
+The Azure/Terraform repository that owns the Container App must add those environment-variable bindings and map `Twilio__ApiKeySecret` to the existing Key Vault secret `twilio-api-key-secret`; this repository does not own that infrastructure definition.
 
-The Twilio Verify Service must define the Programmable Rate Limit unique name `olga_phone` (or the configured `Twilio__RateLimitName`) with destination buckets appropriate to the product, such as one send per minute, five per hour, and ten per day. Core passes a keyed phone fingerprint as the rate-limit value and explicitly keeps Twilio risk checks enabled. The API also limits each source address to five send attempts and twenty code checks per ten minutes.
+`Twilio__RateLimitName` is optional and blank by default. When an operator configures a matching Programmable Rate Limit on the Verify Service, set this value and Core will pass a keyed phone fingerprint for its buckets. Core always keeps Twilio risk checks enabled and independently limits each source address to five send attempts and twenty code checks per ten minutes.
 
 Phone send and check retries reserve the existing `ops.idempotency_record` before calling Twilio. Concurrent requests with the same key return `PHONE_VERIFICATION_IN_PROGRESS`; completed sends replay `PENDING`, completed checks regenerate the same signed proof, and the OTP itself is never persisted.
 

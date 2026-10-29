@@ -107,19 +107,23 @@ var identityMasterKey = local
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
 var twilioOptions = builder.Configuration.GetSection(TwilioVerifyOptions.SectionName).Get<TwilioVerifyOptions>() ?? new TwilioVerifyOptions();
-if (twilioOptions.ProofLifetimeMinutes is < 1 or > 30)
-    throw new InvalidOperationException("Twilio ProofLifetimeMinutes must be from 1 to 30.");
-if (string.IsNullOrWhiteSpace(twilioOptions.RateLimitName) || twilioOptions.RateLimitName.Length > 64
-    || twilioOptions.RateLimitName.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '_'))
-    throw new InvalidOperationException("Twilio RateLimitName must contain only ASCII letters, digits, or underscores and be at most 64 characters.");
-if (!local && (string.IsNullOrWhiteSpace(twilioOptions.AccountSid) || string.IsNullOrWhiteSpace(twilioOptions.AuthToken)
-    || string.IsNullOrWhiteSpace(twilioOptions.VerifyServiceSid)))
-    throw new InvalidOperationException("Twilio AccountSid, AuthToken, and VerifyServiceSid are required.");
-builder.Services.AddHttpClient<IPhoneVerificationProvider, TwilioPhoneVerificationProvider>(client =>
+if (twilioOptions.Enabled)
 {
-    client.BaseAddress = new Uri("https://verify.twilio.com/");
-    client.Timeout = TimeSpan.FromSeconds(10);
-});
+    if (twilioOptions.TokenTtlSeconds is < 120 or > 86400)
+        throw new InvalidOperationException("Twilio TokenTtlSeconds must be from 120 to 86400.");
+    if (twilioOptions.RateLimitName.Length > 64
+        || twilioOptions.RateLimitName.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '_'))
+        throw new InvalidOperationException("Twilio RateLimitName must contain only ASCII letters, digits, or underscores and be at most 64 characters.");
+    if (!IsTwilioSid(twilioOptions.AccountSid, "AC") || !IsTwilioSid(twilioOptions.ApiKeySid, "SK")
+        || !IsTwilioSid(twilioOptions.VerifyServiceSid, "VA") || twilioOptions.ApiKeySecret.Length < 16
+        || twilioOptions.ApiKeySecret.Any(char.IsWhiteSpace))
+        throw new InvalidOperationException("Twilio AccountSid, ApiKeySid, ApiKeySecret, and VerifyServiceSid must be valid when Twilio is enabled.");
+    builder.Services.AddHttpClient<IPhoneVerificationProvider, TwilioPhoneVerificationProvider>(client =>
+    {
+        client.BaseAddress = new Uri("https://verify.twilio.com/");
+        client.Timeout = TimeSpan.FromSeconds(10);
+    });
+}
 builder.Services.AddSingleton(twilioOptions);
 builder.Services.AddSingleton(identityMasterKey);
 var chatFileOptions = builder.Configuration.GetSection(ChatFileOptions.SectionName).Get<ChatFileOptions>() ?? new ChatFileOptions();
@@ -513,6 +517,11 @@ static byte[] ReadIdentityMasterKey(IConfiguration configuration)
     catch (FormatException) { }
     throw new InvalidOperationException("IdentityProtection__MasterKeyBase64 must contain a Base64-encoded 32-byte key.");
 }
+
+static bool IsTwilioSid(string value, string prefix) =>
+    value.Length == 34
+    && value.StartsWith(prefix, StringComparison.Ordinal)
+    && value[2..].All(Uri.IsHexDigit);
 
 public partial class Program { }
 internal sealed class MemberContextMetadata { }

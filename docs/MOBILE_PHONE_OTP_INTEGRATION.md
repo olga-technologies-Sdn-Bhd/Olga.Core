@@ -17,7 +17,7 @@ Phone OTP currently proves possession of a phone number. The API still uses the 
 
 Every `POST` requires an `Idempotency-Key` header. Generate a UUID for each new logical action. Reuse the same key only when retrying that exact request; changing the phone, code, or payload requires a new key.
 
-Phone numbers must be normalized to E.164 before submission, for example `+919876543210`. Do not send spaces, parentheses, or local-format numbers.
+Phone numbers must be normalized to E.164 before submission, for example `+60123456789` for Malaysia. Do not send spaces, parentheses, or local-format numbers.
 
 ## 1. Send the OTP
 
@@ -29,7 +29,7 @@ Content-Type: application/json
 
 ```json
 {
-  "phone": "+919876543210",
+  "phone": "+60123456789",
   "channel": "sms"
 }
 ```
@@ -58,7 +58,7 @@ Content-Type: application/json
 
 ```json
 {
-  "phone": "+919876543210",
+  "phone": "+60123456789",
   "code": "123456"
 }
 ```
@@ -72,7 +72,7 @@ Successful response:
 }
 ```
 
-The verification token is bound to the submitted phone and expires after 10 minutes by default. Keep it only in application memory until registration or lookup finishes. Never log, persist, include in analytics, or send it to another service.
+The verification token is bound to the submitted phone and expires after 300 seconds. Keep it only in application memory until registration or lookup finishes. Never log, persist, include in analytics, or send it to another service.
 
 If the check response is lost, retry the identical phone and code with the same `Idempotency-Key`. Core regenerates the same proof without intentionally checking the approved Twilio verification again.
 
@@ -89,9 +89,9 @@ Content-Type: application/json
 ```json
 {
   "display_name": "New Member",
-  "phone": "+919876543210",
+  "phone": "+60123456789",
   "phone_verification_token": "<opaque signed proof>",
-  "locale": "en-IN",
+  "locale": "en-MY",
   "visibility": "MEMBERS"
 }
 ```
@@ -103,7 +103,7 @@ Successful response:
 ```json
 {
   "member_id": "mem_033ed47ab6da5f5ed7c51647fdcde24b",
-  "phone_hint": "*********3210",
+  "phone_hint": "********6789",
   "profile_status": "DRAFT",
   "etag": "\"1\""
 }
@@ -121,7 +121,7 @@ Content-Type: application/json
 
 ```json
 {
-  "phone": "+919876543210",
+  "phone": "+60123456789",
   "verification_token": "<opaque signed proof>"
 }
 ```
@@ -156,7 +156,7 @@ Errors use `application/problem+json` and include `code`, `message`, and `correl
 | `429` | `PHONE_VERIFICATION_RATE_LIMITED` | Respect `Retry-After` when present, disable send/check actions, and show a neutral retry-later message. |
 | `503` | `PHONE_VERIFICATION_UNAVAILABLE` | Preserve the current screen and retry the identical request with the same key using bounded exponential backoff. |
 
-Do not automatically retry permanent `400`, `403`, `404`, or `409 IDENTITY_KEY_REUSED` responses. Automatic retries are appropriate only for transport failures, `503`, and selected `409 PHONE_VERIFICATION_IN_PROGRESS` responses.
+Do not automatically retry permanent `400`, `403`, `404`, or `409 IDEMPOTENCY_KEY_REUSED` responses. Automatic retries are appropriate only for transport failures, `503`, and selected `409 PHONE_VERIFICATION_IN_PROGRESS` responses.
 
 ## Recommended mobile state machine
 

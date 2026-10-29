@@ -11,11 +11,13 @@ namespace Olga.Core.Infrastructure;
 public sealed class TwilioVerifyOptions
 {
     public const string SectionName = "Twilio";
+    public bool Enabled { get; init; }
     public string AccountSid { get; init; } = "";
-    public string AuthToken { get; init; } = "";
+    public string ApiKeySid { get; init; } = "";
+    public string ApiKeySecret { get; init; } = "";
     public string VerifyServiceSid { get; init; } = "";
-    public string RateLimitName { get; init; } = "olga_phone";
-    public int ProofLifetimeMinutes { get; init; } = 10;
+    public string RateLimitName { get; init; } = "";
+    public int TokenTtlSeconds { get; init; } = 300;
 }
 
 public sealed class TwilioPhoneVerificationProvider(
@@ -29,13 +31,15 @@ public sealed class TwilioPhoneVerificationProvider(
     public async Task StartAsync(string phone, string channel, string rateLimitValue, CancellationToken ct)
     {
         var normalized = NormalizePhone(phone);
-        using var request = CreateRequest("Verifications", new Dictionary<string, string>
+        var values = new Dictionary<string, string>
         {
             ["To"] = normalized,
             ["Channel"] = channel,
-            [$"RateLimits[{options.RateLimitName}]"] = rateLimitValue,
             ["RiskCheck"] = "enable"
-        });
+        };
+        if (!string.IsNullOrWhiteSpace(options.RateLimitName))
+            values[$"RateLimits[{options.RateLimitName}]"] = rateLimitValue;
+        using var request = CreateRequest("Verifications", values);
         using var response = await SendAsync(request, ct);
         if (!response.IsSuccessStatusCode) throw ProviderError(response.StatusCode, checkingCode: false);
         using var payload = await ReadPayloadAsync(response, ct);
@@ -53,7 +57,7 @@ public sealed class TwilioPhoneVerificationProvider(
         if (!string.Equals(Status(payload), "approved", StringComparison.OrdinalIgnoreCase))
             throw new DomainException("PHONE_VERIFICATION_CODE_INVALID");
 
-        var expiresAt = DateTimeOffset.FromUnixTimeSeconds(timeProvider.GetUtcNow().AddMinutes(options.ProofLifetimeMinutes).ToUnixTimeSeconds());
+        var expiresAt = DateTimeOffset.FromUnixTimeSeconds(timeProvider.GetUtcNow().AddSeconds(options.TokenTtlSeconds).ToUnixTimeSeconds());
         return new(CreateProof(normalized, expiresAt), expiresAt);
     }
 
@@ -88,7 +92,7 @@ public sealed class TwilioPhoneVerificationProvider(
             Content = new FormUrlEncodedContent(values)
         };
         request.Headers.Authorization = new AuthenticationHeaderValue("Basic",
-            Convert.ToBase64String(Encoding.ASCII.GetBytes($"{options.AccountSid}:{options.AuthToken}")));
+            Convert.ToBase64String(Encoding.ASCII.GetBytes($"{options.ApiKeySid}:{options.ApiKeySecret}")));
         return request;
     }
 
