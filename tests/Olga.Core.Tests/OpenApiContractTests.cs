@@ -52,6 +52,11 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(profileUpdate, "Idempotency-Key", required: true, maxLength: 128);
         AssertHeader(profileUpdate, "If-Match", required: false);
 
+        var industryQuestionnaire = Operation(document, "/v1/me/profile/industry-questionnaire", "put");
+        AssertHeader(industryQuestionnaire, "X-Member-Id", required: false, maxLength: 64);
+        AssertHeader(industryQuestionnaire, "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(industryQuestionnaire, "If-Match", required: false);
+
         var profileImageUpload = Operation(document, "/v1/me/profile-picture", "put");
         AssertHeader(profileImageUpload, "Idempotency-Key", required: true, maxLength: 128);
         AssertHeader(profileImageUpload, "If-Match", required: false);

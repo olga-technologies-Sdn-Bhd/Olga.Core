@@ -29,9 +29,19 @@ public sealed record PhoneVerificationCheckRequest(string? Phone, string? Code);
 public sealed record PhoneVerificationCheckResponse(string VerificationToken, DateTimeOffset ExpiresAt);
 // display_name is null when another member reads a profile they aren't connected to.
 // email_hint and phone_hint are the member's own masked contact details: set only on /v1/me/profile, never for another member.
-public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? ProfileImageUrl = null, string? ProfileImageStatus = null, string? EmailHint = null, string? PhoneHint = null);
+public sealed record ProfileResponse(string MemberId, string? DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string ProfileStatus, string Visibility, decimal CompletenessScore, string ETag, DateTimeOffset UpdatedAt, string? ProfileImageUrl = null, string? ProfileImageStatus = null, string? EmailHint = null, string? PhoneHint = null, IReadOnlyList<MemberIndustryResponse>? Industries = null, string? IndustryQuestionnaireStatus = null);
 public sealed record ProfileImageUploadResponse(string ImageId, string Status, string ETag);
 public sealed record ProfileUpdateRequest(string DisplayName, string? Headline, string? ProfessionalSummary, string? RoleCategory, string Visibility = "MEMBERS");
+public sealed record IndustryResponse(string Code, string Name, int SortOrder);
+public sealed record MemberIndustryResponse(string Code, string Name, bool IsPrimary, string? CustomName = null);
+public sealed record ProfileQuestionResponse(string QuestionId, string Code, int Version, string Prompt, string AnswerType, bool IsRequired, int SortOrder, System.Text.Json.JsonElement Configuration);
+public sealed record IndustryQuestionnaireResponse(string QuestionnaireId, int DefinitionVersion, IndustryResponse Industry, IReadOnlyList<ProfileQuestionResponse> Questions);
+public sealed record QuestionAnswerRequest(string QuestionId, System.Text.Json.JsonElement Value);
+public sealed record IndustrySelectionRequest(string Code, string? CustomName = null);
+public sealed record IndustryQuestionnaireSubmitRequest(string SectorCode, int DefinitionVersion, IReadOnlyList<QuestionAnswerRequest> Answers, string Status = "COMPLETED", string? CustomIndustryName = null, IReadOnlyList<IndustrySelectionRequest>? AdditionalIndustries = null);
+public sealed record IndustryQuestionnaireSubmissionResponse(string ResponseId, string Status, string SectorCode, int DefinitionVersion, string ProfileETag, string ResponseETag, DateTimeOffset UpdatedAt);
+public sealed record SavedQuestionAnswerResponse(string QuestionId, System.Text.Json.JsonElement Value);
+public sealed record MemberIndustryQuestionnaireResponse(IndustryQuestionnaireResponse Definition, string? ResponseId, string Status, IReadOnlyList<SavedQuestionAnswerResponse> Answers, string ProfileETag, string? ResponseETag);
 public sealed record ConsentRequest(string PurposeCode, string PolicyVersion, string Decision, string CaptureChannel = "MOBILE", object? Evidence = null);
 public sealed record ConsentResponse(long MemberConsentId, string PolicyId, string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
 // check_in_required gates matching eligibility only; it does not gate registration or Live Mode.
@@ -119,7 +129,8 @@ public sealed record DataExportResponse(
     IReadOnlyList<ExportConnection> Connections,
     IReadOnlyList<ExportMessage> Messages,
     IReadOnlyList<ExportConsent> Consents,
-    IReadOnlyList<PrivacyRequestResponse> PrivacyRequests);
+    IReadOnlyList<PrivacyRequestResponse> PrivacyRequests,
+    IReadOnlyList<ExportIndustryQuestionnaire>? IndustryQuestionnaires = null);
 public sealed record ExportIntent(string IntentId, string ContextId, string IntentType, string Text, string Status, string? Category, string? Industry, string? Geography, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt);
 public sealed record ExportRegistration(string EventId, string? EventName, string Status, DateTimeOffset RegisteredAt, DateTimeOffset? CheckedInAt);
 // event_id is set for Commits and null for plain connection requests. A sent Commit's DECLINED shows as PENDING, then EXPIRED, as in the app.
@@ -128,6 +139,8 @@ public sealed record ExportConnection(string ConnectionId, string Status, string
 // Only messages the member sent; a deleted message has a null body.
 public sealed record ExportMessage(string MessageId, string ConversationId, string MessageType, string? Body, DateTimeOffset CreatedAt, DateTimeOffset? DeletedAt);
 public sealed record ExportConsent(string PurposeCode, string PolicyVersion, string Decision, DateTimeOffset CapturedAt, DateTimeOffset? WithdrawnAt);
+public sealed record ExportIndustryQuestionnaire(string ResponseId, string SectorCode, int DefinitionVersion, string Status, DateTimeOffset? CompletedAt, IReadOnlyList<ExportQuestionAnswer> Answers);
+public sealed record ExportQuestionAnswer(string QuestionId, string QuestionCode, System.Text.Json.JsonElement Value, DateTimeOffset UpdatedAt);
 public sealed record SyncItem(long Sequence, string ResourceType, string ResourceId, string ChangeType, long? ResourceVersion, object? Payload, DateTimeOffset OccurredAt);
 public sealed record SyncResponse(IReadOnlyList<SyncItem> Items, string? NextCursor, bool HasMore);
 public sealed record AdminEventCreateRequest(string Name, DateTimeOffset StartsAt, DateTimeOffset EndsAt, string? Description = null, string? VenueId = null, bool LiveModeEnabled = true, bool Publish = false);

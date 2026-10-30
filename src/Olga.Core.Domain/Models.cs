@@ -27,6 +27,92 @@ public sealed class MemberProfile
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
+public sealed class Sector
+{
+    public string SectorCode { get; set; } = "";
+    public string? ParentSectorCode { get; set; }
+    public string Name { get; set; } = "";
+    public string Status { get; set; } = "ACTIVE";
+    public int SortOrder { get; set; }
+}
+
+public sealed class MemberSector
+{
+    public string MemberId { get; set; } = "";
+    public string SectorCode { get; set; } = "";
+    public string? CustomSectorName { get; set; }
+    public bool IsPrimary { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class SectorQuestionnaire
+{
+    public long Id { get; set; }
+    public string QuestionnaireId { get; set; } = "";
+    public string SectorCode { get; set; } = "";
+    public int DefinitionVersion { get; set; } = 1;
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+public sealed class ProfileQuestion
+{
+    public long Id { get; set; }
+    public string QuestionId { get; set; } = "";
+    public string? SectorCode { get; set; }
+    public string QuestionCode { get; set; } = "";
+    public int QuestionVersion { get; set; } = 1;
+    public string Prompt { get; set; } = "";
+    public string AnswerType { get; set; } = "";
+    public bool IsRequired { get; set; }
+    public int SortOrder { get; set; }
+    public string ConfigurationJson { get; set; } = "{}";
+    public string Status { get; set; } = "ACTIVE";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+public sealed class SectorQuestionnaireQuestion
+{
+    public long Id { get; set; }
+    public long SectorQuestionnaireId { get; set; }
+    public int DefinitionVersion { get; set; }
+    public long ProfileQuestionId { get; set; }
+    public bool IsRequired { get; set; }
+    public int SortOrder { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+public sealed class MemberQuestionnaireResponse
+{
+    public long Id { get; set; }
+    public string ResponseId { get; set; } = "";
+    public string MemberId { get; set; } = "";
+    public long SectorQuestionnaireId { get; set; }
+    public int DefinitionVersion { get; set; }
+    public string Status { get; set; } = "DRAFT";
+    public DateTimeOffset? CompletedAt { get; set; }
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
+public sealed class MemberQuestionAnswer
+{
+    public long Id { get; set; }
+    public string AnswerId { get; set; } = "";
+    public long ResponseId { get; set; }
+    public long QuestionId { get; set; }
+    public MemberQuestionnaireResponse Response { get; set; } = null!;
+    public string AnswerJson { get; set; } = "{}";
+    public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public long RowVersion { get; set; } = 1;
+}
+
 public sealed class MemberProfileImage
 {
     public long Id { get; set; }

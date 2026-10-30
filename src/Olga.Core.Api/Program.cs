@@ -240,6 +240,20 @@ profileV1.MapGet("", async (HttpContext c, ICoreService s, CancellationToken ct)
 profileV1.MapPatch("", async (HttpContext c, ProfileUpdateRequest body, ICoreService s, CancellationToken ct) => { var value = await s.UpdateProfileAsync(Member(c), body, c.Request.Headers.IfMatch.FirstOrDefault(), ct); c.Response.Headers.ETag = value.ETag; return Results.Ok(value); })
     .WithMetadata(new IfMatchMetadata())
     .WithName("UpdateOwnProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapGet("/profile-industries", async (ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIndustriesAsync(ct)))
+    .WithName("GetProfileIndustries").WithTags("Members").Produces<IReadOnlyList<IndustryResponse>>(200);
+memberV1.MapGet("/profile-industries/{sectorCode}/questionnaire", async (string sectorCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIndustryQuestionnaireAsync(sectorCode, ct)))
+    .WithName("GetIndustryQuestionnaire").WithTags("Members").Produces<IndustryQuestionnaireResponse>(200).Produces<ApiError>(404);
+profileV1.MapGet("/industry-questionnaire", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMemberIndustryQuestionnaireAsync(Member(c), ct)))
+    .WithName("GetOwnIndustryQuestionnaire").WithTags("Members").Produces<MemberIndustryQuestionnaireResponse>(200).Produces<ApiError>(404);
+profileV1.MapPut("/industry-questionnaire", async (HttpContext c, IndustryQuestionnaireSubmitRequest body, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.SaveIndustryQuestionnaireAsync(Member(c), body, Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ProfileETag;
+    return Results.Ok(value);
+})
+    .WithMetadata(new IfMatchMetadata())
+    .WithName("SaveIndustryQuestionnaire").WithTags("Members").Produces<IndustryQuestionnaireSubmissionResponse>(200).Produces<ApiError>(409);
 memberV1.MapPut("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
 {
     if (!c.Request.HasFormContentType) throw new DomainException("PROFILE_IMAGE_MULTIPART_REQUIRED", 415);

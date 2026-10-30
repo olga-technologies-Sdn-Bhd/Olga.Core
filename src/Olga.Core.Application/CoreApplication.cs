@@ -9,6 +9,13 @@ public interface ICoreStore
     bool IsRelational { get; }
     IQueryable<MemberProfile> Profiles { get; }
     IQueryable<MemberProfileImage> ProfileImages { get; }
+    IQueryable<Sector> Sectors { get; }
+    IQueryable<MemberSector> MemberSectors { get; }
+    IQueryable<SectorQuestionnaire> SectorQuestionnaires { get; }
+    IQueryable<ProfileQuestion> ProfileQuestions { get; }
+    IQueryable<SectorQuestionnaireQuestion> SectorQuestionnaireQuestions { get; }
+    IQueryable<MemberQuestionnaireResponse> QuestionnaireResponses { get; }
+    IQueryable<MemberQuestionAnswer> QuestionAnswers { get; }
     IQueryable<MemberAccount> Accounts { get; }
     IQueryable<MemberIdentity> Identities { get; }
     IQueryable<ConsentPolicy> ConsentPolicies { get; }
@@ -67,6 +74,10 @@ public interface ICoreService
     Task<ProfileResponse> GetOwnProfileAsync(string memberId, CancellationToken ct);
     Task<ProfileResponse> GetVisibleProfileAsync(string actorId, string memberId, CancellationToken ct);
     Task<ProfileResponse> UpdateProfileAsync(string memberId, ProfileUpdateRequest request, string? ifMatch, CancellationToken ct);
+    Task<IReadOnlyList<IndustryResponse>> GetIndustriesAsync(CancellationToken ct);
+    Task<IndustryQuestionnaireResponse> GetIndustryQuestionnaireAsync(string sectorCode, CancellationToken ct);
+    Task<MemberIndustryQuestionnaireResponse> GetMemberIndustryQuestionnaireAsync(string memberId, CancellationToken ct);
+    Task<IndustryQuestionnaireSubmissionResponse> SaveIndustryQuestionnaireAsync(string memberId, IndustryQuestionnaireSubmitRequest request, string idempotencyKey, string? ifMatch, CancellationToken ct);
     Task<ProfileImageUploadResponse> UploadProfileImageAsync(string memberId, Stream content, long contentLength, string declaredContentType, string idempotencyKey, string? ifMatch, CancellationToken ct);
     Task<ProfileResponse> DeleteProfileImageAsync(string memberId, string idempotencyKey, string? ifMatch, CancellationToken ct);
     Task<ProfileImageContent> GetVisibleProfileImageAsync(string actorId, string memberId, string size, CancellationToken ct);
@@ -482,6 +493,258 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         AddOutbox("MEMBER", memberId, "MemberProfileChanged.v1", new { member_id = memberId, profile.Version });
         await store.SaveAsync(ct);
         return WithContactHints(Map(profile));
+    }
+
+    public Task<IReadOnlyList<IndustryResponse>> GetIndustriesAsync(CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        IReadOnlyList<IndustryResponse> industries = store.Sectors
+            .Where(x => x.Status == "ACTIVE")
+            .OrderBy(x => x.SortOrder)
+            .ThenBy(x => x.Name)
+            .Select(x => new IndustryResponse(x.SectorCode, x.Name, x.SortOrder))
+            .ToArray();
+        return Task.FromResult(industries);
+    }
+
+    public Task<IndustryQuestionnaireResponse> GetIndustryQuestionnaireAsync(string sectorCode, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var code = NormalizeSectorCode(sectorCode);
+        var sector = store.Sectors.SingleOrDefault(x => x.SectorCode == code && x.Status == "ACTIVE")
+            ?? throw new DomainException("INDUSTRY_NOT_FOUND", 404);
+        var questionnaire = store.SectorQuestionnaires.SingleOrDefault(x => x.SectorCode == code && x.Status == "ACTIVE")
+            ?? throw new DomainException("INDUSTRY_QUESTIONNAIRE_NOT_FOUND", 404);
+        var questions = (from membership in store.SectorQuestionnaireQuestions
+                         join question in store.ProfileQuestions on membership.ProfileQuestionId equals question.Id
+                         where membership.SectorQuestionnaireId == questionnaire.Id
+                            && membership.DefinitionVersion == questionnaire.DefinitionVersion
+                         orderby membership.SortOrder
+                         select new { Question = question, membership.IsRequired, membership.SortOrder })
+            .AsEnumerable()
+            .Select(x => MapQuestion(x.Question, x.IsRequired, x.SortOrder))
+            .ToArray();
+        return Task.FromResult(new IndustryQuestionnaireResponse(
+            questionnaire.QuestionnaireId,
+            questionnaire.DefinitionVersion,
+            new IndustryResponse(sector.SectorCode, sector.Name, sector.SortOrder),
+            questions));
+    }
+
+    public async Task<MemberIndustryQuestionnaireResponse> GetMemberIndustryQuestionnaireAsync(string memberId, CancellationToken ct)
+    {
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId)
+            ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        var primary = store.MemberSectors.SingleOrDefault(x => x.MemberId == memberId && x.IsPrimary)
+            ?? throw new DomainException("INDUSTRY_NOT_SELECTED", 404);
+        var definition = await GetIndustryQuestionnaireAsync(primary.SectorCode, ct);
+        var questionnaire = store.SectorQuestionnaires.Single(x => x.QuestionnaireId == definition.QuestionnaireId);
+        var response = store.QuestionnaireResponses.SingleOrDefault(x =>
+            x.MemberId == memberId && x.SectorQuestionnaireId == questionnaire.Id && x.DefinitionVersion == definition.DefinitionVersion);
+        if (response is null)
+            return new(definition, null, "NOT_STARTED", [], $"\"{profile.Version}\"", null);
+        var answerRows = store.QuestionAnswers.Where(x => x.ResponseId == response.Id).ToArray();
+        var questionKeys = answerRows.Select(x => x.QuestionId).Distinct().ToArray();
+        var questionIds = store.ProfileQuestions.Where(x => questionKeys.Contains(x.Id)).ToDictionary(x => x.Id, x => x.QuestionId);
+        var answers = answerRows
+            .Select(x =>
+            {
+                using var value = JsonDocument.Parse(x.AnswerJson);
+                return new SavedQuestionAnswerResponse(questionIds[x.QuestionId], value.RootElement.Clone());
+            })
+            .ToArray();
+        return new(definition, response.ResponseId, response.Status, answers, $"\"{profile.Version}\"", $"\"{response.RowVersion}\"");
+    }
+
+    public async Task<IndustryQuestionnaireSubmissionResponse> SaveIndustryQuestionnaireAsync(
+        string memberId,
+        IndustryQuestionnaireSubmitRequest request,
+        string idempotencyKey,
+        string? ifMatch,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        const string scope = "core.profile.industry_questionnaire";
+        var requestHash = Hash(scope, memberId, JsonSerializer.Serialize(request, JsonOptions));
+        var now = DateTimeOffset.UtcNow;
+        var claim = await store.ClaimIdempotencyAsync(scope, memberId, idempotencyKey, requestHash, now, now.AddMinutes(2), ct);
+        if (!claim.Acquired)
+        {
+            EnsureReplayMatches(claim, requestHash);
+            if (claim.StatusCode is null) throw new DomainException("IDEMPOTENT_OPERATION_IN_PROGRESS", 409);
+            var existing = store.QuestionnaireResponses.SingleOrDefault(x => x.ResponseId == claim.ResponseRef && x.MemberId == memberId)
+                ?? throw new DomainException("IDEMPOTENCY_RESULT_NOT_FOUND", 409);
+            var questionnaire = store.SectorQuestionnaires.Single(x => x.Id == existing.SectorQuestionnaireId);
+            var profile = store.Profiles.Single(x => x.MemberId == memberId);
+            return new(existing.ResponseId, existing.Status, questionnaire.SectorCode, existing.DefinitionVersion,
+                $"\"{profile.Version}\"", $"\"{existing.RowVersion}\"", existing.UpdatedAt);
+        }
+        try
+        {
+            var result = await SaveIndustryQuestionnaireCoreAsync(memberId, request, ifMatch, ct);
+            await store.CompleteIdempotencyAsync(scope, memberId, idempotencyKey, requestHash, 200, result.ResponseId, DateTimeOffset.UtcNow.AddHours(24), ct);
+            return result;
+        }
+        catch
+        {
+            await store.ReleaseIdempotencyAsync(scope, memberId, idempotencyKey, requestHash, CancellationToken.None);
+            throw;
+        }
+    }
+
+    private async Task<IndustryQuestionnaireSubmissionResponse> SaveIndustryQuestionnaireCoreAsync(
+        string memberId,
+        IndustryQuestionnaireSubmitRequest request,
+        string? ifMatch,
+        CancellationToken ct)
+    {
+        if (request.Status is not ("DRAFT" or "COMPLETED")) throw new DomainException("QUESTIONNAIRE_STATUS_INVALID");
+        if (request.Answers is null) throw new DomainException("QUESTIONNAIRE_ANSWERS_REQUIRED");
+        EnsureNotDeletionPending(memberId);
+        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId)
+            ?? throw new DomainException("PROFILE_NOT_FOUND", 404);
+        EnsureProfileEtag(profile, ifMatch);
+
+        var code = NormalizeSectorCode(request.SectorCode);
+        var sector = store.Sectors.SingleOrDefault(x => x.SectorCode == code && x.Status == "ACTIVE")
+            ?? throw new DomainException("INDUSTRY_NOT_FOUND", 404);
+        var customName = request.CustomIndustryName?.Trim();
+        if (code == "OTHER")
+        {
+            if (string.IsNullOrWhiteSpace(customName) || customName.Length > 150)
+                throw new DomainException("CUSTOM_INDUSTRY_REQUIRED");
+        }
+        else if (!string.IsNullOrWhiteSpace(customName))
+        {
+            throw new DomainException("CUSTOM_INDUSTRY_NOT_ALLOWED");
+        }
+
+        var selectedIndustries = new List<(string Code, string? CustomName)> { (code, customName) };
+        foreach (var additional in request.AdditionalIndustries ?? [])
+        {
+            var additionalCode = NormalizeSectorCode(additional.Code);
+            var additionalCustomName = additional.CustomName?.Trim();
+            if (additionalCode == "OTHER")
+            {
+                if (string.IsNullOrWhiteSpace(additionalCustomName) || additionalCustomName.Length > 150)
+                    throw new DomainException("CUSTOM_INDUSTRY_REQUIRED");
+            }
+            else if (!string.IsNullOrWhiteSpace(additionalCustomName))
+            {
+                throw new DomainException("CUSTOM_INDUSTRY_NOT_ALLOWED");
+            }
+            selectedIndustries.Add((additionalCode, additionalCustomName));
+        }
+        if (selectedIndustries.Count > 3 || selectedIndustries.Select(x => x.Code).Distinct(StringComparer.Ordinal).Count() != selectedIndustries.Count)
+            throw new DomainException("INDUSTRY_SELECTION_INVALID");
+        var selectedCodes = selectedIndustries.Select(x => x.Code).ToArray();
+        if (store.Sectors.Count(x => selectedCodes.Contains(x.SectorCode) && x.Status == "ACTIVE") != selectedCodes.Length)
+            throw new DomainException("INDUSTRY_NOT_FOUND", 404);
+
+        var questionnaire = store.SectorQuestionnaires.SingleOrDefault(x => x.SectorCode == code && x.Status == "ACTIVE")
+            ?? throw new DomainException("INDUSTRY_QUESTIONNAIRE_NOT_FOUND", 404);
+        if (request.DefinitionVersion != questionnaire.DefinitionVersion)
+            throw new DomainException("QUESTIONNAIRE_VERSION_CONFLICT", 409)
+            {
+                Details = new { current_definition_version = questionnaire.DefinitionVersion }
+            };
+
+        var questions = (from membership in store.SectorQuestionnaireQuestions
+                         join question in store.ProfileQuestions on membership.ProfileQuestionId equals question.Id
+                         where membership.SectorQuestionnaireId == questionnaire.Id
+                            && membership.DefinitionVersion == questionnaire.DefinitionVersion
+                         select new { Question = question, membership.IsRequired })
+            .AsEnumerable()
+            .ToDictionary(x => x.Question.QuestionId, x => (x.Question, x.IsRequired), StringComparer.Ordinal);
+        var duplicate = request.Answers.GroupBy(x => x.QuestionId, StringComparer.Ordinal).FirstOrDefault(x => x.Count() > 1);
+        if (duplicate is not null) throw new DomainException("QUESTION_ANSWER_DUPLICATE");
+        foreach (var answer in request.Answers)
+        {
+            if (!questions.TryGetValue(answer.QuestionId, out var configuredQuestion))
+                throw new DomainException("QUESTION_NOT_IN_QUESTIONNAIRE");
+            ValidateAnswer(configuredQuestion.Question, answer.Value);
+        }
+        if (request.Status == "COMPLETED")
+        {
+            var answered = request.Answers.Select(x => x.QuestionId).ToHashSet(StringComparer.Ordinal);
+            if (questions.Values.Any(x => x.IsRequired && !answered.Contains(x.Question.QuestionId)))
+                throw new DomainException("QUESTIONNAIRE_REQUIRED_ANSWER_MISSING");
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        foreach (var previous in store.QuestionnaireResponses.Where(x => x.MemberId == memberId && x.SectorQuestionnaireId != questionnaire.Id && x.Status != "SUPERSEDED"))
+        {
+            previous.Status = "SUPERSEDED";
+            previous.UpdatedAt = now;
+            if (!store.IsRelational) previous.RowVersion++;
+        }
+
+        foreach (var deselected in store.MemberSectors.Where(x => x.MemberId == memberId && !selectedCodes.Contains(x.SectorCode)).ToArray())
+            store.Remove(deselected);
+        foreach (var selection in selectedIndustries)
+        {
+            var memberSector = store.MemberSectors.SingleOrDefault(x => x.MemberId == memberId && x.SectorCode == selection.Code);
+            if (memberSector is null)
+            {
+                memberSector = new MemberSector { MemberId = memberId, SectorCode = selection.Code };
+                store.Add(memberSector);
+            }
+            memberSector.IsPrimary = selection.Code == code;
+            memberSector.CustomSectorName = selection.CustomName;
+        }
+
+        var response = store.QuestionnaireResponses.SingleOrDefault(x =>
+            x.MemberId == memberId && x.SectorQuestionnaireId == questionnaire.Id && x.DefinitionVersion == questionnaire.DefinitionVersion);
+        if (response is null)
+        {
+            response = new MemberQuestionnaireResponse
+            {
+                ResponseId = $"qr_{Hash("questionnaire.response", memberId, questionnaire.QuestionnaireId, questionnaire.DefinitionVersion.ToString(System.Globalization.CultureInfo.InvariantCulture))[..32]}",
+                MemberId = memberId,
+                SectorQuestionnaireId = questionnaire.Id,
+                DefinitionVersion = questionnaire.DefinitionVersion,
+                CreatedAt = now
+            };
+            store.Add(response);
+        }
+        else
+        {
+            foreach (var oldAnswer in store.QuestionAnswers.Where(x => x.ResponseId == response.Id).ToArray()) store.Remove(oldAnswer);
+            if (!store.IsRelational) response.RowVersion++;
+        }
+        response.Status = request.Status;
+        response.CompletedAt = request.Status == "COMPLETED" ? now : null;
+        response.UpdatedAt = now;
+
+        foreach (var submitted in request.Answers)
+        {
+            var question = questions[submitted.QuestionId].Question;
+            store.Add(new MemberQuestionAnswer
+            {
+                AnswerId = $"qa_{Hash("questionnaire.answer", response.ResponseId, question.QuestionId)[..32]}",
+                Response = response,
+                QuestionId = question.Id,
+                AnswerJson = submitted.Value.GetRawText(),
+                CreatedAt = now,
+                UpdatedAt = now
+            });
+        }
+
+        TouchProfile(profile);
+        AddChange(memberId, "PROFILE", memberId, "UPSERT", new { primary_industry = code, questionnaire_status = response.Status, profile.Version });
+        AddOutbox("MEMBER", memberId, "MemberIndustryQuestionnaireChanged.v1", new
+        {
+            member_id = memberId,
+            sector_code = code,
+            questionnaire_id = questionnaire.QuestionnaireId,
+            definition_version = questionnaire.DefinitionVersion,
+            response_status = response.Status,
+            matching_features = BuildMatchingFeatures(questions.ToDictionary(x => x.Key, x => x.Value.Question, StringComparer.Ordinal), request.Answers)
+        });
+        await store.SaveAsync(ct);
+        return new(response.ResponseId, response.Status, sector.SectorCode, response.DefinitionVersion,
+            $"\"{profile.Version}\"", $"\"{response.RowVersion}\"", response.UpdatedAt);
     }
 
     // Own-profile routes only: adds the masked hints stored at registration. Never call this for another member's profile.
@@ -1380,6 +1643,25 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
                         where consent.MemberId == memberId
                         orderby consent.CapturedAt descending
                         select new ExportConsent(policy.PurposeCode, policy.Version, consent.Decision, consent.CapturedAt, consent.WithdrawnAt)).ToArray();
+        var questionnaireRows = store.QuestionnaireResponses.Where(x => x.MemberId == memberId).OrderByDescending(x => x.UpdatedAt).ToArray();
+        var questionnaireIds = questionnaireRows.Select(x => x.SectorQuestionnaireId).Distinct().ToArray();
+        var questionnaires = store.SectorQuestionnaires.Where(x => questionnaireIds.Contains(x.Id)).ToDictionary(x => x.Id);
+        var responseIds = questionnaireRows.Select(x => x.Id).ToArray();
+        var answerRows = store.QuestionAnswers.Where(x => responseIds.Contains(x.ResponseId)).OrderBy(x => x.Id).ToArray();
+        var questionIds = answerRows.Select(x => x.QuestionId).Distinct().ToArray();
+        var questions = store.ProfileQuestions.Where(x => questionIds.Contains(x.Id)).ToDictionary(x => x.Id);
+        var questionnaireExport = questionnaireRows.Select(response => new ExportIndustryQuestionnaire(
+            response.ResponseId,
+            questionnaires.GetValueOrDefault(response.SectorQuestionnaireId)?.SectorCode ?? "UNKNOWN",
+            response.DefinitionVersion,
+            response.Status,
+            response.CompletedAt,
+            answerRows.Where(x => x.ResponseId == response.Id).Select(answer =>
+            {
+                using var value = JsonDocument.Parse(answer.AnswerJson);
+                var question = questions[answer.QuestionId];
+                return new ExportQuestionAnswer(question.QuestionId, question.QuestionCode, value.RootElement.Clone(), answer.UpdatedAt);
+            }).ToArray())).ToArray();
 
         // The export itself is recorded as a completed EXPORT request, so it is part of this file too. The database
         // completes a request only once each domain task is completed with evidence, so the tasks are saved first.
@@ -1399,7 +1681,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             requests.Where(x => x.SenderMemberId == memberId).Select(x => Request(x, true)).ToArray(),
             requests.Where(x => x.RecipientMemberId == memberId).Select(x => Request(x, false)).ToArray(),
             connections.Select(x => { var other = OtherMember(x, memberId); return new ExportConnection(x.ConnectionId, x.Status, connectedIds.Contains(other) ? other : null, NameOf(other), x.ConnectedAt, x.DisconnectedAt); }).ToArray(),
-            messages, consents, privacy);
+            messages, consents, privacy, questionnaireExport);
     }
 
     // A deletion request starts the erasure workflow (iam.member.deleted_at). From then on the member is out of
@@ -1581,6 +1863,98 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
 
     private static string PairKey(string a, string b) { var p = Pair(a, b); return $"{p.Low}:{p.High}"; }
     private static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
+    private static string NormalizeSectorCode(string value)
+    {
+        var code = value?.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(code) || code.Length > 64) throw new DomainException("INDUSTRY_INVALID");
+        return code;
+    }
+
+    private static ProfileQuestionResponse MapQuestion(ProfileQuestion question, bool isRequired, int sortOrder)
+    {
+        using var configuration = JsonDocument.Parse(question.ConfigurationJson);
+        return new(question.QuestionId, question.QuestionCode, question.QuestionVersion, question.Prompt,
+            question.AnswerType, isRequired, sortOrder, configuration.RootElement.Clone());
+    }
+
+    private static void ValidateAnswer(ProfileQuestion question, JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Object) throw new DomainException("QUESTION_ANSWER_INVALID");
+        using var configurationDocument = JsonDocument.Parse(question.ConfigurationJson);
+        var configuration = configurationDocument.RootElement;
+        static void RequireOnly(JsonElement answer, string property)
+        {
+            if (answer.EnumerateObject().Count() != 1 || !answer.TryGetProperty(property, out _))
+                throw new DomainException("QUESTION_ANSWER_INVALID");
+        }
+        HashSet<string> Options()
+        {
+            if (!configuration.TryGetProperty("options", out var options) || options.ValueKind != JsonValueKind.Array)
+                throw new DomainException("QUESTION_CONFIGURATION_INVALID", 500);
+            return options.EnumerateArray()
+                .Select(x => x.GetProperty("code").GetString())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
+                .Select(x => x!)
+                .ToHashSet(StringComparer.Ordinal);
+        }
+
+        switch (question.AnswerType)
+        {
+            case "SINGLE_SELECT":
+                RequireOnly(value, "option_code");
+                var option = value.GetProperty("option_code");
+                if (option.ValueKind != JsonValueKind.String || !Options().Contains(option.GetString()!))
+                    throw new DomainException("QUESTION_ANSWER_INVALID");
+                break;
+            case "MULTI_SELECT":
+                RequireOnly(value, "option_codes");
+                var optionCodes = value.GetProperty("option_codes");
+                if (optionCodes.ValueKind != JsonValueKind.Array) throw new DomainException("QUESTION_ANSWER_INVALID");
+                var selected = optionCodes.EnumerateArray().Select(x => x.ValueKind == JsonValueKind.String ? x.GetString() : null).ToArray();
+                var allowed = Options();
+                var minimum = configuration.TryGetProperty("min_selections", out var min) ? min.GetInt32() : 0;
+                var maximum = configuration.TryGetProperty("max_selections", out var max) ? max.GetInt32() : int.MaxValue;
+                if (selected.Any(string.IsNullOrWhiteSpace) || selected.Length < minimum || selected.Length > maximum
+                    || selected.Distinct(StringComparer.Ordinal).Count() != selected.Length || selected.Any(x => !allowed.Contains(x!)))
+                    throw new DomainException("QUESTION_ANSWER_INVALID");
+                break;
+            case "TEXT":
+                RequireOnly(value, "text");
+                var text = value.GetProperty("text");
+                var maximumLength = configuration.TryGetProperty("max_length", out var length) ? length.GetInt32() : 1000;
+                if (text.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(text.GetString()) || text.GetString()!.Length > maximumLength)
+                    throw new DomainException("QUESTION_ANSWER_INVALID");
+                break;
+            case "NUMBER":
+                RequireOnly(value, "number");
+                if (value.GetProperty("number").ValueKind != JsonValueKind.Number) throw new DomainException("QUESTION_ANSWER_INVALID");
+                break;
+            case "BOOLEAN":
+                RequireOnly(value, "value");
+                if (value.GetProperty("value").ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                    throw new DomainException("QUESTION_ANSWER_INVALID");
+                break;
+            default:
+                throw new DomainException("QUESTION_CONFIGURATION_INVALID", 500);
+        }
+    }
+
+    private static IReadOnlyDictionary<string, string[]> BuildMatchingFeatures(
+        IReadOnlyDictionary<string, ProfileQuestion> questions,
+        IReadOnlyList<QuestionAnswerRequest> answers)
+    {
+        var features = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        foreach (var answer in answers)
+        {
+            var question = questions[answer.QuestionId];
+            if (question.AnswerType == "SINGLE_SELECT")
+                features[question.QuestionCode] = [answer.Value.GetProperty("option_code").GetString()!];
+            else if (question.AnswerType == "MULTI_SELECT")
+                features[question.QuestionCode] = answer.Value.GetProperty("option_codes").EnumerateArray().Select(x => x.GetString()!).ToArray();
+        }
+        return features;
+    }
+
     private static decimal CalculateCompleteness(MemberProfile x) => new[] { x.DisplayName, x.Headline, x.Biography, x.Sector }.Count(v => !string.IsNullOrWhiteSpace(v)) * 25m;
     private static string EncodeCursor(long value) => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(value.ToString(System.Globalization.CultureInfo.InvariantCulture)));
     private static void EnsureReplayMatches(IdempotencyClaim claim, string requestHash)
@@ -1600,7 +1974,20 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
             .FirstOrDefault();
         var imageUrl = x.ProfileImageId is null ? null : $"/v1/members/{Uri.EscapeDataString(x.MemberId)}/profile-picture?size=thumbnail";
         var imageStatus = latest?.Status == "APPROVED" ? "READY" : latest?.Status;
-        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, imageStatus);
+        var sectorNames = store.Sectors.Where(s => s.Status == "ACTIVE").ToDictionary(s => s.SectorCode, s => s.Name);
+        var industries = store.MemberSectors
+            .Where(s => s.MemberId == x.MemberId)
+            .OrderByDescending(s => s.IsPrimary)
+            .ThenBy(s => s.SectorCode)
+            .AsEnumerable()
+            .Select(s => new MemberIndustryResponse(s.SectorCode, sectorNames.GetValueOrDefault(s.SectorCode, s.SectorCode), s.IsPrimary, s.CustomSectorName))
+            .ToArray();
+        var questionnaireStatus = store.QuestionnaireResponses
+            .Where(r => r.MemberId == x.MemberId && r.Status != "SUPERSEDED")
+            .OrderByDescending(r => r.UpdatedAt)
+            .Select(r => r.Status)
+            .FirstOrDefault();
+        return new(x.MemberId, x.DisplayName, x.Headline, x.Biography, x.Sector, x.Status, x.Visibility, x.CompletenessScore, $"\"{x.Version}\"", x.UpdatedAt, imageUrl, imageStatus, Industries: industries, IndustryQuestionnaireStatus: questionnaireStatus);
     }
     public static string OriginalImagePath(string memberId, string imageId) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/original";
     public static string DerivativeImagePath(string memberId, string imageId, int pixels) => $"members/{Uri.EscapeDataString(memberId)}/{Uri.EscapeDataString(imageId)}/avatar-{pixels}.webp";

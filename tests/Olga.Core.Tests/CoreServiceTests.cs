@@ -1864,6 +1864,66 @@ public sealed class CoreServiceTests
         Assert.Equal(("sha256", "blob_path_hash", "file_asset_link_id"), (asset.FindProperty(nameof(FileAsset.Sha256))!.GetColumnName(), asset.FindProperty(nameof(FileAsset.BlobPathHash))!.GetColumnName(), link.FindProperty(nameof(FileAssetLink.FileAssetLinkId))!.GetColumnName()));
     }
 
+    [Fact]
+    public async Task Industry_questionnaire_is_server_driven_and_saves_the_primary_sector_and_versioned_answers()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "Asha", Status = "ACTIVE" });
+        db.Sectors.Add(new Sector { SectorCode = "TECHNOLOGY", Name = "Technology, Software & AI", SortOrder = 10 });
+        db.SectorQuestionnaires.Add(new SectorQuestionnaire { QuestionnaireId = "sq_technology", SectorCode = "TECHNOLOGY", DefinitionVersion = 1 });
+        db.ProfileQuestions.AddRange(
+            new ProfileQuestion { QuestionId = "q_role_v1", QuestionCode = "ROLE", Prompt = "Role?", AnswerType = "SINGLE_SELECT", IsRequired = true, SortOrder = 10, ConfigurationJson = "{\"options\":[{\"code\":\"FOUNDER\",\"label\":\"Founder\"}],\"min_selections\":1,\"max_selections\":1}" },
+            new ProfileQuestion { QuestionId = "q_technology_product_v1", SectorCode = "TECHNOLOGY", QuestionCode = "TECH_PRODUCT", Prompt = "Product?", AnswerType = "MULTI_SELECT", IsRequired = true, SortOrder = 110, ConfigurationJson = "{\"options\":[{\"code\":\"SAAS\",\"label\":\"SaaS\"}],\"min_selections\":1,\"max_selections\":5}" });
+        await db.SaveChangesAsync();
+        var questionnaireRow = db.SectorQuestionnaires.Single();
+        db.SectorQuestionnaireQuestions.AddRange(db.ProfileQuestions.Select(x => new SectorQuestionnaireQuestion { SectorQuestionnaireId = questionnaireRow.Id, DefinitionVersion = 1, ProfileQuestionId = x.Id, IsRequired = x.IsRequired, SortOrder = x.SortOrder }));
+        await db.SaveChangesAsync();
+        var service = Service(db);
+
+        var definition = await service.GetIndustryQuestionnaireAsync("technology", default);
+        var request = new IndustryQuestionnaireSubmitRequest(
+            "TECHNOLOGY",
+            definition.DefinitionVersion,
+            [
+                new("q_role_v1", System.Text.Json.JsonDocument.Parse("{\"option_code\":\"FOUNDER\"}").RootElement.Clone()),
+                new("q_technology_product_v1", System.Text.Json.JsonDocument.Parse("{\"option_codes\":[\"SAAS\"]}").RootElement.Clone())
+            ]);
+        var saved = await service.SaveIndustryQuestionnaireAsync("A", request, "industry-save-1", "\"1\"", default);
+        var replay = await service.SaveIndustryQuestionnaireAsync("A", request, "industry-save-1", "\"1\"", default);
+        var own = await service.GetMemberIndustryQuestionnaireAsync("A", default);
+
+        Assert.Equal(2, definition.Questions.Count);
+        Assert.Equal(("COMPLETED", "TECHNOLOGY", 1), (saved.Status, saved.SectorCode, saved.DefinitionVersion));
+        Assert.Equal(saved.ResponseId, replay.ResponseId);
+        Assert.Equal(2, own.Answers.Count);
+        Assert.True(Assert.Single(db.MemberSectors).IsPrimary);
+        Assert.Equal(2, db.MemberQuestionAnswers.Count());
+        Assert.Contains(db.OutboxEvents, x => x.EventType == "MemberIndustryQuestionnaireChanged.v1");
+    }
+
+    [Fact]
+    public async Task Industry_questionnaire_rejects_a_stale_definition_and_requires_a_custom_other_name()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "Asha", Status = "ACTIVE" });
+        db.Sectors.Add(new Sector { SectorCode = "OTHER", Name = "Other / Not listed", SortOrder = 999 });
+        db.SectorQuestionnaires.Add(new SectorQuestionnaire { QuestionnaireId = "sq_other", SectorCode = "OTHER", DefinitionVersion = 2 });
+        db.ProfileQuestions.Add(new ProfileQuestion { QuestionId = "q_other_v1", SectorCode = "OTHER", QuestionCode = "OTHER_INDUSTRY", Prompt = "Describe it", AnswerType = "TEXT", IsRequired = true, SortOrder = 110, ConfigurationJson = "{\"max_length\":1000}" });
+        await db.SaveChangesAsync();
+        var questionnaireRow = db.SectorQuestionnaires.Single();
+        var questionRow = db.ProfileQuestions.Single();
+        db.SectorQuestionnaireQuestions.Add(new SectorQuestionnaireQuestion { SectorQuestionnaireId = questionnaireRow.Id, DefinitionVersion = 2, ProfileQuestionId = questionRow.Id, IsRequired = true, SortOrder = 110 });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var answer = new QuestionAnswerRequest("q_other_v1", System.Text.Json.JsonDocument.Parse("{\"text\":\"Space services\"}").RootElement.Clone());
+
+        var stale = await Assert.ThrowsAsync<DomainException>(() => service.SaveIndustryQuestionnaireAsync("A", new("OTHER", 1, [answer], CustomIndustryName: "Space"), "industry-stale", "\"1\"", default));
+        var missingName = await Assert.ThrowsAsync<DomainException>(() => service.SaveIndustryQuestionnaireAsync("A", new("OTHER", 2, [answer]), "industry-other", "\"1\"", default));
+
+        Assert.Equal(("QUESTIONNAIRE_VERSION_CONFLICT", 409), (stale.Code, stale.StatusCode));
+        Assert.Equal("CUSTOM_INDUSTRY_REQUIRED", missingName.Code);
+    }
+
     private static byte[] ChatSample(string kind) => kind switch
     {
         "jpeg" => [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, .. "JFIF"u8, 0, 1, 2, 3],
