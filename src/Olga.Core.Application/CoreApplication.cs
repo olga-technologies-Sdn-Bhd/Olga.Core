@@ -48,6 +48,8 @@ public interface ICoreStore
     Task ReleaseIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, CancellationToken ct);
     Task CreateMemberAsync(NewMemberRegistration member, CancellationToken ct);
     Task EnsureMemberAsync(string memberId, CancellationToken ct);
+    // Stamps verified_at on an identity (and its member) the caller has just proven, leaving an existing stamp as is.
+    Task MarkIdentityVerifiedAsync(long identityId, string memberId, CancellationToken ct);
     void Add<T>(T entity) where T : class;
     void Remove<T>(T entity) where T : class;
     Task SaveAsync(CancellationToken ct);
@@ -249,7 +251,7 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
     }
 
-    public Task<MemberLookupResponse> LookupMemberByPhoneAsync(PhoneMemberLookupRequest request, CancellationToken ct)
+    public async Task<MemberLookupResponse> LookupMemberByPhoneAsync(PhoneMemberLookupRequest request, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(request.Phone) || string.IsNullOrWhiteSpace(request.VerificationToken))
@@ -257,14 +259,22 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         if (!PhoneVerification().ValidateProof(request.Phone, request.VerificationToken))
             throw new DomainException("PHONE_VERIFICATION_INVALID", 403);
         var subjectHash = identityProtector.PhoneLookupHash(request.Phone);
-        var memberId = store.Identities
-            .Where(x => x.Provider == "PHONE" && x.ProviderSubjectHash == subjectHash && x.Status == "ACTIVE" && x.VerifiedAt != null)
-            .Select(x => x.MemberId)
+        // Match on the same key as ux_member_identity_provider_subject_hash, so sign-in finds every phone
+        // that would make sign-up fail with MEMBER_IDENTITY_ALREADY_REGISTERED.
+        var identity = store.Identities
+            .Where(x => x.Provider == "PHONE" && x.ProviderSubjectHash == subjectHash)
+            .Select(x => new { x.Id, x.MemberId, x.Status, x.VerifiedAt })
             .FirstOrDefault() ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        var memberId = identity.MemberId;
         if (IsDeletionPending(memberId)) throw DeletionPending(memberId);
-        var profile = store.Profiles.SingleOrDefault(x => x.MemberId == memberId) ?? throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        if (identity.Status != "ACTIVE") throw new DomainException("MEMBER_IDENTITY_REVOKED", 409);
+        // Phones registered before OTP was required have no verified_at; the token above proves the number now.
+        if (identity.VerifiedAt is null) await store.MarkIdentityVerifiedAsync(identity.Id, memberId, ct);
+        // A member whose profile row is missing gets the draft onboarding starts from, as provisioning does.
+        if (!store.Profiles.Any(x => x.MemberId == memberId)) await store.EnsureMemberAsync(memberId, ct);
+        var profile = store.Profiles.Single(x => x.MemberId == memberId);
         var mapped = Map(profile);
-        return Task.FromResult(new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag));
+        return new MemberLookupResponse(mapped.MemberId, profile.DisplayName, mapped.ProfileStatus, mapped.ETag);
     }
 
     public async Task<PhoneVerificationStartResponse> StartPhoneVerificationAsync(PhoneVerificationStartRequest request, string idempotencyKey, CancellationToken ct)
