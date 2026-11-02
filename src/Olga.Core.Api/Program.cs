@@ -512,6 +512,8 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         "IDEMPOTENCY_KEY_REQUIRED" => "An Idempotency-Key header is required for every mutation.",
         "IF_MATCH_REQUIRED" => "An If-Match header is required.",
         "MEMBER_NOT_REGISTERED" => "The member must be registered by the identity service before profile onboarding.",
+        "MEMBER_IDENTITY_ALREADY_REGISTERED" => "This email or phone number already belongs to a member; sign in instead.",
+        "MEMBER_IDENTITY_REVOKED" => "This email or phone number has been revoked and can't be used to sign in.",
         "RESOURCE_REFERENCE_NOT_FOUND" => "A referenced resource does not exist.",
         "RESOURCE_VERSION_CONFLICT" => "The resource changed since it was read.",
         "INTERNAL_ERROR" => "The request could not be completed.",

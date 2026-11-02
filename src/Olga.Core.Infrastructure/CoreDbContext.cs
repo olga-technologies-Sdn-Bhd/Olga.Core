@@ -320,6 +320,49 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
+    async Task ICoreStore.MarkIdentityVerifiedAsync(long identityId, string memberId, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var identity = await MemberIdentities.SingleAsync(x => x.Id == identityId, ct);
+            identity.VerifiedAt ??= DateTimeOffset.UtcNow;
+            await SaveChangesAsync(ct);
+            return;
+        }
+
+        var connection = (NpgsqlConnection)Database.GetDbConnection();
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using (var audit = CreateCommand("SELECT ops.set_audit_context(@actor_id)", transaction))
+            {
+                AddVarchar(audit, "actor_id", memberId, 64);
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+            await using (var identity = CreateCommand("""
+                UPDATE iam.member_identity
+                SET verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, row_version = row_version + 1
+                WHERE member_identity_id = @identity_id AND verified_at IS NULL
+                """, transaction))
+            {
+                identity.Parameters.Add(new NpgsqlParameter("identity_id", NpgsqlDbType.Bigint) { Value = identityId });
+                await identity.ExecuteNonQueryAsync(ct);
+            }
+            await using (var member = CreateCommand("""
+                UPDATE iam.member
+                SET verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, row_version = row_version + 1
+                WHERE member_id = @member_id AND verified_at IS NULL
+                """, transaction))
+            {
+                AddVarchar(member, "member_id", memberId, 64);
+                await member.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+        }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
     async Task<(string ConnectionId, string ConversationId)> ICoreStore.AcceptConnectionRequestAsync(string requestId, string recipientId, string connectionId, string conversationId, string idempotencyKey, string requestHash, CancellationToken ct)
     {
         await using var command = CreateCommand("SELECT * FROM social.accept_connection_request(@request_id, @recipient_id, @connection_id, @conversation_id, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
