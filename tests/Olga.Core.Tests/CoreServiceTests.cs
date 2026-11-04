@@ -117,6 +117,62 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Phone_lookup_signs_in_a_phone_registered_before_verification_was_required()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Legacy phone", Phone: "+60123456789", PhoneVerificationToken: "verified"), "legacy-phone", default);
+        db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).VerifiedAt = null;
+        await db.SaveChangesAsync();
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal(registered.MemberId, found.MemberId);
+        Assert.NotNull(db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Phone_lookup_gives_a_member_without_a_profile_the_onboarding_draft()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("No profile", Phone: "+60123456789", PhoneVerificationToken: "verified"), "no-profile", default);
+        db.MemberProfiles.Remove(db.MemberProfiles.Single(x => x.MemberId == registered.MemberId));
+        await db.SaveChangesAsync();
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal((registered.MemberId, "DRAFT"), (found.MemberId, found.ProfileStatus));
+    }
+
+    [Fact]
+    public async Task Phone_lookup_rejects_a_revoked_phone_instead_of_reporting_it_unregistered()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Revoked phone", Phone: "+60123456789", PhoneVerificationToken: "verified"), "revoked-phone", default);
+        db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).Status = "REVOKED";
+        await db.SaveChangesAsync();
+
+        var error = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default));
+
+        Assert.Equal(("MEMBER_IDENTITY_REVOKED", 409), (error.Code, error.StatusCode));
+    }
+
+    [Fact]
+    public async Task Phone_lookup_reports_an_unknown_phone_as_unregistered()
+    {
+        await using var db = Db();
+
+        var error = await Assert.ThrowsAsync<DomainException>(() => Service(db).LookupMemberByPhoneAsync(new("+60123456789", "verified"), default));
+
+        Assert.Equal(("MEMBER_NOT_REGISTERED", 404), (error.Code, error.StatusCode));
+    }
+
+    [Fact]
     public async Task Starting_phone_verification_replays_without_sending_another_sms()
     {
         await using var db = Db();
