@@ -113,7 +113,7 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         for (var index = 0; index < request.LinkIds.Count; index++)
         {
             var token = identityProtector.CreateInvitationToken(ownerMemberId, request.BatchId, request.LinkIds[index], idempotencyKey);
-            var invitationId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"INVITATION_ID\n{token}")))[..16]).ToLowerInvariant();
+            var invitationId = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"INVITATION_ID\n{token}")))[..16].ToLowerInvariant();
             var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
             await using var command = new NpgsqlCommand("""
                 INSERT INTO social.invitation (invitation_id, invite_batch_pk, contact_link_pk, owner_member_id, batch_position, token_hash, expires_at)
