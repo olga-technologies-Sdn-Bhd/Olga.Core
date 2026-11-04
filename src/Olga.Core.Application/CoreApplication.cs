@@ -169,6 +169,9 @@ public interface IIdentityProtector
     string EmailLookupHash(string email);
     string PhoneLookupHash(string phone);
     string PhoneVerificationRequestHash(string phone, string code);
+    byte[] ProtectContactLabel(string ownerMemberId, string contactRecordId, string label);
+    string UnprotectContactLabel(string ownerMemberId, string contactRecordId, byte[] ciphertext);
+    string CreateInvitationToken(string ownerMemberId, string batchId, string linkId, string idempotencyKey);
     // SubjectHash is the token's keyed fingerprint; DisplayHint is empty.
     ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token);
     string Unprotect(string memberId, string provider, byte[] ciphertext);

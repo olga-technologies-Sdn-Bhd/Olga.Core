@@ -101,7 +101,12 @@ if (!string.IsNullOrWhiteSpace(signalREndpoint))
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
 if (local) builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseInMemoryDatabase("olga-core-local"));
-else builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection!));
+else
+{
+    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connection!));
+    // Keep the existing Core DbContext retry configuration unchanged; SCI raw SQL shares only the connection string.
+    builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection!));
+}
 var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
@@ -139,6 +144,8 @@ builder.Services.AddSingleton<IChatTypingPublisher, SignalRChatTypingPublisher>(
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
+builder.Services.AddScoped<ISocialCapitalRepository, NpgsqlSocialCapitalRepository>();
+builder.Services.AddScoped<ISocialCapitalService, SocialCapitalService>();
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
@@ -199,6 +206,25 @@ app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.
 
 var v1 = app.MapGroup("/v1");
 var memberV1 = app.MapGroup("/v1").WithMetadata(new MemberContextMetadata());
+memberV1.MapPost("/ventures", async (HttpContext c, VentureCreateRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.CreateVentureAsync(Member(c), body, ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Created($"/v1/ventures/{value.VentureId}", value);
+}).WithName("CreateVenture").WithTags("Social capital").Produces<VentureResponse>(201);
+memberV1.MapPost("/contacts/imports", async (HttpContext c, ContactImportRequest body, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ImportContactsAsync(Member(c), body, ct)))
+    .WithName("ImportContacts").WithTags("Social capital").Produces<ContactImportResponse>(200);
+memberV1.MapPost("/invite-batches", async (HttpContext c, InviteBatchCreateRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.CreateInviteBatchAsync(Member(c), body, Idempotency(c), ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Created($"/v1/invite-batches/{value.BatchId}", value);
+}).WithName("CreateInviteBatch").WithTags("Social capital").Produces<InviteBatchResponse>(201);
+memberV1.MapPost("/invitations/{token}/accept", async (HttpContext c, string token, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.AcceptInvitationAsync(Member(c), token, Idempotency(c), ct)))
+    .WithName("AcceptInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200);
+memberV1.MapGet("/ventures/{ventureId}/sci", async (HttpContext c, string ventureId, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetSciAsync(Member(c), ventureId, cursor, limit ?? 50, ct)))
+    .WithName("GetSocialCapitalIndex").WithTags("Social capital").Produces<SciContactPage>(200);
 v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreService s, CancellationToken ct) =>
 {
     var value = await s.RegisterMemberAsync(defaultCommunityId, body, Idempotency(c), ct);

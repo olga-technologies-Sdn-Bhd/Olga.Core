@@ -32,6 +32,12 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
     public string EmailLookupHash(string email) => LookupHash("EMAIL", NormalizeEmail(email));
     public string PhoneLookupHash(string phone) => LookupHash("PHONE", NormalizePhone(phone));
     public string PhoneVerificationRequestHash(string phone, string code) => LookupHash("PHONE_VERIFICATION", $"{NormalizePhone(phone)}\n{code}");
+    public byte[] ProtectContactLabel(string ownerMemberId, string contactRecordId, string label) =>
+        Protect("CONTACT_LABEL", $"{ownerMemberId}:{contactRecordId}", label.Trim(), "", false, false).SubjectCiphertext;
+    public string UnprotectContactLabel(string ownerMemberId, string contactRecordId, byte[] ciphertext) =>
+        Unprotect($"{ownerMemberId}:{contactRecordId}", "CONTACT_LABEL", ciphertext);
+    public string CreateInvitationToken(string ownerMemberId, string batchId, string linkId, string idempotencyKey) =>
+        Convert.ToHexString(HMACSHA256.HashData(lookupKey, Encoding.UTF8.GetBytes($"INVITATION\n{ownerMemberId}\n{batchId}\n{linkId}\n{idempotencyKey}"))).ToLowerInvariant();
 
     // Bound to the device, so Unprotect(deviceId, provider, ciphertext) reads it back.
     public ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token) => Protect(provider, deviceId, token, "", false, false);
