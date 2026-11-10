@@ -211,6 +211,14 @@ memberV1.MapPost("/ventures", async (HttpContext c, VentureCreateRequest body, I
     var value = await s.CreateVentureAsync(Member(c), body, ct); c.Response.Headers.ETag = value.ETag;
     return Results.Created($"/v1/ventures/{value.VentureId}", value);
 }).WithName("CreateVenture").WithTags("Social capital").Produces<VentureResponse>(201);
+memberV1.MapGet("/ventures", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListVenturesAsync(Member(c), ct)))
+    .WithName("ListVentures").WithTags("Social capital").Produces<IReadOnlyList<VentureResponse>>(200);
+memberV1.MapGet("/ventures/{ventureId}", async (HttpContext c, string ventureId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.GetVentureAsync(Member(c), ventureId, ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+}).WithName("GetVenture").WithTags("Social capital").Produces<VentureResponse>(200).Produces<ApiError>(404);
 memberV1.MapPost("/contacts/imports", async (HttpContext c, ContactImportRequest body, ISocialCapitalService s, CancellationToken ct) =>
     Results.Ok(await s.ImportContactsAsync(Member(c), body, ct)))
     .WithName("ImportContacts").WithTags("Social capital").Produces<ContactImportResponse>(200);

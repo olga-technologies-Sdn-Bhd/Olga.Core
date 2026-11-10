@@ -50,6 +50,32 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         return result;
     }
 
+    public async Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct)
+    {
+        await using var command = dataSource.CreateCommand("""
+            SELECT v.venture_id, v.name, v.organization_id, v.industry_code, v.stage_code,
+                   v.revenue_band_code, v.team_size_band_code, v.status, v.updated_at, v.row_version,
+                   COALESCE(array_agg(g.geography_code ORDER BY g.is_primary DESC, g.geography_code)
+                       FILTER (WHERE g.geography_code IS NOT NULL), ARRAY[]::varchar[])
+            FROM core.venture v
+            LEFT JOIN core.venture_geography g ON g.venture_pk=v.venture_pk
+            WHERE v.owner_member_id=@owner_member_id
+            GROUP BY v.venture_pk
+            ORDER BY v.updated_at DESC, v.venture_pk DESC
+            """);
+        Add(command, "owner_member_id", ownerMemberId);
+        var ventures = new List<VentureResponse>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct)) ventures.Add(ReadVenture(reader));
+        return ventures;
+    }
+
+    public async Task<VentureResponse?> GetVentureAsync(string ownerMemberId, string ventureId, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        return await ReadVentureAsync(connection, null, ownerMemberId, ventureId, ct);
+    }
+
     public async Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, IReadOnlyList<ProtectedContactImport> contacts, int retentionDays, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
@@ -235,19 +261,34 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodeCursor(page[^1].Score, page[^1].Pk) : null);
     }
 
-    private static async Task<VentureResponse?> ReadVentureAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string ownerMemberId, string ventureId, CancellationToken ct)
+    private static async Task<VentureResponse?> ReadVentureAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, string ownerMemberId, string ventureId, CancellationToken ct)
     {
         await using var command = new NpgsqlCommand("""
-            SELECT v.name, v.status, v.updated_at, v.row_version,
-                   COALESCE(array_agg(g.geography_code ORDER BY g.is_primary DESC, g.geography_code) FILTER (WHERE g.geography_code IS NOT NULL), ARRAY[]::varchar[])
+            SELECT v.venture_id, v.name, v.organization_id, v.industry_code, v.stage_code,
+                   v.revenue_band_code, v.team_size_band_code, v.status, v.updated_at, v.row_version,
+                   COALESCE(array_agg(g.geography_code ORDER BY g.is_primary DESC, g.geography_code)
+                       FILTER (WHERE g.geography_code IS NOT NULL), ARRAY[]::varchar[])
             FROM core.venture v LEFT JOIN core.venture_geography g ON g.venture_pk=v.venture_pk
             WHERE v.venture_id=@venture_id AND v.owner_member_id=@owner_member_id
             GROUP BY v.venture_pk
             """, connection, transaction);
         Add(command, "venture_id", ventureId); Add(command, "owner_member_id", ownerMemberId);
         await using var reader = await command.ExecuteReaderAsync(ct);
-        return await reader.ReadAsync(ct) ? new VentureResponse(ventureId, reader.GetString(0), reader.GetString(1), reader.GetFieldValue<string[]>(4), reader.GetFieldValue<DateTimeOffset>(2), $"\"{reader.GetInt64(3):x}\"") : null;
+        return await reader.ReadAsync(ct) ? ReadVenture(reader) : null;
     }
+
+    private static VentureResponse ReadVenture(NpgsqlDataReader reader) => new(
+        reader.GetString(0),
+        reader.GetString(1),
+        reader.IsDBNull(2) ? null : reader.GetString(2),
+        reader.IsDBNull(3) ? null : reader.GetString(3),
+        reader.IsDBNull(4) ? null : reader.GetString(4),
+        reader.IsDBNull(5) ? null : reader.GetString(5),
+        reader.IsDBNull(6) ? null : reader.GetString(6),
+        reader.GetString(7),
+        reader.GetFieldValue<string[]>(10),
+        reader.GetFieldValue<DateTimeOffset>(8),
+        $"\"{reader.GetInt64(9):x}\"");
 
     private static async Task UpsertIdentifierAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long recordPk, string ownerMemberId, string type, string? hash, CancellationToken ct)
     {

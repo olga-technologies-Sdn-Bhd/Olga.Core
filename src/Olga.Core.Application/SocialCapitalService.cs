@@ -8,6 +8,8 @@ public sealed record ProtectedContactImport(string ContactRecordId, string LinkI
 public interface ISocialCapitalRepository
 {
     Task<VentureResponse> CreateVentureAsync(string ownerMemberId, VentureCreateRequest request, CancellationToken ct);
+    Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct);
+    Task<VentureResponse?> GetVentureAsync(string ownerMemberId, string ventureId, CancellationToken ct);
     Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, IReadOnlyList<ProtectedContactImport> contacts, int retentionDays, CancellationToken ct);
     Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct);
@@ -17,6 +19,8 @@ public interface ISocialCapitalRepository
 public interface ISocialCapitalService
 {
     Task<VentureResponse> CreateVentureAsync(string ownerMemberId, VentureCreateRequest request, CancellationToken ct);
+    Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct);
+    Task<VentureResponse> GetVentureAsync(string ownerMemberId, string ventureId, CancellationToken ct);
     Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, ContactImportRequest request, CancellationToken ct);
     Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct);
@@ -32,6 +36,16 @@ public sealed class SocialCapitalService(ISocialCapitalRepository repository, II
         if (request.GeographyCodes?.Count > 20 || request.GeographyCodes?.Any(x => string.IsNullOrWhiteSpace(x) || x.Length > 64) == true)
             throw new DomainException("VENTURE_GEOGRAPHY_INVALID");
         return repository.CreateVentureAsync(ownerMemberId, request, ct);
+    }
+
+    public Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct) =>
+        repository.ListVenturesAsync(ownerMemberId, ct);
+
+    public async Task<VentureResponse> GetVentureAsync(string ownerMemberId, string ventureId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(ventureId) || ventureId.Length > 64) throw new DomainException("VENTURE_INVALID");
+        return await repository.GetVentureAsync(ownerMemberId, ventureId, ct)
+            ?? throw new DomainException("VENTURE_NOT_FOUND", 404);
     }
 
     public Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, ContactImportRequest request, CancellationToken ct)

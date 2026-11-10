@@ -13,6 +13,11 @@ public sealed record VentureCreateRequest(
 public sealed record VentureResponse(
     string VentureId,
     string Name,
+    string? OrganizationId,
+    string? IndustryCode,
+    string? StageCode,
+    string? RevenueBandCode,
+    string? TeamSizeBandCode,
     string Status,
     IReadOnlyList<string> GeographyCodes,
     DateTimeOffset UpdatedAt,
