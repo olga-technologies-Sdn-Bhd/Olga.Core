@@ -169,25 +169,32 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         return new(request.BatchId, "APPROVED", invitations, "\"1\"");
     }
 
-    public async Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct)
+    public Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct) =>
+        AcceptAsync(recipientMemberId, "i.token_hash=@lookup", TokenHash(token), idempotencyKey, ct);
+
+    // Accepts an invitation addressed to one of the member's verified phone/email identities,
+    // without the shared token (the "pending invites" inbox path).
+    public Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct) =>
+        AcceptAsync(recipientMemberId, $"i.invitation_id=@lookup AND {MatchesRecipientIdentity}", invitationId, idempotencyKey, ct);
+
+    private async Task<InvitationAcceptResponse> AcceptAsync(string recipientMemberId, string lookupFilter, string lookup, string idempotencyKey, CancellationToken ct)
     {
-        var tokenHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         string invitationId, senderMemberId, linkId;
         long? venturePk;
-        await using (var read = new NpgsqlCommand("""
+        await using (var read = new NpgsqlCommand($"""
             SELECT i.invitation_id, i.owner_member_id, l.link_id, b.venture_pk
             FROM social.invitation i
             JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
             JOIN social.contact_link l ON l.contact_link_pk=i.contact_link_pk
-            WHERE i.token_hash=@token_hash AND i.status IN ('APPROVED','OPENED','ACCEPTED')
+            WHERE {lookupFilter} AND i.status IN ('APPROVED','OPENED','ACCEPTED')
               AND i.expires_at>CURRENT_TIMESTAMP AND b.expires_at>CURRENT_TIMESTAMP
               AND (l.contact_member_id IS NULL OR l.contact_member_id=@recipient_member_id)
             FOR UPDATE OF i,l
             """, connection, transaction))
         {
-            Add(read, "token_hash", tokenHash); Add(read, "recipient_member_id", recipientMemberId);
+            Add(read, "lookup", lookup); Add(read, "recipient_member_id", recipientMemberId);
             await using var reader = await read.ExecuteReaderAsync(ct);
             if (!await reader.ReadAsync(ct)) throw new DomainException("INVITATION_NOT_FOUND", 404);
             invitationId=reader.GetString(0); senderMemberId=reader.GetString(1); linkId=reader.GetString(2); venturePk=reader.IsDBNull(3)?null:reader.GetInt64(3);
@@ -261,6 +268,255 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodeCursor(page[^1].Score, page[^1].Pk) : null);
     }
 
+    public async Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        var ventures = new List<SciVentureSummary>();
+        await using (var perVenture = new NpgsqlCommand("""
+            SELECT v.venture_id, v.name, count(s.contact_link_pk)::int, max(s.calibrated_score), round(avg(s.calibrated_score), 2),
+                   (count(*) FILTER (WHERE s.is_stale))::int, max(s.scored_at)
+            FROM core.venture v
+            LEFT JOIN social.vw_sci_contact s ON s.owner_member_id=v.owner_member_id AND s.venture_id=v.venture_id
+            WHERE v.owner_member_id=@owner_member_id
+            GROUP BY v.venture_pk
+            ORDER BY v.updated_at DESC, v.venture_pk DESC
+            """, connection))
+        {
+            Add(perVenture, "owner_member_id", ownerMemberId);
+            await using var reader = await perVenture.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                ventures.Add(new(reader.GetString(0), reader.GetString(1), reader.GetInt32(2), NullableDecimal(reader, 3), NullableDecimal(reader, 4),
+                    reader.GetInt32(5), reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6)));
+        }
+        // One contact can sit in several ventures' SCI; the totals count each contact once, at its best score.
+        await using var totals = new NpgsqlCommand("""
+            WITH best AS (
+                SELECT contact_link_pk, max(calibrated_score) AS score, max(scored_at) AS scored_at
+                FROM social.vw_sci_contact WHERE owner_member_id=@owner_member_id
+                GROUP BY contact_link_pk)
+            SELECT count(*)::int,
+                   (count(*) FILTER (WHERE score >= 10 AND score < 25))::int,
+                   (count(*) FILTER (WHERE score >= 25 AND score < 50))::int,
+                   (count(*) FILTER (WHERE score >= 50 AND score < 75))::int,
+                   (count(*) FILTER (WHERE score >= 75))::int,
+                   round(avg(score), 2), max(scored_at)
+            FROM best
+            """, connection);
+        Add(totals, "owner_member_id", ownerMemberId);
+        await using var total = await totals.ExecuteReaderAsync(ct);
+        await total.ReadAsync(ct);
+        return new(ventures.Count, total.GetInt32(0), new(total.GetInt32(1), total.GetInt32(2), total.GetInt32(3), total.GetInt32(4)),
+            NullableDecimal(total, 5), total.IsDBNull(6) ? null : total.GetFieldValue<DateTimeOffset>(6), ventures);
+    }
+
+    public async Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct)
+    {
+        var afterPk = DecodePkCursor(cursor, "CONTACT_CURSOR_INVALID");
+        await using var command = dataSource.CreateCommand($"""
+            SELECT l.contact_link_pk, l.link_id, r.contact_record_id, r.label_ciphertext, l.lifecycle_state, l.contact_member_id,
+                   EXISTS (SELECT 1 FROM social.contact_identifier ci WHERE ci.contact_record_pk=r.contact_record_pk AND ci.identifier_type='EMAIL'),
+                   EXISTS (SELECT 1 FROM social.contact_identifier ci WHERE ci.contact_record_pk=r.contact_record_pk AND ci.identifier_type='PHONE'),
+                   inv.invitation_id, {EffectiveInvitationStatus("inv")}, inv.effective_expires_at, l.created_at, r.expires_at
+            FROM social.contact_link l
+            JOIN social.contact_record r ON r.contact_record_pk=l.contact_record_pk
+            LEFT JOIN LATERAL (
+                SELECT i.invitation_id, i.status, LEAST(i.expires_at, b.expires_at) AS effective_expires_at
+                FROM social.invitation i JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
+                WHERE i.contact_link_pk=l.contact_link_pk
+                ORDER BY i.created_at DESC, i.invitation_pk DESC LIMIT 1) inv ON true
+            WHERE l.owner_member_id=@owner_member_id AND l.lifecycle_state<>'REMOVED'
+              AND r.status='ACTIVE' AND r.expires_at>CURRENT_TIMESTAMP
+              AND (@after_pk = 0 OR l.contact_link_pk < @after_pk)
+            ORDER BY l.contact_link_pk DESC
+            LIMIT @take
+            """);
+        Add(command, "owner_member_id", ownerMemberId);
+        command.Parameters.AddWithValue("after_pk", afterPk); command.Parameters.AddWithValue("take", limit + 1);
+        var rows = new List<(long Pk, ImportedContactResponse Value)>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+        {
+            var recordId = reader.GetString(2);
+            rows.Add((reader.GetInt64(0), new(reader.GetString(1), recordId,
+                identityProtector.UnprotectContactLabel(ownerMemberId, recordId, reader.GetFieldValue<byte[]>(3)),
+                reader.GetString(4), NullableString(reader, 5), reader.GetBoolean(6), reader.GetBoolean(7),
+                NullableString(reader, 8), NullableString(reader, 9), reader.IsDBNull(10) ? null : reader.GetFieldValue<DateTimeOffset>(10),
+                reader.GetFieldValue<DateTimeOffset>(11), reader.GetFieldValue<DateTimeOffset>(12))));
+        }
+        var page = rows.Take(limit).ToArray();
+        return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodePkCursor(page[^1].Pk) : null);
+    }
+
+    public async Task<InviteBatchDetailResponse?> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        string? ventureId; string status; DateTimeOffset expiresAt, createdAt;
+        await using (var batch = new NpgsqlCommand("""
+            SELECT v.venture_id,
+                   CASE WHEN b.status='APPROVED' AND b.expires_at<=CURRENT_TIMESTAMP THEN 'EXPIRED' ELSE b.status END,
+                   b.expires_at, b.created_at
+            FROM social.invite_batch b LEFT JOIN core.venture v ON v.venture_pk=b.venture_pk
+            WHERE b.batch_id=@batch_id AND b.owner_member_id=@owner_member_id
+            """, connection))
+        {
+            Add(batch, "batch_id", batchId); Add(batch, "owner_member_id", ownerMemberId);
+            await using var reader = await batch.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) return null;
+            ventureId = NullableString(reader, 0); status = reader.GetString(1);
+            expiresAt = reader.GetFieldValue<DateTimeOffset>(2); createdAt = reader.GetFieldValue<DateTimeOffset>(3);
+        }
+        await using var command = new NpgsqlCommand($"""
+            SELECT inv.invitation_id, l.link_id, r.contact_record_id, r.label_ciphertext, {EffectiveInvitationStatus("inv")},
+                   inv.first_opened_at, inv.accepted_at, inv.effective_expires_at
+            FROM (SELECT i.*, LEAST(i.expires_at, b.expires_at) AS effective_expires_at
+                  FROM social.invitation i JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
+                  WHERE b.batch_id=@batch_id AND b.owner_member_id=@owner_member_id) inv
+            JOIN social.contact_link l ON l.contact_link_pk=inv.contact_link_pk
+            JOIN social.contact_record r ON r.contact_record_pk=l.contact_record_pk
+            ORDER BY inv.batch_position
+            """, connection);
+        Add(command, "batch_id", batchId); Add(command, "owner_member_id", ownerMemberId);
+        var invitations = new List<InvitationStatusResponse>();
+        await using (var reader = await command.ExecuteReaderAsync(ct))
+        {
+            while (await reader.ReadAsync(ct))
+            {
+                var recordId = reader.GetString(2);
+                invitations.Add(new(reader.GetString(0), reader.GetString(1),
+                    identityProtector.UnprotectContactLabel(ownerMemberId, recordId, reader.GetFieldValue<byte[]>(3)), reader.GetString(4),
+                    reader.IsDBNull(5) ? null : reader.GetFieldValue<DateTimeOffset>(5), reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6),
+                    reader.GetFieldValue<DateTimeOffset>(7)));
+            }
+        }
+        return new(batchId, ventureId, status, expiresAt, createdAt, invitations);
+    }
+
+    // The raw token is never stored, so a resend rotates it. The new token is derived from the
+    // resend's Idempotency-Key, so retrying the same resend returns the same token.
+    public async Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, int expiresInDays, string idempotencyKey, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        long invitationPk, batchPk; string batchId, linkId, status, batchStatus, currentHash; DateTimeOffset currentExpiry;
+        await using (var read = new NpgsqlCommand("""
+            SELECT i.invitation_pk, b.invite_batch_pk, b.batch_id, l.link_id, i.status, b.status, i.token_hash, LEAST(i.expires_at, b.expires_at)
+            FROM social.invitation i
+            JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
+            JOIN social.contact_link l ON l.contact_link_pk=i.contact_link_pk
+            WHERE i.invitation_id=@invitation_id AND i.owner_member_id=@owner_member_id
+            FOR UPDATE OF i,b
+            """, connection, transaction))
+        {
+            Add(read, "invitation_id", invitationId); Add(read, "owner_member_id", ownerMemberId);
+            await using var reader = await read.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) throw new DomainException("INVITATION_NOT_FOUND", 404);
+            invitationPk = reader.GetInt64(0); batchPk = reader.GetInt64(1); batchId = reader.GetString(2); linkId = reader.GetString(3);
+            status = reader.GetString(4); batchStatus = reader.GetString(5); currentHash = reader.GetString(6); currentExpiry = reader.GetFieldValue<DateTimeOffset>(7);
+        }
+        var token = identityProtector.CreateInvitationToken(ownerMemberId, batchId, linkId, $"resend\n{idempotencyKey}");
+        var tokenHash = TokenHash(token);
+        if (currentHash == tokenHash)
+        {
+            await transaction.CommitAsync(ct);
+            return new(invitationId, linkId, token, currentExpiry);
+        }
+        if (status is "ACCEPTED" or "REVOKED" || batchStatus is "CANCELLED" or "DRAFT") throw new DomainException("INVITATION_NOT_RESENDABLE", 409);
+        var expiresAt = DateTimeOffset.UtcNow.AddDays(expiresInDays);
+        await using (var update = new NpgsqlCommand("""
+            UPDATE social.invite_batch SET expires_at=GREATEST(expires_at, @expires_at),
+                status=CASE WHEN status='EXPIRED' THEN 'APPROVED' ELSE status END, updated_at=CURRENT_TIMESTAMP
+            WHERE invite_batch_pk=@batch_pk;
+            UPDATE social.invitation SET token_hash=@token_hash, expires_at=@expires_at,
+                status=CASE WHEN status='EXPIRED' THEN 'APPROVED' ELSE status END, updated_at=CURRENT_TIMESTAMP
+            WHERE invitation_pk=@invitation_pk;
+            """, connection, transaction))
+        {
+            update.Parameters.AddWithValue("expires_at", expiresAt); update.Parameters.AddWithValue("batch_pk", batchPk);
+            update.Parameters.AddWithValue("invitation_pk", invitationPk); Add(update, "token_hash", tokenHash);
+            await update.ExecuteNonQueryAsync(ct);
+        }
+        await transaction.CommitAsync(ct);
+        return new(invitationId, linkId, token, expiresAt);
+    }
+
+    public async Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        InvitationPreviewResponse preview;
+        await using (var read = new NpgsqlCommand($"""
+            SELECT inv.invitation_id, inv.owner_member_id, COALESCE(p.display_name, ''), v.name, {EffectiveInvitationStatus("inv")}, inv.effective_expires_at
+            FROM (SELECT i.*, b.venture_pk, LEAST(i.expires_at, b.expires_at) AS effective_expires_at
+                  FROM social.invitation i JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
+                  WHERE i.token_hash=@token_hash) inv
+            JOIN social.contact_link l ON l.contact_link_pk=inv.contact_link_pk
+            LEFT JOIN core.member_profile p ON p.member_id=inv.owner_member_id
+            LEFT JOIN core.venture v ON v.venture_pk=inv.venture_pk
+            WHERE inv.status<>'REVOKED' AND (l.contact_member_id IS NULL OR l.contact_member_id=@viewer_member_id OR inv.owner_member_id=@viewer_member_id)
+            """, connection, transaction))
+        {
+            Add(read, "token_hash", TokenHash(token)); Add(read, "viewer_member_id", viewerMemberId);
+            await using var reader = await read.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) throw new DomainException("INVITATION_NOT_FOUND", 404);
+            preview = new(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5));
+        }
+        // The inviter previewing their own link must not count as the invitee opening it.
+        if (preview.Status == "APPROVED" && preview.InviterMemberId != viewerMemberId)
+        {
+            await using var opened = new NpgsqlCommand("""
+                UPDATE social.invitation SET status='OPENED', first_opened_at=COALESCE(first_opened_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP
+                WHERE invitation_id=@invitation_id AND status='APPROVED'
+                """, connection, transaction);
+            Add(opened, "invitation_id", preview.InvitationId);
+            await opened.ExecuteNonQueryAsync(ct);
+            preview = preview with { Status = "OPENED" };
+        }
+        await transaction.CommitAsync(ct);
+        return preview;
+    }
+
+    public async Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct)
+    {
+        await using var command = dataSource.CreateCommand($"""
+            SELECT i.invitation_id, i.owner_member_id, COALESCE(p.display_name, ''), p.headline, v.name, i.created_at, LEAST(i.expires_at, b.expires_at)
+            FROM social.invitation i
+            JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
+            JOIN social.contact_link l ON l.contact_link_pk=i.contact_link_pk
+            LEFT JOIN core.member_profile p ON p.member_id=i.owner_member_id
+            LEFT JOIN core.venture v ON v.venture_pk=b.venture_pk
+            WHERE i.status IN ('APPROVED','OPENED') AND i.expires_at>CURRENT_TIMESTAMP
+              AND b.status='APPROVED' AND b.expires_at>CURRENT_TIMESTAMP
+              AND i.owner_member_id<>@recipient_member_id
+              AND (l.contact_member_id IS NULL OR l.contact_member_id=@recipient_member_id)
+              AND {MatchesRecipientIdentity}
+              AND NOT EXISTS (SELECT 1 FROM social.member_block mb WHERE mb.removed_at IS NULL
+                  AND ((mb.blocker_member_id=@recipient_member_id AND mb.blocked_member_id=i.owner_member_id)
+                    OR (mb.blocker_member_id=i.owner_member_id AND mb.blocked_member_id=@recipient_member_id)))
+            ORDER BY i.created_at DESC, i.invitation_pk DESC
+            LIMIT 50
+            """);
+        Add(command, "recipient_member_id", memberId);
+        var items = new List<PendingInvitationResponse>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            items.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), NullableString(reader, 3), NullableString(reader, 4),
+                reader.GetFieldValue<DateTimeOffset>(5), reader.GetFieldValue<DateTimeOffset>(6)));
+        return items;
+    }
+
+    // The imported contact's phone/email hash equals the recipient's verified identity hash
+    // (both come from IIdentityProtector's keyed lookup hash). Expects alias l (contact_link) and @recipient_member_id.
+    private const string MatchesRecipientIdentity = """
+        EXISTS (SELECT 1 FROM social.contact_identifier ci
+                JOIN iam.member_identity mi ON mi.provider=ci.identifier_type AND mi.provider_subject_hash=ci.identifier_hash
+                WHERE ci.contact_record_pk=l.contact_record_pk AND mi.member_id=@recipient_member_id
+                  AND mi.status='ACTIVE' AND mi.verified_at IS NOT NULL)
+        """;
+
+    // Unaccepted invitations past their own or their batch's expiry read as EXPIRED. Expects alias.status and alias.effective_expires_at.
+    private static string EffectiveInvitationStatus(string alias) =>
+        $"CASE WHEN {alias}.status IN ('APPROVED','OPENED') AND {alias}.effective_expires_at<=CURRENT_TIMESTAMP THEN 'EXPIRED' ELSE {alias}.status END";
+
     private static async Task<VentureResponse?> ReadVentureAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, string ownerMemberId, string ventureId, CancellationToken ct)
     {
         await using var command = new NpgsqlCommand("""
@@ -303,6 +559,20 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
     }
 
     private static void Add(NpgsqlCommand command, string name, string? value) => command.Parameters.Add(name, NpgsqlDbType.Varchar).Value = value is null ? DBNull.Value : value;
+    private static string TokenHash(string token) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
+    private static string? NullableString(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    private static decimal? NullableDecimal(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetDecimal(ordinal);
+    private static string EncodePkCursor(long pk) => Convert.ToBase64String(Encoding.UTF8.GetBytes(pk.ToString(CultureInfo.InvariantCulture)));
+    private static long DecodePkCursor(string? cursor, string errorCode)
+    {
+        if (string.IsNullOrWhiteSpace(cursor)) return 0;
+        try
+        {
+            return long.TryParse(Encoding.UTF8.GetString(Convert.FromBase64String(cursor)), NumberStyles.None, CultureInfo.InvariantCulture, out var pk) && pk > 0
+                ? pk : throw new FormatException();
+        }
+        catch (FormatException) { throw new DomainException(errorCode); }
+    }
     private static string EncodeCursor(decimal score, long pk) => Convert.ToBase64String(Encoding.UTF8.GetBytes($"{score.ToString(CultureInfo.InvariantCulture)}:{pk}"));
     private static string StableId(string prefix, string value) => $"{prefix}_{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant()[..32]}";
     private static (decimal? Score, long Pk) DecodeCursor(string? cursor)

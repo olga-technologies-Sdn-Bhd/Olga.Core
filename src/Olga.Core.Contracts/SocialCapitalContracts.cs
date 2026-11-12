@@ -45,3 +45,37 @@ public sealed record SciContactResponse(
     string ETag);
 
 public sealed record SciContactPage(IReadOnlyList<SciContactResponse> Items, string? NextCursor);
+
+// Score bands match the UI guide: Emerging 10-24, Relevant 25-49, Strong 50-74, Exact 75-100.
+public sealed record SciBandCounts(int Emerging, int Relevant, int Strong, int Exact);
+public sealed record SciVentureSummary(string VentureId, string Name, int ContactCount, decimal? TopScore, decimal? AverageScore, int StaleCount, DateTimeOffset? LastScoredAt);
+public sealed record SciSummaryResponse(int VentureCount, int ContactCount, SciBandCounts Bands, decimal? AverageScore, DateTimeOffset? LastScoredAt, IReadOnlyList<SciVentureSummary> Ventures);
+
+public sealed record ImportedContactResponse(
+    string LinkId,
+    string ContactRecordId,
+    string Label,
+    string LifecycleState,
+    string? ContactMemberId,
+    bool HasEmail,
+    bool HasPhone,
+    string? InvitationId,
+    string? InvitationStatus,
+    DateTimeOffset? InvitationExpiresAt,
+    DateTimeOffset ImportedAt,
+    DateTimeOffset ExpiresAt);
+public sealed record ImportedContactPage(IReadOnlyList<ImportedContactResponse> Items, string? NextCursor);
+
+public sealed record InvitationStatusResponse(
+    string InvitationId,
+    string LinkId,
+    string Label,
+    string Status,
+    DateTimeOffset? FirstOpenedAt,
+    DateTimeOffset? AcceptedAt,
+    DateTimeOffset ExpiresAt);
+public sealed record InviteBatchDetailResponse(string BatchId, string? VentureId, string Status, DateTimeOffset ExpiresAt, DateTimeOffset CreatedAt, IReadOnlyList<InvitationStatusResponse> Invitations);
+public sealed record InvitationResendRequest(int ExpiresInDays = 14);
+
+public sealed record InvitationPreviewResponse(string InvitationId, string InviterMemberId, string InviterDisplayName, string? VentureName, string Status, DateTimeOffset ExpiresAt);
+public sealed record PendingInvitationResponse(string InvitationId, string InviterMemberId, string InviterDisplayName, string? InviterHeadline, string? VentureName, DateTimeOffset InvitedAt, DateTimeOffset ExpiresAt);

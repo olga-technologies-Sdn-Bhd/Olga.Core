@@ -36,6 +36,11 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(memberRegistration, "Idempotency-Key", required: true, maxLength: 128);
         AssertNoHeader(memberRegistration, "X-Member-Id");
 
+        AssertHeader(Operation(document, "/v1/invitations/{invitationId}/resend", "post"), "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(Operation(document, "/v1/me/invitations/{invitationId}/accept", "post"), "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(Operation(document, "/v1/invitations/{token}/open", "post"), "Idempotency-Key");
+        AssertNoHeader(Operation(document, "/v1/sci/summary", "get"), "Idempotency-Key");
+
         var memberLookup = Operation(document, "/v1/members/{memberId}", "get");
         AssertHeader(memberLookup, "X-Member-Id", required: false, maxLength: 64);
         AssertNoHeader(memberLookup, "Idempotency-Key");

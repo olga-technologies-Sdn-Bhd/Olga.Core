@@ -233,6 +233,28 @@ memberV1.MapPost("/invitations/{token}/accept", async (HttpContext c, string tok
 memberV1.MapGet("/ventures/{ventureId}/sci", async (HttpContext c, string ventureId, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
     Results.Ok(await s.GetSciAsync(Member(c), ventureId, cursor, limit ?? 50, ct)))
     .WithName("GetSocialCapitalIndex").WithTags("Social capital").Produces<SciContactPage>(200);
+memberV1.MapGet("/sci/summary", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetSciSummaryAsync(Member(c), ct)))
+    .WithName("GetSocialCapitalSummary").WithTags("Social capital").Produces<SciSummaryResponse>(200);
+memberV1.MapGet("/contacts", async (HttpContext c, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListContactsAsync(Member(c), cursor, limit ?? 50, ct)))
+    .WithName("ListImportedContacts").WithTags("Social capital").Produces<ImportedContactPage>(200);
+memberV1.MapGet("/invite-batches/{batchId}", async (HttpContext c, string batchId, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetInviteBatchAsync(Member(c), batchId, ct)))
+    .WithName("GetInviteBatch").WithTags("Social capital").Produces<InviteBatchDetailResponse>(200).Produces<ApiError>(404);
+memberV1.MapPost("/invitations/{invitationId}/resend", async (HttpContext c, string invitationId, InvitationResendRequest? body, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ResendInvitationAsync(Member(c), invitationId, body ?? new InvitationResendRequest(), Idempotency(c), ct)))
+    .WithName("ResendInvitation").WithTags("Social capital").Produces<InvitationDispatch>(200).Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapPost("/invitations/{token}/open", async (HttpContext c, string token, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.OpenInvitationAsync(Member(c), token, ct)))
+    // Only flips APPROVED to OPENED once, so a replay is harmless and needs no Idempotency-Key.
+    .WithName("OpenInvitation").WithTags("Social capital").WithMetadata(new NoIdempotencyMetadata()).Produces<InvitationPreviewResponse>(200).Produces<ApiError>(404);
+memberV1.MapGet("/me/invitations", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListPendingInvitationsAsync(Member(c), ct)))
+    .WithName("ListPendingInvitations").WithTags("Social capital").Produces<IReadOnlyList<PendingInvitationResponse>>(200);
+memberV1.MapPost("/me/invitations/{invitationId}/accept", async (HttpContext c, string invitationId, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.AcceptPendingInvitationAsync(Member(c), invitationId, Idempotency(c), ct)))
+    .WithName("AcceptPendingInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200).Produces<ApiError>(404);
 v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreService s, CancellationToken ct) =>
 {
     var value = await s.RegisterMemberAsync(defaultCommunityId, body, Idempotency(c), ct);
