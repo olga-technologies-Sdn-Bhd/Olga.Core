@@ -85,7 +85,7 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
             long recordPk;
             await using (var command = new NpgsqlCommand("""
                 INSERT INTO social.contact_record (contact_record_id, owner_member_id, label_ciphertext, source_type, expires_at)
-                VALUES (@contact_record_id, @owner_member_id, @label_ciphertext, 'DEVICE_IMPORT', CURRENT_TIMESTAMP + make_interval(days => @retention_days))
+                VALUES (@contact_record_id, @owner_member_id, @label_ciphertext, 'PHONE', CURRENT_TIMESTAMP + make_interval(days => @retention_days))
                 ON CONFLICT (contact_record_id) DO UPDATE SET
                     label_ciphertext = EXCLUDED.label_ciphertext,
                     last_refreshed_at = CURRENT_TIMESTAMP,
