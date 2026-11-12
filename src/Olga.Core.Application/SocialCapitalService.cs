@@ -14,6 +14,13 @@ public interface ISocialCapitalRepository
     Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct);
     Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct);
+    Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct);
+    Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct);
+    Task<InviteBatchDetailResponse?> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct);
+    Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, int expiresInDays, string idempotencyKey, CancellationToken ct);
+    Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct);
+    Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct);
+    Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct);
 }
 
 public interface ISocialCapitalService
@@ -25,6 +32,13 @@ public interface ISocialCapitalService
     Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct);
     Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct);
+    Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct);
+    Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct);
+    Task<InviteBatchDetailResponse> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct);
+    Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, InvitationResendRequest request, string idempotencyKey, CancellationToken ct);
+    Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct);
+    Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct);
+    Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct);
 }
 
 public sealed class SocialCapitalService(ISocialCapitalRepository repository, IIdentityProtector identityProtector) : ISocialCapitalService
@@ -82,7 +96,7 @@ public sealed class SocialCapitalService(ISocialCapitalRepository repository, II
 
     public Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct)
     {
-        if (token.Length != 64 || token.Any(c => !Uri.IsHexDigit(c))) throw new DomainException("INVITATION_TOKEN_INVALID");
+        if (!IsToken(token)) throw new DomainException("INVITATION_TOKEN_INVALID");
         return repository.AcceptInvitationAsync(recipientMemberId, token.ToLowerInvariant(), idempotencyKey, ct);
     }
 
@@ -91,4 +105,47 @@ public sealed class SocialCapitalService(ISocialCapitalRepository repository, II
         if (string.IsNullOrWhiteSpace(ventureId) || ventureId.Length > 64 || limit is < 1 or > 100) throw new DomainException("SCI_QUERY_INVALID");
         return repository.GetSciAsync(ownerMemberId, ventureId, cursor, limit, ct);
     }
+
+    public Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct) =>
+        repository.GetSciSummaryAsync(ownerMemberId, ct);
+
+    public Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct)
+    {
+        if (limit is < 1 or > 100) throw new DomainException("CONTACT_QUERY_INVALID");
+        return repository.ListContactsAsync(ownerMemberId, cursor, limit, ct);
+    }
+
+    public async Task<InviteBatchDetailResponse> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(batchId) || batchId.Length > 64) throw new DomainException("INVITE_BATCH_INVALID");
+        return await repository.GetInviteBatchAsync(ownerMemberId, batchId, ct)
+            ?? throw new DomainException("INVITE_BATCH_NOT_FOUND", 404);
+    }
+
+    public Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, InvitationResendRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        if (!IsInvitationId(invitationId) || request.ExpiresInDays is < 1 or > 30) throw new DomainException("INVITATION_RESEND_INVALID");
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        return repository.ResendInvitationAsync(ownerMemberId, invitationId.ToLowerInvariant(), request.ExpiresInDays, idempotencyKey, ct);
+    }
+
+    public Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct)
+    {
+        if (!IsToken(token)) throw new DomainException("INVITATION_TOKEN_INVALID");
+        return repository.OpenInvitationAsync(viewerMemberId, token.ToLowerInvariant(), ct);
+    }
+
+    public Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct) =>
+        repository.ListPendingInvitationsAsync(memberId, ct);
+
+    public Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct)
+    {
+        if (!IsInvitationId(invitationId)) throw new DomainException("INVITATION_NOT_FOUND", 404);
+        if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
+        return repository.AcceptPendingInvitationAsync(recipientMemberId, invitationId.ToLowerInvariant(), idempotencyKey, ct);
+    }
+
+    private static bool IsToken(string token) => token.Length == 64 && token.All(Uri.IsHexDigit);
+    // Invitation IDs are the first 16 hex characters of a SHA-256 (see NpgsqlSocialCapitalRepository).
+    private static bool IsInvitationId(string invitationId) => invitationId.Length == 16 && invitationId.All(Uri.IsHexDigit);
 }
