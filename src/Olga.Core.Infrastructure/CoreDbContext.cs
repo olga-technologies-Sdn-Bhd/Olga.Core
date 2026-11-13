@@ -12,9 +12,17 @@ namespace Olga.Core.Infrastructure;
 
 public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbContext(options), ICoreStore
 {
+    private static readonly SemaphoreSlim IdempotencyGate = new(1, 1);
     bool ICoreStore.IsRelational => Database.IsRelational();
     public DbSet<MemberProfile> MemberProfiles => Set<MemberProfile>();
     public DbSet<MemberProfileImage> MemberProfileImages => Set<MemberProfileImage>();
+    public DbSet<Sector> Sectors => Set<Sector>();
+    public DbSet<MemberSector> MemberSectors => Set<MemberSector>();
+    public DbSet<SectorQuestionnaire> SectorQuestionnaires => Set<SectorQuestionnaire>();
+    public DbSet<ProfileQuestion> ProfileQuestions => Set<ProfileQuestion>();
+    public DbSet<SectorQuestionnaireQuestion> SectorQuestionnaireQuestions => Set<SectorQuestionnaireQuestion>();
+    public DbSet<MemberQuestionnaireResponse> MemberQuestionnaireResponses => Set<MemberQuestionnaireResponse>();
+    public DbSet<MemberQuestionAnswer> MemberQuestionAnswers => Set<MemberQuestionAnswer>();
     public DbSet<MemberAccount> MemberAccounts => Set<MemberAccount>();
     public DbSet<MemberIdentity> MemberIdentities => Set<MemberIdentity>();
     public DbSet<ConsentPolicy> ConsentPolicies => Set<ConsentPolicy>();
@@ -47,6 +55,13 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
 
     IQueryable<MemberProfile> ICoreStore.Profiles => MemberProfiles;
     IQueryable<MemberProfileImage> ICoreStore.ProfileImages => MemberProfileImages;
+    IQueryable<Sector> ICoreStore.Sectors => Sectors;
+    IQueryable<MemberSector> ICoreStore.MemberSectors => MemberSectors;
+    IQueryable<SectorQuestionnaire> ICoreStore.SectorQuestionnaires => SectorQuestionnaires;
+    IQueryable<ProfileQuestion> ICoreStore.ProfileQuestions => ProfileQuestions;
+    IQueryable<SectorQuestionnaireQuestion> ICoreStore.SectorQuestionnaireQuestions => SectorQuestionnaireQuestions;
+    IQueryable<MemberQuestionnaireResponse> ICoreStore.QuestionnaireResponses => MemberQuestionnaireResponses;
+    IQueryable<MemberQuestionAnswer> ICoreStore.QuestionAnswers => MemberQuestionAnswers;
     IQueryable<MemberAccount> ICoreStore.Accounts => MemberAccounts;
     IQueryable<MemberIdentity> ICoreStore.Identities => MemberIdentities;
     IQueryable<ConsentPolicy> ICoreStore.ConsentPolicies => ConsentPolicies;
@@ -93,6 +108,83 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
             if (mapped is null) entry.State = EntityState.Detached;
             else entry.Entity.ResourceType = mapped;
         }
+    }
+
+    async Task<IdempotencyClaim> ICoreStore.ClaimIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, DateTimeOffset now, DateTimeOffset leaseExpiresAt, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            await IdempotencyGate.WaitAsync(ct);
+            try
+            {
+                var existing = await IdempotencyRecords.SingleOrDefaultAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey, ct);
+                if (existing is not null && existing.ExpiresAt <= now) { IdempotencyRecords.Remove(existing); await SaveChangesAsync(ct); existing = null; }
+                if (existing is not null) return new(false, existing.RequestHash, existing.StatusCode, existing.ResponseRef, existing.ExpiresAt);
+                var created = new IdempotencyRecord { Scope = scope, ActorId = actorId, IdempotencyKey = idempotencyKey, RequestHash = requestHash, StatusCode = null, ExpiresAt = leaseExpiresAt };
+                IdempotencyRecords.Add(created);
+                await SaveChangesAsync(ct);
+                return new(true, requestHash, null, null, leaseExpiresAt);
+            }
+            finally { IdempotencyGate.Release(); }
+        }
+
+        var connection = (NpgsqlConnection)Database.GetDbConnection();
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using (var remove = CreateCommand("DELETE FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND expires_at <= @now", transaction))
+            {
+                AddVarchar(remove, "scope", scope, 64); AddVarchar(remove, "actor_id", actorId, 64); AddVarchar(remove, "idempotency_key", idempotencyKey, 128); AddTimestamp(remove, "now", now);
+                await remove.ExecuteNonQueryAsync(ct);
+            }
+            var acquired = false;
+            await using (var insert = CreateCommand("""
+                INSERT INTO ops.idempotency_record(scope, actor_id, idempotency_key, request_hash, status_code, created_at, expires_at)
+                VALUES (@scope, @actor_id, @idempotency_key, @request_hash, NULL, @now, @lease_expires_at)
+                ON CONFLICT (scope, actor_id, idempotency_key) DO NOTHING
+                """, transaction))
+            {
+                AddVarchar(insert, "scope", scope, 64); AddVarchar(insert, "actor_id", actorId, 64); AddVarchar(insert, "idempotency_key", idempotencyKey, 128); AddChar(insert, "request_hash", requestHash); AddTimestamp(insert, "now", now); AddTimestamp(insert, "lease_expires_at", leaseExpiresAt);
+                acquired = await insert.ExecuteNonQueryAsync(ct) == 1;
+            }
+            await using var select = CreateCommand("SELECT request_hash, status_code, response_ref, expires_at FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key", transaction);
+            AddVarchar(select, "scope", scope, 64); AddVarchar(select, "actor_id", actorId, 64); AddVarchar(select, "idempotency_key", idempotencyKey, 128);
+            await using var reader = await select.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("Idempotency claim was not persisted.");
+            var result = new IdempotencyClaim(acquired, reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetInt16(1), reader.IsDBNull(2) ? null : reader.GetString(2), GetInstant(reader, "expires_at"));
+            await reader.DisposeAsync();
+            await transaction.CommitAsync(ct);
+            return result;
+        }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task ICoreStore.CompleteIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, short statusCode, string? responseRef, DateTimeOffset expiresAt, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var row = await IdempotencyRecords.SingleAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey && x.RequestHash == requestHash && x.StatusCode == null, ct);
+            row.StatusCode = statusCode; row.ResponseRef = responseRef; row.ExpiresAt = expiresAt; await SaveChangesAsync(ct); return;
+        }
+        await using var command = CreateCommand("UPDATE ops.idempotency_record SET status_code = @status_code, response_ref = @response_ref, expires_at = @expires_at WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND request_hash = @request_hash AND status_code IS NULL");
+        command.Parameters.Add(new NpgsqlParameter("status_code", NpgsqlDbType.Smallint) { Value = statusCode }); AddNullableVarchar(command, "response_ref", responseRef, 128); AddTimestamp(command, "expires_at", expiresAt); AddVarchar(command, "scope", scope, 64); AddVarchar(command, "actor_id", actorId, 64); AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+        var close = await OpenIfNeededAsync(ct);
+        try { if (await command.ExecuteNonQueryAsync(ct) != 1) throw new InvalidOperationException("Idempotency claim is no longer active."); }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task ICoreStore.ReleaseIdempotencyAsync(string scope, string actorId, string idempotencyKey, string requestHash, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var row = await IdempotencyRecords.SingleOrDefaultAsync(x => x.Scope == scope && x.ActorId == actorId && x.IdempotencyKey == idempotencyKey && x.RequestHash == requestHash && x.StatusCode == null, ct);
+            if (row is not null) { IdempotencyRecords.Remove(row); await SaveChangesAsync(ct); }
+            return;
+        }
+        await using var command = CreateCommand("DELETE FROM ops.idempotency_record WHERE scope = @scope AND actor_id = @actor_id AND idempotency_key = @idempotency_key AND request_hash = @request_hash AND status_code IS NULL");
+        AddVarchar(command, "scope", scope, 64); AddVarchar(command, "actor_id", actorId, 64); AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+        var close = await OpenIfNeededAsync(ct); try { await command.ExecuteNonQueryAsync(ct); } finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
     async Task ICoreStore.CreateMemberAsync(NewMemberRegistration member, CancellationToken ct)
@@ -224,6 +316,49 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.ForeignKeyViolation && ex.ConstraintName == "fk_member_profile_member_id")
         {
             throw new DomainException("MEMBER_NOT_REGISTERED", 404);
+        }
+        finally { if (close) await Database.CloseConnectionAsync(); }
+    }
+
+    async Task ICoreStore.MarkIdentityVerifiedAsync(long identityId, string memberId, CancellationToken ct)
+    {
+        if (!Database.IsRelational())
+        {
+            var identity = await MemberIdentities.SingleAsync(x => x.Id == identityId, ct);
+            identity.VerifiedAt ??= DateTimeOffset.UtcNow;
+            await SaveChangesAsync(ct);
+            return;
+        }
+
+        var connection = (NpgsqlConnection)Database.GetDbConnection();
+        var close = await OpenIfNeededAsync(ct);
+        try
+        {
+            await using var transaction = await connection.BeginTransactionAsync(ct);
+            await using (var audit = CreateCommand("SELECT ops.set_audit_context(@actor_id)", transaction))
+            {
+                AddVarchar(audit, "actor_id", memberId, 64);
+                await audit.ExecuteNonQueryAsync(ct);
+            }
+            await using (var identity = CreateCommand("""
+                UPDATE iam.member_identity
+                SET verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, row_version = row_version + 1
+                WHERE member_identity_id = @identity_id AND verified_at IS NULL
+                """, transaction))
+            {
+                identity.Parameters.Add(new NpgsqlParameter("identity_id", NpgsqlDbType.Bigint) { Value = identityId });
+                await identity.ExecuteNonQueryAsync(ct);
+            }
+            await using (var member = CreateCommand("""
+                UPDATE iam.member
+                SET verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP, row_version = row_version + 1
+                WHERE member_id = @member_id AND verified_at IS NULL
+                """, transaction))
+            {
+                AddVarchar(member, "member_id", memberId, 64);
+                await member.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
@@ -398,6 +533,13 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
     {
         model.Entity<MemberAccount>(e => { e.ToTable("member", "iam"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.CommunityId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(24); });
         model.Entity<MemberProfile>(e => { e.ToTable("member_profile", "core"); e.HasKey(x => x.MemberId); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.DisplayName).HasMaxLength(150); e.Property(x => x.Headline).HasMaxLength(240); e.Property(x => x.Biography).HasColumnName("professional_summary").HasMaxLength(2000); e.Property(x => x.Sector).HasColumnName("role_category").HasMaxLength(64); e.Property(x => x.Status).HasColumnName("profile_status").HasMaxLength(24); e.Property(x => x.Visibility).HasMaxLength(20); e.Property(x => x.CompletenessScore).HasPrecision(5, 2); ConfigureVersion(e.Property(x => x.Version).HasColumnName("row_version")); });
+        model.Entity<Sector>(e => { e.ToTable("sector", "core"); e.HasKey(x => x.SectorCode); e.Property(x => x.SectorCode).HasMaxLength(64); e.Property(x => x.ParentSectorCode).HasMaxLength(64); e.Property(x => x.Name).HasMaxLength(150); e.Property(x => x.Status).HasMaxLength(16); });
+        model.Entity<MemberSector>(e => { e.ToTable("member_sector", "core"); e.HasKey(x => new { x.MemberId, x.SectorCode }); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.SectorCode).HasMaxLength(64); e.Property(x => x.CustomSectorName).HasMaxLength(150); e.HasIndex(x => x.MemberId).IsUnique().HasFilter("is_primary IS TRUE"); });
+        model.Entity<SectorQuestionnaire>(e => { e.ToTable("sector_questionnaire", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("sector_questionnaire_id").UseIdentityByDefaultColumn(); e.Property(x => x.QuestionnaireId).HasColumnName("questionnaire_api_id").HasMaxLength(64); e.Property(x => x.SectorCode).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.QuestionnaireId).IsUnique(); });
+        model.Entity<ProfileQuestion>(e => { e.ToTable("profile_question", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("profile_question_id").UseIdentityByDefaultColumn(); e.Property(x => x.QuestionId).HasColumnName("question_api_id").HasMaxLength(64); e.Property(x => x.SectorCode).HasMaxLength(64); e.Property(x => x.QuestionCode).HasMaxLength(64); e.Property(x => x.Prompt).HasMaxLength(500); e.Property(x => x.AnswerType).HasMaxLength(24); e.Property(x => x.ConfigurationJson).HasColumnType("jsonb"); e.Property(x => x.Status).HasMaxLength(16); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.QuestionId).IsUnique(); });
+        model.Entity<SectorQuestionnaireQuestion>(e => { e.ToTable("sector_questionnaire_question", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("sector_questionnaire_question_id").UseIdentityByDefaultColumn(); e.HasIndex(x => new { x.SectorQuestionnaireId, x.DefinitionVersion, x.ProfileQuestionId }).IsUnique(); });
+        model.Entity<MemberQuestionnaireResponse>(e => { e.ToTable("member_questionnaire_response", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_questionnaire_response_id").UseIdentityByDefaultColumn(); e.Property(x => x.ResponseId).HasColumnName("response_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Status).HasMaxLength(20); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ResponseId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.SectorQuestionnaireId, x.DefinitionVersion }).IsUnique(); });
+        model.Entity<MemberQuestionAnswer>(e => { e.ToTable("member_question_answer", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_question_answer_id").UseIdentityByDefaultColumn(); e.Property(x => x.AnswerId).HasColumnName("answer_api_id").HasMaxLength(64); e.Property(x => x.ResponseId).HasColumnName("member_questionnaire_response_id"); e.Property(x => x.QuestionId).HasColumnName("profile_question_id"); e.Property(x => x.AnswerJson).HasColumnType("jsonb"); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.AnswerId).IsUnique(); e.HasIndex(x => new { x.ResponseId, x.QuestionId }).IsUnique(); e.HasOne(x => x.Response).WithMany().HasForeignKey(x => x.ResponseId); });
         model.Entity<MemberProfileImage>(e => { e.ToTable("member_profile_image", "core"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("profile_image_id").UseIdentityAlwaysColumn(); e.Property(x => x.ImageId).HasColumnName("image_api_id").HasMaxLength(64); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.OriginalBlobPath).HasColumnName("source_blob_path").HasMaxLength(1024); e.Property(x => x.DisplayBlobPath).HasMaxLength(1024); e.Property(x => x.ThumbnailBlobPath).HasMaxLength(1024); e.Property(x => x.DeclaredContentType).HasColumnName("content_type").HasMaxLength(100); e.Property(x => x.ContentLength).HasColumnName("size_bytes"); e.Property(x => x.ContentSha256).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.Status).HasMaxLength(24); e.Property(x => x.FailureCode).HasColumnName("rejection_reason").HasMaxLength(240); ConfigureVersion(e.Property(x => x.RowVersion)); e.HasIndex(x => x.ImageId).IsUnique(); e.HasIndex(x => new { x.MemberId, x.CreatedAt }); });
         model.Entity<MemberIdentity>(e => { e.ToTable("member_identity", "iam"); e.HasKey(x => x.Id); e.Property(x => x.Id).HasColumnName("member_identity_id").UseIdentityByDefaultColumn(); e.Property(x => x.MemberId).HasMaxLength(64); e.Property(x => x.Provider).HasMaxLength(32); e.Property(x => x.ProviderSubjectHash).HasColumnType("character(64)").IsFixedLength(); e.Property(x => x.ProviderSubjectCiphertext).HasColumnType("bytea"); e.Property(x => x.DisplayHint).HasMaxLength(80); e.Property(x => x.Status).HasMaxLength(16); e.HasIndex(x => new { x.Provider, x.ProviderSubjectHash }).IsUnique(); });
         model.Entity<ConsentPolicy>(e => { e.ToTable("consent_policy", "consent"); e.HasKey(x => x.PolicyId); e.Property(x => x.PolicyId).HasMaxLength(64); e.Property(x => x.PurposeCode).HasMaxLength(64); e.Property(x => x.Version).HasMaxLength(32); e.Property(x => x.ContentHash).HasColumnType("character(64)").IsFixedLength(); ConfigureVersion(e.Property(x => x.RowVersion)); });

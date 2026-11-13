@@ -36,6 +36,19 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(memberRegistration, "Idempotency-Key", required: true, maxLength: 128);
         AssertNoHeader(memberRegistration, "X-Member-Id");
 
+        AssertHeader(Operation(document, "/v1/invitations/{invitationId}/resend", "post"), "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(Operation(document, "/v1/me/invitations/{invitationId}/accept", "post"), "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(Operation(document, "/v1/invitations/{token}/open", "post"), "Idempotency-Key");
+        AssertNoHeader(Operation(document, "/v1/sci/summary", "get"), "Idempotency-Key");
+        AssertHeader(Operation(document, "/v1/invitations/{invitationId}/revoke", "post"), "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(Operation(document, "/v1/contacts/{linkId}", "delete"), "Idempotency-Key", required: true, maxLength: 128);
+
+        // Invite-link files and the fallback page aren't API operations.
+        var paths = document.RootElement.GetProperty("paths");
+        Assert.False(paths.TryGetProperty("/i", out _));
+        Assert.False(paths.TryGetProperty("/.well-known/assetlinks.json", out _));
+        Assert.False(paths.TryGetProperty("/.well-known/apple-app-site-association", out _));
+
         var memberLookup = Operation(document, "/v1/members/{memberId}", "get");
         AssertHeader(memberLookup, "X-Member-Id", required: false, maxLength: 64);
         AssertNoHeader(memberLookup, "Idempotency-Key");
@@ -51,6 +64,11 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(profileUpdate, "X-Member-Id", required: false, maxLength: 64);
         AssertHeader(profileUpdate, "Idempotency-Key", required: true, maxLength: 128);
         AssertHeader(profileUpdate, "If-Match", required: false);
+
+        var industryQuestionnaire = Operation(document, "/v1/me/profile/industry-questionnaire", "put");
+        AssertHeader(industryQuestionnaire, "X-Member-Id", required: false, maxLength: 64);
+        AssertHeader(industryQuestionnaire, "Idempotency-Key", required: true, maxLength: 128);
+        AssertHeader(industryQuestionnaire, "If-Match", required: false);
 
         var profileImageUpload = Operation(document, "/v1/me/profile-picture", "put");
         AssertHeader(profileImageUpload, "Idempotency-Key", required: true, maxLength: 128);
@@ -68,6 +86,18 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         AssertHeader(lookupByEmail, "Idempotency-Key", required: true, maxLength: 128);
         AssertNoHeader(lookupByEmail, "X-Member-Id");
         Assert.Equal("LookupMember", lookupByEmail.GetProperty("operationId").GetString());
+
+        var startPhoneVerification = Operation(document, "/v1/auth/phone/verifications", "post");
+        AssertHeader(startPhoneVerification, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(startPhoneVerification, "X-Member-Id");
+
+        var checkPhoneVerification = Operation(document, "/v1/auth/phone/verification-checks", "post");
+        AssertHeader(checkPhoneVerification, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(checkPhoneVerification, "X-Member-Id");
+
+        var lookupByPhone = Operation(document, "/v1/members/lookup/phone", "post");
+        AssertHeader(lookupByPhone, "Idempotency-Key", required: true, maxLength: 128);
+        AssertNoHeader(lookupByPhone, "X-Member-Id");
 
         var publicEvents = Operation(document, "/v1/events", "get");
         AssertHeader(publicEvents, "X-Member-Id", required: false, maxLength: 64);

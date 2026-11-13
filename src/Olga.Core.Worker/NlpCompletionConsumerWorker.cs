@@ -3,6 +3,7 @@ using Azure.Messaging.ServiceBus;
 
 namespace Olga.Core.Worker;
 
+// This existing subscription also dispatches SCI score events to avoid another messaging entity.
 public sealed class NlpCompletionConsumerWorker(
     IServiceScopeFactory scopes,
     ServiceBusClient serviceBus,
@@ -36,7 +37,7 @@ public sealed class NlpCompletionConsumerWorker(
             return;
         }
 
-        if (envelope is null || !NlpMatchRequestCompleted.TryParse(envelope, out var completion))
+        if (envelope is null)
         {
             await args.DeadLetterMessageAsync(args.Message, "UNSUPPORTED_EVENT", envelope?.EventType ?? "Missing event type");
             return;
@@ -45,13 +46,25 @@ public sealed class NlpCompletionConsumerWorker(
         try
         {
             await using var scope = scopes.CreateAsyncScope();
-            await scope.ServiceProvider.GetRequiredService<NlpCompletionProjectionHandler>()
-                .HandleAsync(envelope.EventId, completion!, args.CancellationToken);
+            if (NlpMatchRequestCompleted.TryParse(envelope, out var completion))
+                await scope.ServiceProvider.GetRequiredService<NlpCompletionProjectionHandler>()
+                    .HandleAsync(envelope.EventId, completion!, args.CancellationToken);
+            else if (SciLinkScoreChanged.TryParse(envelope, out var scoreChange))
+                await scope.ServiceProvider.GetRequiredService<SciScoreProjectionHandler>()
+                    .HandleAsync(envelope.EventId, scoreChange!, args.CancellationToken);
+            else if (NlpIntentMatchReady.TryParse(envelope, out var intentReady))
+                await scope.ServiceProvider.GetRequiredService<SciIntentRescoreHandler>()
+                    .HandleAsync(intentReady!, args.CancellationToken);
+            else
+            {
+                await args.DeadLetterMessageAsync(args.Message, "UNSUPPORTED_EVENT", envelope.EventType);
+                return;
+            }
             await args.CompleteMessageAsync(args.Message, args.CancellationToken);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            logger.LogError(ex, "NLP completion event {EventId} failed on delivery {DeliveryCount}", envelope.EventId, args.Message.DeliveryCount);
+            logger.LogError(ex, "Core integration event {EventId} failed on delivery {DeliveryCount}", envelope.EventId, args.Message.DeliveryCount);
             await args.AbandonMessageAsync(args.Message, cancellationToken: args.CancellationToken);
         }
     }

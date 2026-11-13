@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using Azure.Identity;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.SignalR;
@@ -19,6 +20,8 @@ const string memberIdHeader = "X-Member-Id";
 const string idempotencyKeyHeader = "Idempotency-Key";
 const string ifMatchHeader = "If-Match";
 const string adminCorsPolicy = "AdminPortal";
+const string phoneSendRateLimit = "PhoneVerificationSend";
+const string phoneCheckRateLimit = "PhoneVerificationCheck";
 var defaultMemberId = builder.Configuration["Mvp:DefaultMemberId"] ?? "A123";
 var defaultCommunityId = builder.Configuration["Mvp:DefaultCommunityId"] ?? "olga";
 var includeExceptionDetails = builder.Configuration.GetValue<bool>("Diagnostics:IncludeExceptionDetails");
@@ -66,6 +69,22 @@ builder.Services.AddOpenApi(options =>
     });
 });
 builder.Services.AddHealthChecks();
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.AddPolicy(phoneSendRateLimit, context => RateLimitPartition.GetSlidingWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new SlidingWindowRateLimiterOptions { PermitLimit = 5, Window = TimeSpan.FromMinutes(10), SegmentsPerWindow = 10, QueueLimit = 0, QueueProcessingOrder = QueueProcessingOrder.OldestFirst, AutoReplenishment = true }));
+    options.AddPolicy(phoneCheckRateLimit, context => RateLimitPartition.GetSlidingWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new SlidingWindowRateLimiterOptions { PermitLimit = 20, Window = TimeSpan.FromMinutes(10), SegmentsPerWindow = 10, QueueLimit = 0, QueueProcessingOrder = QueueProcessingOrder.OldestFirst, AutoReplenishment = true }));
+    options.OnRejected = async (context, ct) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+            context.HttpContext.Response.Headers["Retry-After"] = Math.Max(1, (int)Math.Ceiling(retryAfter.TotalSeconds)).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        await Error(context.HttpContext, 429, "PHONE_VERIFICATION_RATE_LIMITED");
+    };
+});
 // Realtime chat through Azure SignalR when SignalR:Endpoint is set (keyless, managed identity); in-process otherwise.
 var signalR = builder.Services.AddSignalR();
 var signalREndpoint = builder.Configuration["SignalR:Endpoint"];
@@ -82,11 +101,36 @@ if (!string.IsNullOrWhiteSpace(signalREndpoint))
 var connection = builder.Configuration.GetConnectionString("PostgreSql");
 var local = string.IsNullOrWhiteSpace(connection);
 if (local) builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseInMemoryDatabase("olga-core-local"));
-else builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection!));
+else
+{
+    builder.Services.AddSingleton(_ => NpgsqlDataSource.Create(connection!));
+    // Keep the existing Core DbContext retry configuration unchanged; SCI raw SQL shares only the connection string.
+    builder.Services.AddDbContextPool<CoreDbContext>(o => o.UseOlgaPostgreSql(connection!));
+}
 var identityMasterKey = local
     ? System.Security.Cryptography.RandomNumberGenerator.GetBytes(32)
     : ReadIdentityMasterKey(builder.Configuration);
 builder.Services.AddSingleton<IIdentityProtector>(new AesIdentityProtector(identityMasterKey));
+var twilioOptions = builder.Configuration.GetSection(TwilioVerifyOptions.SectionName).Get<TwilioVerifyOptions>() ?? new TwilioVerifyOptions();
+if (twilioOptions.Enabled)
+{
+    if (twilioOptions.TokenTtlSeconds is < 120 or > 86400)
+        throw new InvalidOperationException("Twilio TokenTtlSeconds must be from 120 to 86400.");
+    if (twilioOptions.RateLimitName.Length > 64
+        || twilioOptions.RateLimitName.Any(c => !char.IsAsciiLetterOrDigit(c) && c != '_'))
+        throw new InvalidOperationException("Twilio RateLimitName must contain only ASCII letters, digits, or underscores and be at most 64 characters.");
+    if (!IsTwilioSid(twilioOptions.AccountSid, "AC") || !IsTwilioSid(twilioOptions.ApiKeySid, "SK")
+        || !IsTwilioSid(twilioOptions.VerifyServiceSid, "VA") || twilioOptions.ApiKeySecret.Length < 16
+        || twilioOptions.ApiKeySecret.Any(char.IsWhiteSpace))
+        throw new InvalidOperationException("Twilio AccountSid, ApiKeySid, ApiKeySecret, and VerifyServiceSid must be valid when Twilio is enabled.");
+    builder.Services.AddHttpClient<IPhoneVerificationProvider, TwilioPhoneVerificationProvider>(client =>
+    {
+        client.BaseAddress = new Uri("https://verify.twilio.com/");
+        client.Timeout = TimeSpan.FromSeconds(10);
+    });
+}
+builder.Services.AddSingleton(twilioOptions);
+builder.Services.AddSingleton(identityMasterKey);
 var chatFileOptions = builder.Configuration.GetSection(ChatFileOptions.SectionName).Get<ChatFileOptions>() ?? new ChatFileOptions();
 builder.Services.AddSingleton(chatFileOptions);
 if (local) builder.Services.AddSingleton<IChatFileStorage, InMemoryChatFileStorage>();
@@ -100,10 +144,14 @@ builder.Services.AddSingleton<IChatTypingPublisher, SignalRChatTypingPublisher>(
 builder.Services.AddScoped<ICoreService, CoreService>();
 builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
+builder.Services.AddScoped<ISocialCapitalRepository, NpgsqlSocialCapitalRepository>();
+builder.Services.AddScoped<ISocialCapitalService, SocialCapitalService>();
+builder.Services.Configure<InviteLinkOptions>(builder.Configuration.GetSection(InviteLinkOptions.SectionName));
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
 app.UseCors(adminCorsPolicy);
+app.UseRateLimiter();
 app.Use(async (context, next) =>
 {
     context.Response.Headers["X-Correlation-Id"] = context.TraceIdentifier;
@@ -152,6 +200,7 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json", "OLGA Core API v1");
 });
 app.MapHealthChecks("/health");
+app.MapInviteLinks();
 app.UseMiddleware<RealtimeMemberMiddleware>();
 app.MapHub<ChatHub>(ChatRealtime.HubPath);
 app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503))
@@ -159,6 +208,65 @@ app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.
 
 var v1 = app.MapGroup("/v1");
 var memberV1 = app.MapGroup("/v1").WithMetadata(new MemberContextMetadata());
+memberV1.MapPost("/ventures", async (HttpContext c, VentureCreateRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.CreateVentureAsync(Member(c), body, ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Created($"/v1/ventures/{value.VentureId}", value);
+}).WithName("CreateVenture").WithTags("Social capital").Produces<VentureResponse>(201);
+memberV1.MapGet("/ventures", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListVenturesAsync(Member(c), ct)))
+    .WithName("ListVentures").WithTags("Social capital").Produces<IReadOnlyList<VentureResponse>>(200);
+memberV1.MapGet("/ventures/{ventureId}", async (HttpContext c, string ventureId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.GetVentureAsync(Member(c), ventureId, ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+}).WithName("GetVenture").WithTags("Social capital").Produces<VentureResponse>(200).Produces<ApiError>(404);
+memberV1.MapPost("/contacts/imports", async (HttpContext c, ContactImportRequest body, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ImportContactsAsync(Member(c), body, ct)))
+    .WithName("ImportContacts").WithTags("Social capital").Produces<ContactImportResponse>(200);
+memberV1.MapPost("/invite-batches", async (HttpContext c, InviteBatchCreateRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.CreateInviteBatchAsync(Member(c), body, Idempotency(c), ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Created($"/v1/invite-batches/{value.BatchId}", value);
+}).WithName("CreateInviteBatch").WithTags("Social capital").Produces<InviteBatchResponse>(201);
+memberV1.MapPost("/invitations/{token}/accept", async (HttpContext c, string token, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.AcceptInvitationAsync(Member(c), token, Idempotency(c), ct)))
+    .WithName("AcceptInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200);
+memberV1.MapGet("/ventures/{ventureId}/sci", async (HttpContext c, string ventureId, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetSciAsync(Member(c), ventureId, cursor, limit ?? 50, ct)))
+    .WithName("GetSocialCapitalIndex").WithTags("Social capital").Produces<SciContactPage>(200);
+memberV1.MapGet("/sci/summary", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetSciSummaryAsync(Member(c), ct)))
+    .WithName("GetSocialCapitalSummary").WithTags("Social capital").Produces<SciSummaryResponse>(200);
+memberV1.MapGet("/contacts", async (HttpContext c, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListContactsAsync(Member(c), cursor, limit ?? 50, ct)))
+    .WithName("ListImportedContacts").WithTags("Social capital").Produces<ImportedContactPage>(200);
+memberV1.MapGet("/invite-batches/{batchId}", async (HttpContext c, string batchId, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetInviteBatchAsync(Member(c), batchId, ct)))
+    .WithName("GetInviteBatch").WithTags("Social capital").Produces<InviteBatchDetailResponse>(200).Produces<ApiError>(404);
+memberV1.MapPost("/invitations/{invitationId}/resend", async (HttpContext c, string invitationId, InvitationResendRequest? body, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ResendInvitationAsync(Member(c), invitationId, body ?? new InvitationResendRequest(), Idempotency(c), ct)))
+    .WithName("ResendInvitation").WithTags("Social capital").Produces<InvitationDispatch>(200).Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapPost("/invitations/{token}/open", async (HttpContext c, string token, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.OpenInvitationAsync(Member(c), token, ct)))
+    // Only flips APPROVED to OPENED once, so a replay is harmless and needs no Idempotency-Key.
+    .WithName("OpenInvitation").WithTags("Social capital").WithMetadata(new NoIdempotencyMetadata()).Produces<InvitationPreviewResponse>(200).Produces<ApiError>(404);
+memberV1.MapGet("/me/invitations", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.ListPendingInvitationsAsync(Member(c), ct)))
+    .WithName("ListPendingInvitations").WithTags("Social capital").Produces<IReadOnlyList<PendingInvitationResponse>>(200);
+memberV1.MapPost("/me/invitations/{invitationId}/accept", async (HttpContext c, string invitationId, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.AcceptPendingInvitationAsync(Member(c), invitationId, Idempotency(c), ct)))
+    .WithName("AcceptPendingInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200).Produces<ApiError>(404);
+memberV1.MapPost("/invitations/{invitationId}/revoke", async (HttpContext c, string invitationId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    await s.RevokeInvitationAsync(Member(c), invitationId, ct);
+    return Results.NoContent();
+}).WithName("RevokeInvitation").WithTags("Social capital").Produces(204).Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapDelete("/contacts/{linkId}", async (HttpContext c, string linkId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    await s.DeleteContactAsync(Member(c), linkId, ct);
+    return Results.NoContent();
+}).WithName("DeleteImportedContact").WithTags("Social capital").Produces(204).Produces<ApiError>(409);
 v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreService s, CancellationToken ct) =>
 {
     var value = await s.RegisterMemberAsync(defaultCommunityId, body, Idempotency(c), ct);
@@ -173,6 +281,21 @@ v1.MapPost("/members/lookup", async (HttpContext c, MemberLookupRequest body, IC
     return Results.Ok(value);
 })
     .WithName("LookupMember").WithTags("Members").Produces<MemberLookupResponse>(200);
+v1.MapPost("/members/lookup/phone", async (HttpContext c, PhoneMemberLookupRequest body, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.LookupMemberByPhoneAsync(body, ct);
+    c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
+    .WithName("LookupMemberByPhone").WithTags("Phone authentication").Produces<MemberLookupResponse>(200);
+v1.MapPost("/auth/phone/verifications", async (HttpContext c, PhoneVerificationStartRequest body, ICoreService s, CancellationToken ct) =>
+    Results.Accepted(value: await s.StartPhoneVerificationAsync(body, Idempotency(c), ct)))
+    .RequireRateLimiting(phoneSendRateLimit)
+    .WithName("StartPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationStartResponse>(202).Produces(429);
+v1.MapPost("/auth/phone/verification-checks", async (HttpContext c, PhoneVerificationCheckRequest body, ICoreService s, CancellationToken ct) =>
+    Results.Ok(await s.CheckPhoneVerificationAsync(body, Idempotency(c), ct)))
+    .RequireRateLimiting(phoneCheckRateLimit)
+    .WithName("CheckPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationCheckResponse>(200).Produces(429);
 var profileV1 = memberV1.MapGroup("/me/profile");
 profileV1.AddEndpointFilter(async (invocationContext, next) =>
 {
@@ -185,6 +308,20 @@ profileV1.MapGet("", async (HttpContext c, ICoreService s, CancellationToken ct)
 profileV1.MapPatch("", async (HttpContext c, ProfileUpdateRequest body, ICoreService s, CancellationToken ct) => { var value = await s.UpdateProfileAsync(Member(c), body, c.Request.Headers.IfMatch.FirstOrDefault(), ct); c.Response.Headers.ETag = value.ETag; return Results.Ok(value); })
     .WithMetadata(new IfMatchMetadata())
     .WithName("UpdateOwnProfile").WithTags("Members").Produces<ProfileResponse>(200);
+memberV1.MapGet("/profile-industries", async (ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIndustriesAsync(ct)))
+    .WithName("GetProfileIndustries").WithTags("Members").Produces<IReadOnlyList<IndustryResponse>>(200);
+memberV1.MapGet("/profile-industries/{sectorCode}/questionnaire", async (string sectorCode, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetIndustryQuestionnaireAsync(sectorCode, ct)))
+    .WithName("GetIndustryQuestionnaire").WithTags("Members").Produces<IndustryQuestionnaireResponse>(200).Produces<ApiError>(404);
+profileV1.MapGet("/industry-questionnaire", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetMemberIndustryQuestionnaireAsync(Member(c), ct)))
+    .WithName("GetOwnIndustryQuestionnaire").WithTags("Members").Produces<MemberIndustryQuestionnaireResponse>(200).Produces<ApiError>(404);
+profileV1.MapPut("/industry-questionnaire", async (HttpContext c, IndustryQuestionnaireSubmitRequest body, ICoreService s, CancellationToken ct) =>
+{
+    var value = await s.SaveIndustryQuestionnaireAsync(Member(c), body, Idempotency(c), c.Request.Headers.IfMatch.FirstOrDefault(), ct);
+    c.Response.Headers.ETag = value.ProfileETag;
+    return Results.Ok(value);
+})
+    .WithMetadata(new IfMatchMetadata())
+    .WithName("SaveIndustryQuestionnaire").WithTags("Members").Produces<IndustryQuestionnaireSubmissionResponse>(200).Produces<ApiError>(409);
 memberV1.MapPut("/me/profile-picture", async (HttpContext c, ICoreService s, CancellationToken ct) =>
 {
     if (!c.Request.HasFormContentType) throw new DomainException("PROFILE_IMAGE_MULTIPART_REQUIRED", 415);
@@ -443,6 +580,8 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         "IDEMPOTENCY_KEY_REQUIRED" => "An Idempotency-Key header is required for every mutation.",
         "IF_MATCH_REQUIRED" => "An If-Match header is required.",
         "MEMBER_NOT_REGISTERED" => "The member must be registered by the identity service before profile onboarding.",
+        "MEMBER_IDENTITY_ALREADY_REGISTERED" => "This email or phone number already belongs to a member; sign in instead.",
+        "MEMBER_IDENTITY_REVOKED" => "This email or phone number has been revoked and can't be used to sign in.",
         "RESOURCE_REFERENCE_NOT_FOUND" => "A referenced resource does not exist.",
         "RESOURCE_VERSION_CONFLICT" => "The resource changed since it was read.",
         "INTERNAL_ERROR" => "The request could not be completed.",
@@ -462,6 +601,11 @@ static byte[] ReadIdentityMasterKey(IConfiguration configuration)
     catch (FormatException) { }
     throw new InvalidOperationException("IdentityProtection__MasterKeyBase64 must contain a Base64-encoded 32-byte key.");
 }
+
+static bool IsTwilioSid(string value, string prefix) =>
+    value.Length == 34
+    && value.StartsWith(prefix, StringComparison.Ordinal)
+    && value[2..].All(Uri.IsHexDigit);
 
 public partial class Program { }
 internal sealed class MemberContextMetadata { }

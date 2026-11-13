@@ -21,15 +21,23 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
         return Protect("EMAIL", memberId, normalized, hint.Length <= 80 ? hint : hint[..80], isPrimary, true);
     }
 
-    public ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary)
+    public ProtectedIdentity ProtectPhone(string memberId, string value, bool isPrimary, bool isVerified = false)
     {
         var normalized = NormalizePhone(value);
         var visible = Math.Min(4, normalized.Length - 1);
         var hint = new string('*', normalized.Length - visible) + normalized[^visible..];
-        return Protect("PHONE", memberId, normalized, hint, isPrimary, false);
+        return Protect("PHONE", memberId, normalized, hint, isPrimary, isVerified);
     }
 
     public string EmailLookupHash(string email) => LookupHash("EMAIL", NormalizeEmail(email));
+    public string PhoneLookupHash(string phone) => LookupHash("PHONE", NormalizePhone(phone));
+    public string PhoneVerificationRequestHash(string phone, string code) => LookupHash("PHONE_VERIFICATION", $"{NormalizePhone(phone)}\n{code}");
+    public byte[] ProtectContactLabel(string ownerMemberId, string contactRecordId, string label) =>
+        Protect("CONTACT_LABEL", $"{ownerMemberId}:{contactRecordId}", label.Trim(), "", false, false).SubjectCiphertext;
+    public string UnprotectContactLabel(string ownerMemberId, string contactRecordId, byte[] ciphertext) =>
+        Unprotect($"{ownerMemberId}:{contactRecordId}", "CONTACT_LABEL", ciphertext);
+    public string CreateInvitationToken(string ownerMemberId, string batchId, string linkId, string idempotencyKey) =>
+        Convert.ToHexString(HMACSHA256.HashData(lookupKey, Encoding.UTF8.GetBytes($"INVITATION\n{ownerMemberId}\n{batchId}\n{linkId}\n{idempotencyKey}"))).ToLowerInvariant();
 
     // Bound to the device, so Unprotect(deviceId, provider, ciphertext) reads it back.
     public ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token) => Protect(provider, deviceId, token, "", false, false);
