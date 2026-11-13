@@ -15,7 +15,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var request = new MemberCreateRequest("New member", "Member@Example.com", "+919876543210");
+        var request = new MemberCreateRequest("New member", "Member@Example.com", "+919876543210", PhoneVerificationToken: "verified");
 
         var first = await service.RegisterMemberAsync("olga", request, "register-1", default);
         var replay = await service.RegisterMemberAsync("olga", request, "register-1", default);
@@ -32,7 +32,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "Asha@Example.com", "+60123456789"), "register-lookup", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "Asha@Example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-lookup", default);
 
         var exact = await service.LookupMemberByEmailAsync(new("asha@example.com"), default);
         var variant = await service.LookupMemberByEmailAsync(new("  ASHA@example.COM "), default);
@@ -47,7 +47,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        await service.RegisterMemberAsync("olga", new MemberCreateRequest("Phone only", Phone: "+60123456789"), "register-phone", default);
+        await service.RegisterMemberAsync("olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "verified"), "register-phone", default);
 
         var unknown = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("nobody@example.com"), default));
         var missing = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new("  "), default));
@@ -85,11 +85,132 @@ public sealed class CoreServiceTests
     }
 
     [Fact]
+    public async Task Phone_registration_requires_a_valid_verification_proof_and_marks_the_identity_verified()
+    {
+        await using var db = Db();
+        var service = Service(db);
+
+        var missing = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Email and phone", "member@example.com", "+60123456789"), "phone-missing", default));
+        var invalid = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "invalid"), "phone-invalid", default));
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone only", Phone: "+60123456789", PhoneVerificationToken: "verified"), "phone-valid", default);
+
+        Assert.Equal(("PHONE_VERIFICATION_REQUIRED", 403), (missing.Code, missing.StatusCode));
+        Assert.Equal(("PHONE_VERIFICATION_INVALID", 403), (invalid.Code, invalid.StatusCode));
+        Assert.NotNull(Assert.Single(db.MemberIdentities, x => x.MemberId == registered.MemberId).VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Verified_phone_lookup_returns_the_registered_member()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Phone lookup", "phone@example.com", "+60123456789", PhoneVerificationToken: "verified"), "phone-lookup", default);
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal(registered.MemberId, found.MemberId);
+        Assert.NotNull(Assert.Single(db.MemberIdentities, x => x.MemberId == registered.MemberId && x.Provider == "PHONE").VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Phone_lookup_signs_in_a_phone_registered_before_verification_was_required()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Legacy phone", Phone: "+60123456789", PhoneVerificationToken: "verified"), "legacy-phone", default);
+        db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).VerifiedAt = null;
+        await db.SaveChangesAsync();
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal(registered.MemberId, found.MemberId);
+        Assert.NotNull(db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).VerifiedAt);
+    }
+
+    [Fact]
+    public async Task Phone_lookup_gives_a_member_without_a_profile_the_onboarding_draft()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("No profile", Phone: "+60123456789", PhoneVerificationToken: "verified"), "no-profile", default);
+        db.MemberProfiles.Remove(db.MemberProfiles.Single(x => x.MemberId == registered.MemberId));
+        await db.SaveChangesAsync();
+
+        var found = await service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default);
+
+        Assert.Equal((registered.MemberId, "DRAFT"), (found.MemberId, found.ProfileStatus));
+    }
+
+    [Fact]
+    public async Task Phone_lookup_rejects_a_revoked_phone_instead_of_reporting_it_unregistered()
+    {
+        await using var db = Db();
+        var service = Service(db);
+        var registered = await service.RegisterMemberAsync(
+            "olga", new MemberCreateRequest("Revoked phone", Phone: "+60123456789", PhoneVerificationToken: "verified"), "revoked-phone", default);
+        db.MemberIdentities.Single(x => x.MemberId == registered.MemberId).Status = "REVOKED";
+        await db.SaveChangesAsync();
+
+        var error = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByPhoneAsync(new("+60123456789", "verified"), default));
+
+        Assert.Equal(("MEMBER_IDENTITY_REVOKED", 409), (error.Code, error.StatusCode));
+    }
+
+    [Fact]
+    public async Task Phone_lookup_reports_an_unknown_phone_as_unregistered()
+    {
+        await using var db = Db();
+
+        var error = await Assert.ThrowsAsync<DomainException>(() => Service(db).LookupMemberByPhoneAsync(new("+60123456789", "verified"), default));
+
+        Assert.Equal(("MEMBER_NOT_REGISTERED", 404), (error.Code, error.StatusCode));
+    }
+
+    [Fact]
+    public async Task Starting_phone_verification_replays_without_sending_another_sms()
+    {
+        await using var db = Db();
+        var provider = new FakePhoneVerificationProvider();
+        var service = new CoreService(db, IdentityProtector, phoneVerificationProvider: provider);
+
+        await service.StartPhoneVerificationAsync(new("+60123456789"), "send-code", default);
+        await service.StartPhoneVerificationAsync(new("+60123456789"), "send-code", default);
+        var reused = await Assert.ThrowsAsync<DomainException>(() =>
+            service.StartPhoneVerificationAsync(new("+60123456780"), "send-code", default));
+
+        Assert.Equal(1, provider.StartCount);
+        Assert.Equal(("IDEMPOTENCY_KEY_REUSED", 409), (reused.Code, reused.StatusCode));
+    }
+
+    [Fact]
+    public async Task Checking_phone_verification_replays_the_proof_without_calling_twilio_again()
+    {
+        await using var db = Db();
+        var provider = new FakePhoneVerificationProvider();
+        var service = new CoreService(db, IdentityProtector, phoneVerificationProvider: provider);
+
+        var first = await service.CheckPhoneVerificationAsync(new("+60123456789", "123456"), "check-code", default);
+        var replay = await service.CheckPhoneVerificationAsync(new("+60123456789", "123456"), "check-code", default);
+        var reused = await Assert.ThrowsAsync<DomainException>(() =>
+            service.CheckPhoneVerificationAsync(new("+60123456789", "654321"), "check-code", default));
+
+        Assert.Equal(first, replay);
+        Assert.Equal(1, provider.CheckCount);
+        Assert.Equal(("IDEMPOTENCY_KEY_REUSED", 409), (reused.Code, reused.StatusCode));
+    }
+
+    [Fact]
     public async Task Own_profile_returns_the_masked_contact_hints_from_registration()
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "Member@Example.com", "+919876543210"), "register-1", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "Member@Example.com", "+919876543210", PhoneVerificationToken: "verified"), "register-1", default);
 
         var own = await service.GetOwnProfileAsync(registered.MemberId, default);
         var updated = await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), own.ETag, default);
@@ -118,7 +239,7 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com", "+919876543210"), "register-1", default);
+        var registered = await service.RegisterMemberAsync("olga", new MemberCreateRequest("New member", "member@example.com", "+919876543210", PhoneVerificationToken: "verified"), "register-1", default);
         var other = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Other member", "other@example.com"), "register-2", default);
         await service.UpdateProfileAsync(registered.MemberId, new("New member", null, null, null), "\"1\"", default);
 
@@ -985,13 +1106,13 @@ public sealed class CoreServiceTests
     {
         await using var db = Db();
         var service = Service(db);
-        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default);
+        var member = await service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-del", default);
         var request = await service.CreatePrivacyRequestAsync(member.MemberId, new("DELETE"), default);
 
         var lookup = await Assert.ThrowsAsync<DomainException>(() => service.LookupMemberByEmailAsync(new(" ASHA@example.com"), default));
         var byEmail = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", "asha@example.com"), "register-del-2", default));
-        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789"), "register-del-3", default));
-        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789"), "register-del", default));
+        var byPhone = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Again", Phone: "+60123456789", PhoneVerificationToken: "verified"), "register-del-3", default));
+        var replay = await Assert.ThrowsAsync<DomainException>(() => service.RegisterMemberAsync("olga", new MemberCreateRequest("Asha", "asha@example.com", "+60123456789", PhoneVerificationToken: "verified"), "register-del", default));
 
         foreach (var error in new[] { lookup, byEmail, byPhone, replay })
         {
@@ -1318,7 +1439,17 @@ public sealed class CoreServiceTests
     }
 
     private static CoreDbContext Db() => new(new DbContextOptionsBuilder<CoreDbContext>().UseInMemoryDatabase(Guid.NewGuid().ToString()).Options);
-    private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector);
+    private static CoreService Service(CoreDbContext db) => new(db, IdentityProtector, phoneVerificationProvider: new FakePhoneVerificationProvider());
+
+    private sealed class FakePhoneVerificationProvider : IPhoneVerificationProvider
+    {
+        public int StartCount { get; private set; }
+        public int CheckCount { get; private set; }
+        public Task StartAsync(string phone, string channel, string rateLimitValue, CancellationToken ct) { StartCount++; return Task.CompletedTask; }
+        public Task<PhoneVerificationProof> CheckAsync(string phone, string code, CancellationToken ct) { CheckCount++; var expires = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.AddMinutes(10).ToUnixTimeSeconds()); return Task.FromResult(new PhoneVerificationProof("verified", expires)); }
+        public PhoneVerificationProof RestoreProof(string phone, DateTimeOffset expiresAt) => new("verified", expiresAt);
+        public bool ValidateProof(string phone, string token) => token == "verified";
+    }
     [Fact]
     public async Task Event_list_marks_registration_only_for_the_supplied_member()
     {
@@ -1787,6 +1918,66 @@ public sealed class CoreServiceTests
         var link = db.Model.FindEntityType(typeof(FileAssetLink))!;
         Assert.Equal(("storage", "file_asset", "storage", "file_asset_link"), (asset.GetSchema(), asset.GetTableName(), link.GetSchema(), link.GetTableName()));
         Assert.Equal(("sha256", "blob_path_hash", "file_asset_link_id"), (asset.FindProperty(nameof(FileAsset.Sha256))!.GetColumnName(), asset.FindProperty(nameof(FileAsset.BlobPathHash))!.GetColumnName(), link.FindProperty(nameof(FileAssetLink.FileAssetLinkId))!.GetColumnName()));
+    }
+
+    [Fact]
+    public async Task Industry_questionnaire_is_server_driven_and_saves_the_primary_sector_and_versioned_answers()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "Asha", Status = "ACTIVE" });
+        db.Sectors.Add(new Sector { SectorCode = "TECHNOLOGY", Name = "Technology, Software & AI", SortOrder = 10 });
+        db.SectorQuestionnaires.Add(new SectorQuestionnaire { QuestionnaireId = "sq_technology", SectorCode = "TECHNOLOGY", DefinitionVersion = 1 });
+        db.ProfileQuestions.AddRange(
+            new ProfileQuestion { QuestionId = "q_role_v1", QuestionCode = "ROLE", Prompt = "Role?", AnswerType = "SINGLE_SELECT", IsRequired = true, SortOrder = 10, ConfigurationJson = "{\"options\":[{\"code\":\"FOUNDER\",\"label\":\"Founder\"}],\"min_selections\":1,\"max_selections\":1}" },
+            new ProfileQuestion { QuestionId = "q_technology_product_v1", SectorCode = "TECHNOLOGY", QuestionCode = "TECH_PRODUCT", Prompt = "Product?", AnswerType = "MULTI_SELECT", IsRequired = true, SortOrder = 110, ConfigurationJson = "{\"options\":[{\"code\":\"SAAS\",\"label\":\"SaaS\"}],\"min_selections\":1,\"max_selections\":5}" });
+        await db.SaveChangesAsync();
+        var questionnaireRow = db.SectorQuestionnaires.Single();
+        db.SectorQuestionnaireQuestions.AddRange(db.ProfileQuestions.Select(x => new SectorQuestionnaireQuestion { SectorQuestionnaireId = questionnaireRow.Id, DefinitionVersion = 1, ProfileQuestionId = x.Id, IsRequired = x.IsRequired, SortOrder = x.SortOrder }));
+        await db.SaveChangesAsync();
+        var service = Service(db);
+
+        var definition = await service.GetIndustryQuestionnaireAsync("technology", default);
+        var request = new IndustryQuestionnaireSubmitRequest(
+            "TECHNOLOGY",
+            definition.DefinitionVersion,
+            [
+                new("q_role_v1", System.Text.Json.JsonDocument.Parse("{\"option_code\":\"FOUNDER\"}").RootElement.Clone()),
+                new("q_technology_product_v1", System.Text.Json.JsonDocument.Parse("{\"option_codes\":[\"SAAS\"]}").RootElement.Clone())
+            ]);
+        var saved = await service.SaveIndustryQuestionnaireAsync("A", request, "industry-save-1", "\"1\"", default);
+        var replay = await service.SaveIndustryQuestionnaireAsync("A", request, "industry-save-1", "\"1\"", default);
+        var own = await service.GetMemberIndustryQuestionnaireAsync("A", default);
+
+        Assert.Equal(2, definition.Questions.Count);
+        Assert.Equal(("COMPLETED", "TECHNOLOGY", 1), (saved.Status, saved.SectorCode, saved.DefinitionVersion));
+        Assert.Equal(saved.ResponseId, replay.ResponseId);
+        Assert.Equal(2, own.Answers.Count);
+        Assert.True(Assert.Single(db.MemberSectors).IsPrimary);
+        Assert.Equal(2, db.MemberQuestionAnswers.Count());
+        Assert.Contains(db.OutboxEvents, x => x.EventType == "MemberIndustryQuestionnaireChanged.v1");
+    }
+
+    [Fact]
+    public async Task Industry_questionnaire_rejects_a_stale_definition_and_requires_a_custom_other_name()
+    {
+        await using var db = Db();
+        db.MemberProfiles.Add(new MemberProfile { MemberId = "A", DisplayName = "Asha", Status = "ACTIVE" });
+        db.Sectors.Add(new Sector { SectorCode = "OTHER", Name = "Other / Not listed", SortOrder = 999 });
+        db.SectorQuestionnaires.Add(new SectorQuestionnaire { QuestionnaireId = "sq_other", SectorCode = "OTHER", DefinitionVersion = 2 });
+        db.ProfileQuestions.Add(new ProfileQuestion { QuestionId = "q_other_v1", SectorCode = "OTHER", QuestionCode = "OTHER_INDUSTRY", Prompt = "Describe it", AnswerType = "TEXT", IsRequired = true, SortOrder = 110, ConfigurationJson = "{\"max_length\":1000}" });
+        await db.SaveChangesAsync();
+        var questionnaireRow = db.SectorQuestionnaires.Single();
+        var questionRow = db.ProfileQuestions.Single();
+        db.SectorQuestionnaireQuestions.Add(new SectorQuestionnaireQuestion { SectorQuestionnaireId = questionnaireRow.Id, DefinitionVersion = 2, ProfileQuestionId = questionRow.Id, IsRequired = true, SortOrder = 110 });
+        await db.SaveChangesAsync();
+        var service = Service(db);
+        var answer = new QuestionAnswerRequest("q_other_v1", System.Text.Json.JsonDocument.Parse("{\"text\":\"Space services\"}").RootElement.Clone());
+
+        var stale = await Assert.ThrowsAsync<DomainException>(() => service.SaveIndustryQuestionnaireAsync("A", new("OTHER", 1, [answer], CustomIndustryName: "Space"), "industry-stale", "\"1\"", default));
+        var missingName = await Assert.ThrowsAsync<DomainException>(() => service.SaveIndustryQuestionnaireAsync("A", new("OTHER", 2, [answer]), "industry-other", "\"1\"", default));
+
+        Assert.Equal(("QUESTIONNAIRE_VERSION_CONFLICT", 409), (stale.Code, stale.StatusCode));
+        Assert.Equal("CUSTOM_INDUSTRY_REQUIRED", missingName.Code);
     }
 
     private static byte[] ChatSample(string kind) => kind switch

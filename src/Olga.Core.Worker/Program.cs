@@ -90,6 +90,8 @@ builder.Services.AddSingleton<IOutboxEventPublisher>(sp =>
     return publisher;
 });
 builder.Services.AddScoped<NlpCompletionProjectionHandler>();
+builder.Services.AddScoped<SciScoreProjectionHandler>();
+builder.Services.AddScoped<SciIntentRescoreHandler>();
 builder.Services.AddScoped<ProfileImageProcessor>();
 builder.Services.AddScoped<ChatAttachmentProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
