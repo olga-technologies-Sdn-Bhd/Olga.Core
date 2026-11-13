@@ -21,6 +21,8 @@ public interface ISocialCapitalRepository
     Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct);
     Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct);
+    Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct);
+    Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct);
 }
 
 public interface ISocialCapitalService
@@ -39,6 +41,8 @@ public interface ISocialCapitalService
     Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct);
     Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct);
     Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct);
+    Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct);
+    Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct);
 }
 
 public sealed class SocialCapitalService(ISocialCapitalRepository repository, IIdentityProtector identityProtector) : ISocialCapitalService
@@ -143,6 +147,18 @@ public sealed class SocialCapitalService(ISocialCapitalRepository repository, II
         if (!IsInvitationId(invitationId)) throw new DomainException("INVITATION_NOT_FOUND", 404);
         if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128) throw new DomainException("IDEMPOTENCY_KEY_REQUIRED");
         return repository.AcceptPendingInvitationAsync(recipientMemberId, invitationId.ToLowerInvariant(), idempotencyKey, ct);
+    }
+
+    public Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct)
+    {
+        if (!IsInvitationId(invitationId)) throw new DomainException("INVITATION_NOT_FOUND", 404);
+        return repository.RevokeInvitationAsync(ownerMemberId, invitationId.ToLowerInvariant(), ct);
+    }
+
+    public Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(linkId) || linkId.Length > 64) throw new DomainException("CONTACT_LINK_INVALID");
+        return repository.DeleteContactAsync(ownerMemberId, linkId, ct);
     }
 
     private static bool IsToken(string token) => token.Length == 64 && token.All(Uri.IsHexDigit);

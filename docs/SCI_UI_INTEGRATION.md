@@ -77,7 +77,7 @@ Success: `201 Created`
   "status": "ACTIVE",
   "geography_codes": [],
   "updated_at": "2026-11-04T10:30:00Z",
-  "etag": "\"1\""
+  "e_tag": "\"1\""
 }
 ```
 
@@ -225,6 +225,50 @@ Current validation:
 
 Contact labels and lookup identifiers are protected by Core. The UI must not forward raw contact data to NLP or log request bodies containing contact details.
 
+### List imported contacts
+
+```http
+GET {CORE_API_BASE_URL}/v1/contacts?limit=50
+X-Member-Id: {MEMBER_ID}
+```
+
+Success: `200 OK`, newest first. Pass `next_cursor` back unchanged as `?cursor=` for the next page. `limit` is 1 to 100 (default 50).
+
+```json
+{
+  "items": [
+    {
+      "link_id": "link_01JQ8M1QF7R4B8M6K3T2H9D5VW",
+      "contact_record_id": "contact_01JQ8M0X2D3G7Y5F4A9C6N8P1R",
+      "label": "Priya Sharma",
+      "lifecycle_state": "IMPORTED",
+      "has_email": true,
+      "has_phone": false,
+      "invitation_id": "c1d2e3f4a5b6c7d8",
+      "invitation_status": "APPROVED",
+      "invitation_expires_at": "2026-11-18T10:30:00Z",
+      "imported_at": "2026-11-04T10:30:00Z",
+      "expires_at": "2027-11-04T10:30:00Z"
+    }
+  ],
+  "next_cursor": "Mg=="
+}
+```
+
+- `lifecycle_state`: `IMPORTED`, `INVITED`, `JOINED` or `CONNECTED`. `contact_member_id` is present once the contact has joined.
+- The `invitation_*` fields describe the contact's latest invitation and are omitted when none exists. `invitation_status` reads `EXPIRED` once the invitation or its batch has expired.
+- Removed contacts and contacts past their retention expiry are not listed.
+
+### Delete an imported contact
+
+```http
+DELETE {CORE_API_BASE_URL}/v1/contacts/{link_id}
+X-Member-Id: {MEMBER_ID}
+Idempotency-Key: 6c0f5f3e-5d0e-4a51-9a3c-0b2f1d6e7a10
+```
+
+Success: `204 No Content`. This permanently deletes the contact's label, phone/email lookup hashes, link, invitations (their links stop working) and SCI scores. An existing connection and chat with that person are kept. Deleting a contact that is already gone also returns `204`, so retries are safe. Only address-book imports can be deleted; other links return `409 CONTACT_NOT_REMOVABLE`.
+
 ## 6. Create and share invitations
 
 The owner selects imported `link_id` values and optionally associates the batch with the business.
@@ -259,7 +303,7 @@ Success: `201 Created`
       "expires_at": "2026-11-18T10:30:00Z"
     }
   ],
-  "etag": "\"1\""
+  "e_tag": "\"1\""
 }
 ```
 
@@ -270,17 +314,112 @@ Current validation:
 - `expires_in_days`: 1 to 30.
 - If supplied, `venture_id` must identify an active business owned by the caller.
 
-Build an app-owned invitation URL from the returned token, for example:
+### Invitation links
+
+Share each token as a verified HTTPS link with the token in the URL fragment:
 
 ```text
-https://<ui-host>/invitations/<token>
+https://<link-host>/i#<token>
 ```
 
-Treat tokens as secrets. Do not expose them in analytics, crash reports, or application logs. The current pilot API has no invitation-batch status endpoint, so preserve the creation response if the UI needs to show immediate dispatch state.
+- Browsers never send the fragment to a server, so the token can't reach server or proxy logs.
+- Core serves `/.well-known/assetlinks.json` (Android App Links) and `/.well-known/apple-app-site-association` (iOS Universal Links) on the link host, so the link opens the app directly when it is installed.
+- When the app isn't installed, `GET /i` shows a static page with an "Open in Ol-ga" button and store links, and tells the invitee to sign in with the invited email or phone. Invitations then appear in the in-app inbox (section 7).
+- The app also accepts the custom-scheme form `olgaapp://invitations/<token>` (`olgaapp-dev://` on dev). WhatsApp and SMS don't make custom-scheme links tappable, so share the HTTPS form.
+- `<link-host>` must be a stable custom domain (planned: `link.ol-ga.com`, dev `link-dev.ol-ga.com`), not the `*.azurecontainerapps.io` host.
 
-## 7. Accept an invitation
+Treat tokens as secrets. Do not expose them in analytics, crash reports, or application logs.
 
-After authentication, the invitee accepts the token from the UI route:
+### Invitation batch status
+
+```http
+GET {CORE_API_BASE_URL}/v1/invite-batches/{batch_id}
+X-Member-Id: {MEMBER_ID}
+```
+
+Success: `200 OK`. Tokens are never returned again.
+
+```json
+{
+  "batch_id": "batch_01JQ8N5QV6J9T8R2H7F4P3D1MC",
+  "venture_id": "venture_01JQ8J2M7X6JBY6Y3H1S6D2P9R",
+  "status": "APPROVED",
+  "expires_at": "2026-11-18T10:30:00Z",
+  "created_at": "2026-11-04T10:30:00Z",
+  "invitations": [
+    {
+      "invitation_id": "c1d2e3f4a5b6c7d8",
+      "link_id": "link_01JQ8M1QF7R4B8M6K3T2H9D5VW",
+      "label": "Priya Sharma",
+      "status": "OPENED",
+      "first_opened_at": "2026-11-05T08:00:00Z",
+      "expires_at": "2026-11-18T10:30:00Z"
+    }
+  ]
+}
+```
+
+Invitation `status` is `APPROVED`, `OPENED`, `ACCEPTED`, `EXPIRED` or `REVOKED`. A batch owned by another member returns `404 INVITE_BATCH_NOT_FOUND`.
+
+### Resend an invitation
+
+```http
+POST {CORE_API_BASE_URL}/v1/invitations/{invitation_id}/resend
+X-Member-Id: {MEMBER_ID}
+Idempotency-Key: 7b1e2d3c-4f5a-6b7c-8d9e-0f1a2b3c4d5e
+Content-Type: application/json
+```
+
+```json
+{ "expires_in_days": 14 }
+```
+
+The body is optional (`expires_in_days` 1 to 30, default 14). Success: `200 OK` with `{ invitation_id, link_id, token, expires_at }`.
+
+- Core stores only a hash of each token, so a resend issues a **new** token and the previous link stops working. Share a new link.
+- Retrying with the same `Idempotency-Key` returns the same token.
+- An accepted or revoked invitation returns `409 INVITATION_NOT_RESENDABLE`.
+
+### Revoke an invitation
+
+```http
+POST {CORE_API_BASE_URL}/v1/invitations/{invitation_id}/revoke
+X-Member-Id: {MEMBER_ID}
+Idempotency-Key: 2a3b4c5d-6e7f-4a8b-9c0d-1e2f3a4b5c6d
+```
+
+Success: `204 No Content`. The link stops working and the invitation leaves the invitee's inbox. Revoking again also returns `204`. An accepted invitation returns `409 INVITATION_NOT_REVOKABLE`; an unknown one returns `404 INVITATION_NOT_FOUND`.
+
+## 7. Open and accept an invitation
+
+### Preview the invitation
+
+When the invitee opens an invitation link, show who invited them before they accept:
+
+```http
+POST {CORE_API_BASE_URL}/v1/invitations/{token}/open
+X-Member-Id: {INVITEE_MEMBER_ID}
+```
+
+No `Idempotency-Key` or body is needed. Success: `200 OK`
+
+```json
+{
+  "invitation_id": "c1d2e3f4a5b6c7d8",
+  "inviter_member_id": "mem_4b0c...",
+  "inviter_display_name": "Asha",
+  "venture_name": "Acme Circular Packaging",
+  "status": "OPENED",
+  "expires_at": "2026-11-18T10:30:00Z"
+}
+```
+
+- The first open by anyone other than the inviter moves `APPROVED` to `OPENED` and records `first_opened_at`.
+- `status` `EXPIRED`: show an expired state. `404 INVITATION_NOT_FOUND`: the link is invalid, revoked or was replaced by a resend.
+
+### Accept with the token
+
+After authentication, the invitee accepts the token from the link:
 
 ```http
 POST {CORE_API_BASE_URL}/v1/invitations/{token}/accept
@@ -303,6 +442,50 @@ Success: `200 OK`
 ```
 
 On success, show a connected state and optionally navigate to the returned conversation. Reusing the same idempotency key retries the same acceptance operation safely.
+
+### Pending invitations inbox
+
+Invitations whose imported contact's phone or email matches one of the signed-in member's **verified** identities appear in the app without the link. This also covers invitees who install the app after the link was sent.
+
+```http
+GET {CORE_API_BASE_URL}/v1/me/invitations
+X-Member-Id: {INVITEE_MEMBER_ID}
+```
+
+Success: `200 OK`, newest first, at most 50.
+
+```json
+[
+  {
+    "invitation_id": "c1d2e3f4a5b6c7d8",
+    "inviter_member_id": "mem_4b0c...",
+    "inviter_display_name": "Asha",
+    "inviter_headline": "Product leader",
+    "venture_name": "Acme Circular Packaging",
+    "invited_at": "2026-11-04T10:30:00Z",
+    "expires_at": "2026-11-18T10:30:00Z"
+  }
+]
+```
+
+Accepted, expired and revoked invitations are not listed, and neither are invitations from blocked members. Accept one with:
+
+```http
+POST {CORE_API_BASE_URL}/v1/me/invitations/{invitation_id}/accept
+X-Member-Id: {INVITEE_MEMBER_ID}
+Idempotency-Key: 9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a
+```
+
+The response matches accepting with the token.
+
+### Home summary
+
+```http
+GET {CORE_API_BASE_URL}/v1/sci/summary
+X-Member-Id: {MEMBER_ID}
+```
+
+Returns `venture_count`, `contact_count`, `bands` (`emerging` 10-24, `relevant` 25-49, `strong` 50-74, `exact` 75-100), `average_score`, `last_scored_at` and a per-business `ventures` list (`contact_count`, `top_score`, `average_score`, `stale_count`, `last_scored_at`). Totals count each contact once, at their best score across the member's businesses.
 
 ## 8. Display the SCI network
 
@@ -328,7 +511,7 @@ Success: `200 OK`
       "is_stale": false,
       "origin_type": "IMPORT",
       "scored_at": "2026-11-04T10:42:00Z",
-      "etag": "\"1\""
+      "e_tag": "\"1\""
     }
   ],
   "next_cursor": null
@@ -414,6 +597,14 @@ Important codes include:
 - `INVITATION_TOKEN_INVALID`
 - `INVITATION_NOT_FOUND`
 - `INVITATION_SELF_ACCEPT_INVALID`
+- `INVITATION_RESEND_INVALID`
+- `INVITATION_NOT_RESENDABLE`
+- `INVITATION_NOT_REVOKABLE`
+- `INVITE_BATCH_NOT_FOUND`
+- `CONTACT_QUERY_INVALID`
+- `CONTACT_CURSOR_INVALID`
+- `CONTACT_LINK_INVALID`
+- `CONTACT_NOT_REMOVABLE`
 - `SCI_QUERY_INVALID`
 
 ## 11. Suggested client types
@@ -430,7 +621,7 @@ type VentureResponse = {
   status: string;
   geography_codes: string[];
   updated_at: string;
-  etag: string;
+  e_tag: string;
 };
 
 type IntentSummary = {
@@ -462,7 +653,7 @@ type SciContact = {
   is_stale: boolean;
   origin_type: string;
   scored_at: string;
-  etag: string;
+  e_tag: string;
 };
 
 type SciContactPage = {
@@ -484,10 +675,11 @@ type ApiError = {
 Do not design the UI around endpoints that do not yet exist. The current API does not provide:
 
 - Business edit endpoint.
-- Contact list, import preview, deduplication, or merge endpoints.
-- Invitation batch detail/status or resend endpoints.
+- Contact import preview, deduplication, or merge endpoints.
 - Venture intent-set status endpoint; only individual intents can be read.
 - An explicit SCI job-status endpoint.
+- Score change over time ("changed since you met") or per-event origin counts ("where it came from").
+- A mutual-add rule (adding both members to each other's SCI above an intent-match threshold).
 
 Preserve successful creation responses in client state where needed. If these capabilities are required for a production-quality flow, scope them as backend follow-up work rather than mocking authoritative server state.
 
@@ -501,6 +693,7 @@ Preserve successful creation responses in client state where needed. If these ca
 - [ ] Generate new intent-set, OFFER, and WANT IDs for every intent update.
 - [ ] Never send imported contact details to NLP.
 - [ ] Treat tokens as secrets.
+- [ ] Share invitations as `https://<link-host>/i#<token>`, never with the token in the path or query.
 - [ ] Treat intent creation and SCI scoring as asynchronous.
 - [ ] Preserve stale scores while they update.
 - [ ] Pass opaque cursors back unchanged.

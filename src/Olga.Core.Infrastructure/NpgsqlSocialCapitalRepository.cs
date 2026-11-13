@@ -504,6 +504,60 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         return items;
     }
 
+    // Revoking again is a no-op, so a retried request succeeds. An accepted invitation has already
+    // created a connection and can't be revoked.
+    public async Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct)
+    {
+        await using var command = dataSource.CreateCommand("""
+            WITH target AS (
+                SELECT invitation_pk, status FROM social.invitation
+                WHERE invitation_id=@invitation_id AND owner_member_id=@owner_member_id
+                FOR UPDATE),
+            revoked AS (
+                UPDATE social.invitation i SET status='REVOKED', updated_at=CURRENT_TIMESTAMP
+                FROM target t WHERE i.invitation_pk=t.invitation_pk AND t.status IN ('APPROVED','OPENED','EXPIRED')
+                RETURNING i.invitation_pk)
+            SELECT t.status FROM target t
+            """);
+        Add(command, "invitation_id", invitationId); Add(command, "owner_member_id", ownerMemberId);
+        var status = (string?)await command.ExecuteScalarAsync(ct);
+        if (status is null) throw new DomainException("INVITATION_NOT_FOUND", 404);
+        if (status == "ACCEPTED") throw new DomainException("INVITATION_NOT_REVOKABLE", 409);
+    }
+
+    // Permanently removes an imported contact: the record's FKs cascade to its identifier hashes, link,
+    // invitations, scores and link history. An existing connection/chat with them is kept.
+    // Deleting a contact that is already gone (or never was the caller's) is a no-op, so retries succeed.
+    public async Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        string? origin;
+        await using (var read = new NpgsqlCommand("""
+            SELECT l.origin_type FROM social.contact_link l
+            WHERE l.link_id=@link_id AND l.owner_member_id=@owner_member_id
+            FOR UPDATE
+            """, connection, transaction))
+        {
+            Add(read, "link_id", linkId); Add(read, "owner_member_id", ownerMemberId);
+            origin = (string?)await read.ExecuteScalarAsync(ct);
+        }
+        if (origin is null) { await transaction.CommitAsync(ct); return; }
+        // Only address-book imports are the owner's own data to delete; met-in-person links are evidence-backed.
+        if (origin != "IMPORT") throw new DomainException("CONTACT_NOT_REMOVABLE", 409);
+        await using (var delete = new NpgsqlCommand("""
+            DELETE FROM social.contact_record r
+            USING social.contact_link l
+            WHERE l.link_id=@link_id AND l.owner_member_id=@owner_member_id
+              AND r.contact_record_pk=l.contact_record_pk AND r.owner_member_id=l.owner_member_id
+            """, connection, transaction))
+        {
+            Add(delete, "link_id", linkId); Add(delete, "owner_member_id", ownerMemberId);
+            await delete.ExecuteNonQueryAsync(ct);
+        }
+        await transaction.CommitAsync(ct);
+    }
+
     // The imported contact's phone/email hash equals the recipient's verified identity hash
     // (both come from IIdentityProtector's keyed lookup hash). Expects alias l (contact_link) and @recipient_member_id.
     private const string MatchesRecipientIdentity = """

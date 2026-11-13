@@ -83,6 +83,30 @@ public sealed class SocialCapitalServiceTests
         Assert.Equal(("OpenInvitation", "mem_invitee", Token.ToLowerInvariant()), repository.Calls.Single());
     }
 
+    [Fact]
+    public async Task Revoke_treats_malformed_ids_as_not_found_and_passes_a_lowercase_id()
+    {
+        var (service, repository) = Create();
+
+        var malformed = await Assert.ThrowsAsync<DomainException>(() => service.RevokeInvitationAsync(Owner, "nope", default));
+        await service.RevokeInvitationAsync(Owner, InvitationId, default);
+
+        Assert.Equal(("INVITATION_NOT_FOUND", 404), (malformed.Code, malformed.StatusCode));
+        Assert.Equal(("RevokeInvitation", Owner, InvitationId.ToLowerInvariant()), repository.Calls.Single());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" ")]
+    public async Task Delete_contact_rejects_a_blank_or_oversized_link_id(string linkId)
+    {
+        var (service, repository) = Create();
+
+        Assert.Equal("CONTACT_LINK_INVALID", (await Assert.ThrowsAsync<DomainException>(() => service.DeleteContactAsync(Owner, linkId, default))).Code);
+        Assert.Equal("CONTACT_LINK_INVALID", (await Assert.ThrowsAsync<DomainException>(() => service.DeleteContactAsync(Owner, new string('l', 65), default))).Code);
+        Assert.Empty(repository.Calls);
+    }
+
     private static (SocialCapitalService Service, RecordingRepository Repository) Create()
     {
         var repository = new RecordingRepository();
@@ -114,5 +138,9 @@ public sealed class SocialCapitalServiceTests
         public Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
         public Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct)
+        { Calls.Add(("RevokeInvitation", ownerMemberId, invitationId)); return Task.CompletedTask; }
+        public Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct)
+        { Calls.Add(("DeleteContact", ownerMemberId, linkId)); return Task.CompletedTask; }
     }
 }

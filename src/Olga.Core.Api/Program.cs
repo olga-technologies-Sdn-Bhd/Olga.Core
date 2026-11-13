@@ -146,6 +146,7 @@ builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
 builder.Services.AddScoped<ISocialCapitalRepository, NpgsqlSocialCapitalRepository>();
 builder.Services.AddScoped<ISocialCapitalService, SocialCapitalService>();
+builder.Services.Configure<InviteLinkOptions>(builder.Configuration.GetSection(InviteLinkOptions.SectionName));
 
 var app = builder.Build();
 if (app.Environment.IsProduction()) app.UseMiddleware<AzureIngressHstsMiddleware>();
@@ -199,6 +200,7 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json", "OLGA Core API v1");
 });
 app.MapHealthChecks("/health");
+app.MapInviteLinks();
 app.UseMiddleware<RealtimeMemberMiddleware>();
 app.MapHub<ChatHub>(ChatRealtime.HubPath);
 app.MapGet("/ready", async (CoreDbContext db, CancellationToken ct) => await db.Database.CanConnectAsync(ct) ? Results.Ok(new { status = "ready" }) : Results.StatusCode(503))
@@ -255,6 +257,16 @@ memberV1.MapGet("/me/invitations", async (HttpContext c, ISocialCapitalService s
 memberV1.MapPost("/me/invitations/{invitationId}/accept", async (HttpContext c, string invitationId, ISocialCapitalService s, CancellationToken ct) =>
     Results.Ok(await s.AcceptPendingInvitationAsync(Member(c), invitationId, Idempotency(c), ct)))
     .WithName("AcceptPendingInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200).Produces<ApiError>(404);
+memberV1.MapPost("/invitations/{invitationId}/revoke", async (HttpContext c, string invitationId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    await s.RevokeInvitationAsync(Member(c), invitationId, ct);
+    return Results.NoContent();
+}).WithName("RevokeInvitation").WithTags("Social capital").Produces(204).Produces<ApiError>(404).Produces<ApiError>(409);
+memberV1.MapDelete("/contacts/{linkId}", async (HttpContext c, string linkId, ISocialCapitalService s, CancellationToken ct) =>
+{
+    await s.DeleteContactAsync(Member(c), linkId, ct);
+    return Results.NoContent();
+}).WithName("DeleteImportedContact").WithTags("Social capital").Produces(204).Produces<ApiError>(409);
 v1.MapPost("/members", async (HttpContext c, MemberCreateRequest body, ICoreService s, CancellationToken ct) =>
 {
     var value = await s.RegisterMemberAsync(defaultCommunityId, body, Idempotency(c), ct);
