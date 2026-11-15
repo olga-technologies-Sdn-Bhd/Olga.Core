@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text;
+using Microsoft.Extensions.Logging.Abstractions;
+using Olga.Core.Domain;
 using Olga.Core.Infrastructure;
 
 namespace Olga.Core.Tests;
@@ -47,10 +49,34 @@ public sealed class TwilioPhoneVerificationProviderTests
         Assert.DoesNotContain("60123456789", Encoding.UTF8.GetString(Convert.FromBase64String(Pad(proof.Token.Split('.')[0]))), StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task Compliance_rejection_is_not_reported_as_provider_unavailability()
+    {
+        var provider = Provider(new RecordingHandler(HttpStatusCode.Forbidden, "{\"code\":21608}"));
+
+        var error = await Assert.ThrowsAsync<DomainException>(() =>
+            provider.StartAsync("+919885554624", "sms", "phone-hash", default));
+
+        Assert.Equal("PHONE_VERIFICATION_RECIPIENT_NOT_ALLOWED", error.Code);
+        Assert.Equal(422, error.StatusCode);
+    }
+
+    [Fact]
+    public async Task Authentication_rejection_has_a_distinct_configuration_error()
+    {
+        var provider = Provider(new RecordingHandler(HttpStatusCode.Unauthorized, "{\"code\":20003}"));
+
+        var error = await Assert.ThrowsAsync<DomainException>(() =>
+            provider.StartAsync("+60123456789", "sms", "phone-hash", default));
+
+        Assert.Equal("PHONE_VERIFICATION_CONFIGURATION_ERROR", error.Code);
+        Assert.Equal(503, error.StatusCode);
+    }
+
     private static TwilioPhoneVerificationProvider Provider(HttpMessageHandler handler)
     {
         var client = new HttpClient(handler) { BaseAddress = new Uri("https://verify.twilio.com/") };
-        return new(client, Options, Enumerable.Repeat((byte)3, 32).ToArray(), new FixedTimeProvider());
+        return new(client, Options, Enumerable.Repeat((byte)3, 32).ToArray(), new FixedTimeProvider(), NullLogger<TwilioPhoneVerificationProvider>.Instance);
     }
 
     private static string Pad(string value)
@@ -64,8 +90,18 @@ public sealed class TwilioPhoneVerificationProviderTests
         public override DateTimeOffset GetUtcNow() => new(2026, 10, 29, 0, 0, 0, TimeSpan.Zero);
     }
 
-    private sealed class RecordingHandler(string status) : HttpMessageHandler
+    private sealed class RecordingHandler : HttpMessageHandler
     {
+        private readonly HttpStatusCode responseStatus;
+        private readonly string responseBody;
+
+        public RecordingHandler(string status) : this(HttpStatusCode.OK, $"{{\"status\":\"{status}\"}}") { }
+        public RecordingHandler(HttpStatusCode responseStatus, string responseBody)
+        {
+            this.responseStatus = responseStatus;
+            this.responseBody = responseBody;
+        }
+
         public HttpMethod? Method { get; private set; }
         public Uri? Uri { get; private set; }
         public AuthenticationHeaderValue? Authorization { get; private set; }
@@ -77,9 +113,9 @@ public sealed class TwilioPhoneVerificationProviderTests
             Uri = request.RequestUri;
             Authorization = request.Headers.Authorization;
             Body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
-            return new HttpResponseMessage(HttpStatusCode.OK)
+            return new HttpResponseMessage(responseStatus)
             {
-                Content = new StringContent($"{{\"status\":\"{status}\"}}", Encoding.UTF8, "application/json")
+                Content = new StringContent(responseBody, Encoding.UTF8, "application/json")
             };
         }
     }

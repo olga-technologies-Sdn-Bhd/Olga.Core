@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Extensions.Logging;
 using Olga.Core.Application;
 using Olga.Core.Domain;
 
@@ -24,7 +25,8 @@ public sealed class TwilioPhoneVerificationProvider(
     HttpClient httpClient,
     TwilioVerifyOptions options,
     byte[] masterKey,
-    TimeProvider timeProvider) : IPhoneVerificationProvider
+    TimeProvider timeProvider,
+    ILogger<TwilioPhoneVerificationProvider> logger) : IPhoneVerificationProvider
 {
     private readonly byte[] proofKey = DeriveProofKey(masterKey);
 
@@ -41,7 +43,7 @@ public sealed class TwilioPhoneVerificationProvider(
             values[$"RateLimits[{options.RateLimitName}]"] = rateLimitValue;
         using var request = CreateRequest("Verifications", values);
         using var response = await SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) throw ProviderError(response.StatusCode, checkingCode: false);
+        if (!response.IsSuccessStatusCode) throw await ProviderErrorAsync(response, checkingCode: false, ct);
         using var payload = await ReadPayloadAsync(response, ct);
         if (!string.Equals(Status(payload), "pending", StringComparison.OrdinalIgnoreCase))
             throw new DomainException("PHONE_VERIFICATION_REJECTED", 422);
@@ -52,7 +54,7 @@ public sealed class TwilioPhoneVerificationProvider(
         var normalized = NormalizePhone(phone);
         using var request = CreateRequest("VerificationCheck", new Dictionary<string, string> { ["To"] = normalized, ["Code"] = code });
         using var response = await SendAsync(request, ct);
-        if (!response.IsSuccessStatusCode) throw ProviderError(response.StatusCode, checkingCode: true);
+        if (!response.IsSuccessStatusCode) throw await ProviderErrorAsync(response, checkingCode: true, ct);
         using var payload = await ReadPayloadAsync(response, ct);
         if (!string.Equals(Status(payload), "approved", StringComparison.OrdinalIgnoreCase))
             throw new DomainException("PHONE_VERIFICATION_CODE_INVALID");
@@ -126,13 +128,36 @@ public sealed class TwilioPhoneVerificationProvider(
 
     private static string? Status(JsonDocument payload) => payload.RootElement.TryGetProperty("status", out var status) ? status.GetString() : null;
 
-    private static DomainException ProviderError(HttpStatusCode status, bool checkingCode) => status switch
+    private async Task<DomainException> ProviderErrorAsync(HttpResponseMessage response, bool checkingCode, CancellationToken ct)
     {
-        HttpStatusCode.TooManyRequests => new("PHONE_VERIFICATION_RATE_LIMITED", 429),
-        HttpStatusCode.BadRequest or HttpStatusCode.NotFound when checkingCode => new("PHONE_VERIFICATION_CODE_INVALID"),
-        HttpStatusCode.BadRequest or HttpStatusCode.NotFound => new("PHONE_VERIFICATION_REJECTED", 422),
-        _ => new("PHONE_VERIFICATION_UNAVAILABLE", 503)
-    };
+        var providerCode = await TryReadProviderCodeAsync(response, ct);
+        if (providerCode == 21608 || response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            logger.LogWarning(
+                "Twilio Verify rejected {Operation} with HTTP {StatusCode} and provider code {ProviderCode}",
+                checkingCode ? "check" : "start", (int)response.StatusCode, providerCode);
+        }
+
+        return (response.StatusCode, providerCode, checkingCode) switch
+        {
+            (HttpStatusCode.TooManyRequests, _, _) => new("PHONE_VERIFICATION_RATE_LIMITED", 429),
+            (_, 21608, false) => new("PHONE_VERIFICATION_RECIPIENT_NOT_ALLOWED", 422),
+            (HttpStatusCode.BadRequest or HttpStatusCode.NotFound, _, true) => new("PHONE_VERIFICATION_CODE_INVALID"),
+            (HttpStatusCode.BadRequest or HttpStatusCode.NotFound, _, false) => new("PHONE_VERIFICATION_REJECTED", 422),
+            (HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden, _, _) => new("PHONE_VERIFICATION_CONFIGURATION_ERROR", 503),
+            _ => new("PHONE_VERIFICATION_UNAVAILABLE", 503)
+        };
+    }
+
+    private static async Task<int?> TryReadProviderCodeAsync(HttpResponseMessage response, CancellationToken ct)
+    {
+        try
+        {
+            using var payload = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(ct), cancellationToken: ct);
+            return payload.RootElement.TryGetProperty("code", out var code) && code.TryGetInt32(out var value) ? value : null;
+        }
+        catch (JsonException) { return null; }
+    }
 
     private static string NormalizePhone(string value)
     {
