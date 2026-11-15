@@ -153,10 +153,12 @@ Errors use `application/problem+json` and include `code`, `message`, and `correl
 | `409` | `IDEMPOTENCY_KEY_REUSED` | Generate a new key because the existing key was reused with different input. |
 | `409` | `PHONE_VERIFICATION_IN_PROGRESS` | Keep the same key and retry after a short delay; do not create another logical action. |
 | `409` | `MEMBER_IDENTITY_ALREADY_REGISTERED` | Switch to existing-member lookup rather than registration. |
+| `422` | `PHONE_VERIFICATION_RECIPIENT_NOT_ALLOWED` | Do not retry automatically. Tell the user that this number cannot currently receive a verification code and provide a support path. |
 | `429` | `PHONE_VERIFICATION_RATE_LIMITED` | Respect `Retry-After` when present, disable send/check actions, and show a neutral retry-later message. |
+| `503` | `PHONE_VERIFICATION_CONFIGURATION_ERROR` | Preserve the current screen and surface the correlation ID to support; automatic retries will not resolve an operator configuration problem. |
 | `503` | `PHONE_VERIFICATION_UNAVAILABLE` | Preserve the current screen and retry the identical request with the same key using bounded exponential backoff. |
 
-Do not automatically retry permanent `400`, `403`, `404`, or `409 IDEMPOTENCY_KEY_REUSED` responses. Automatic retries are appropriate only for transport failures, `503`, and selected `409 PHONE_VERIFICATION_IN_PROGRESS` responses.
+Do not automatically retry permanent `400`, `403`, `404`, `422`, `503 PHONE_VERIFICATION_CONFIGURATION_ERROR`, or `409 IDEMPOTENCY_KEY_REUSED` responses. Automatic retries are appropriate only for transport failures, `503 PHONE_VERIFICATION_UNAVAILABLE`, and selected `409 PHONE_VERIFICATION_IN_PROGRESS` responses.
 
 ## Recommended mobile state machine
 

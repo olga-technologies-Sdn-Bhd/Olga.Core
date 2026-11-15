@@ -162,8 +162,9 @@ app.Use(async (context, next) =>
             : 256_000;
         if (context.Request.ContentLength > requestLimit) { await Error(context, 413, "PAYLOAD_TOO_LARGE"); return; }
         var idempotencyKey = context.Request.Headers[idempotencyKeyHeader].ToString();
-        // SignalR's negotiate POST is a connection handshake and a typing signal stores nothing: neither is a mutation.
+        // Endpoint metadata is the source of truth for replay-safe POST exceptions documented by OpenAPI.
         if (context.Request.Path.StartsWithSegments("/v1") && !context.Request.Path.StartsWithSegments(ChatRealtime.HubPath) && !IsTypingSignal(context.Request.Path)
+            && context.GetEndpoint()?.Metadata.GetMetadata<NoIdempotencyMetadata>() is null
             && context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") && (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 128))
         {
             await Error(context, 400, "IDEMPOTENCY_KEY_REQUIRED");
@@ -291,11 +292,11 @@ v1.MapPost("/members/lookup/phone", async (HttpContext c, PhoneMemberLookupReque
 v1.MapPost("/auth/phone/verifications", async (HttpContext c, PhoneVerificationStartRequest body, ICoreService s, CancellationToken ct) =>
     Results.Accepted(value: await s.StartPhoneVerificationAsync(body, Idempotency(c), ct)))
     .RequireRateLimiting(phoneSendRateLimit)
-    .WithName("StartPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationStartResponse>(202).Produces(429);
+    .WithName("StartPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationStartResponse>(202).Produces(422).Produces(429).Produces(503);
 v1.MapPost("/auth/phone/verification-checks", async (HttpContext c, PhoneVerificationCheckRequest body, ICoreService s, CancellationToken ct) =>
     Results.Ok(await s.CheckPhoneVerificationAsync(body, Idempotency(c), ct)))
     .RequireRateLimiting(phoneCheckRateLimit)
-    .WithName("CheckPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationCheckResponse>(200).Produces(429);
+    .WithName("CheckPhoneVerification").WithTags("Phone authentication").Produces<PhoneVerificationCheckResponse>(200).Produces(429).Produces(503);
 var profileV1 = memberV1.MapGroup("/me/profile");
 profileV1.AddEndpointFilter(async (invocationContext, next) =>
 {
@@ -582,6 +583,8 @@ static async Task Error(HttpContext context, int status, string code, Exception?
         "MEMBER_NOT_REGISTERED" => "The member must be registered by the identity service before profile onboarding.",
         "MEMBER_IDENTITY_ALREADY_REGISTERED" => "This email or phone number already belongs to a member; sign in instead.",
         "MEMBER_IDENTITY_REVOKED" => "This email or phone number has been revoked and can't be used to sign in.",
+        "PHONE_VERIFICATION_RECIPIENT_NOT_ALLOWED" => "This phone number cannot receive a verification code in the current environment.",
+        "PHONE_VERIFICATION_CONFIGURATION_ERROR" or "PHONE_VERIFICATION_UNAVAILABLE" => "Phone verification is temporarily unavailable.",
         "RESOURCE_REFERENCE_NOT_FOUND" => "A referenced resource does not exist.",
         "RESOURCE_VERSION_CONFLICT" => "The resource changed since it was read.",
         "INTERNAL_ERROR" => "The request could not be completed.",
@@ -611,5 +614,5 @@ public partial class Program { }
 internal sealed class MemberContextMetadata { }
 internal sealed class OptionalMemberContextMetadata { }
 internal sealed class IfMatchMetadata { }
-// A POST that changes nothing stored, so it needs no Idempotency-Key.
+// A replay-safe POST that intentionally does not require an Idempotency-Key.
 internal sealed class NoIdempotencyMetadata { }

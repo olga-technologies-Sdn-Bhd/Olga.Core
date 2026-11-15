@@ -3,6 +3,9 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Olga.Core.Application;
+using Olga.Core.Contracts;
 using Olga.Core.Infrastructure;
 
 namespace Olga.Core.Tests;
@@ -111,6 +114,23 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
 
         var adminMatchingPolicy = Operation(document, "/v1/admin/events/{eventId}/matching-policy", "put");
         AssertHeader(adminMatchingPolicy, "Idempotency-Key", required: true, maxLength: 128);
+    }
+
+    [Fact]
+    public async Task Invitation_open_does_not_require_an_idempotency_key_at_runtime()
+    {
+        var invitation = new InvitationPreviewResponse("inv_test", "mem_owner", "Owner", null, "OPENED", DateTimeOffset.UtcNow);
+        using var client = factory.WithWebHostBuilder(builder => builder.ConfigureServices(services =>
+        {
+            services.RemoveAll<ISocialCapitalService>();
+            services.AddSingleton<ISocialCapitalService>(new OpenInvitationServiceStub(invitation));
+        })).CreateClient();
+
+        using var response = await client.PostAsync($"/v1/invitations/{new string('a', 64)}/open", null);
+
+        response.EnsureSuccessStatusCode();
+        using var body = JsonDocument.Parse(await response.Content.ReadAsStreamAsync());
+        Assert.Equal(invitation.InvitationId, body.RootElement.GetProperty("invitation_id").GetString());
     }
 
     [Fact]
@@ -246,5 +266,25 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         Assert.DoesNotContain(parameters.EnumerateArray(), parameter =>
             parameter.GetProperty("in").GetString() == "header"
             && string.Equals(parameter.GetProperty("name").GetString(), name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private sealed class OpenInvitationServiceStub(InvitationPreviewResponse response) : ISocialCapitalService
+    {
+        public Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct) => Task.FromResult(response);
+        public Task<VentureResponse> CreateVentureAsync(string ownerMemberId, VentureCreateRequest request, CancellationToken ct) => throw new NotSupportedException();
+        public Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<VentureResponse> GetVentureAsync(string ownerMemberId, string ventureId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, ContactImportRequest request, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InviteBatchDetailResponse> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, InvitationResendRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct) => throw new NotSupportedException();
+        public Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct) => throw new NotSupportedException();
     }
 }
