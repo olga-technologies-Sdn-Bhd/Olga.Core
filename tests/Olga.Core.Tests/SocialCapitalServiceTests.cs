@@ -127,7 +127,7 @@ public sealed class SocialCapitalServiceTests
         public Task<InvitationPreviewResponse> OpenInvitationAsync(string viewerMemberId, string token, CancellationToken ct)
         { Calls.Add(("OpenInvitation", viewerMemberId, token)); return Task.FromResult(new InvitationPreviewResponse(InvitationId, Owner, "Owner", null, "OPENED", Now)); }
         public Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct)
-        { Calls.Add(("AcceptPendingInvitation", recipientMemberId, invitationId)); return Task.FromResult(new InvitationAcceptResponse(invitationId, "conn", "chat", "link")); }
+        { Calls.Add(("AcceptPendingInvitation", recipientMemberId, invitationId)); return Task.FromResult(new InvitationAcceptResponse(invitationId, "request", "REQUEST_PENDING", "link")); }
 
         public Task<VentureResponse> CreateVentureAsync(string ownerMemberId, VentureCreateRequest request, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<VentureResponse>> ListVenturesAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
@@ -135,12 +135,23 @@ public sealed class SocialCapitalServiceTests
         public Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, IReadOnlyList<ProtectedContactImport> contacts, int retentionDays, CancellationToken ct) => throw new NotSupportedException();
         public Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
-        public Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciContactPage> GetSciAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
         public Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciReachOutPage> GetReachOutAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<RelationshipOutcomeResponse> CreateOutcomeAsync(string memberId, RelationshipOutcomeCreateRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task<RelationshipOutcomeResponse> DecideOutcomeAsync(string memberId, string outcomeId, RelationshipOutcomeDecisionRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task<IReadOnlyList<PendingInvitationResponse>> ListPendingInvitationsAsync(string memberId, CancellationToken ct) => throw new NotSupportedException();
         public Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct)
         { Calls.Add(("RevokeInvitation", ownerMemberId, invitationId)); return Task.CompletedTask; }
         public Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct)
         { Calls.Add(("DeleteContact", ownerMemberId, linkId)); return Task.CompletedTask; }
+        public Task RemoveConnectionAsync(string memberId, string connectionId, CancellationToken ct)
+        { Calls.Add(("RemoveConnection", memberId, connectionId)); return Task.CompletedTask; }
+        public Task<MemberDiscoveryPreferenceResponse> GetDiscoveryPreferenceAsync(string memberId, CancellationToken ct) =>
+            Task.FromResult(new MemberDiscoveryPreferenceResponse(false,false,"\"0\"",Now));
+        public Task<MemberDiscoveryPreferenceResponse> SaveDiscoveryPreferenceAsync(string memberId, MemberDiscoveryPreferenceRequest request, string expectedETag, CancellationToken ct) =>
+            Task.FromResult(new MemberDiscoveryPreferenceResponse(request.FindByPhone,request.FindByEmail,"\"1\"",Now));
+        public Task<InAppNotificationPage> GetInAppNotificationsAsync(string memberId,string? cursor,int limit,CancellationToken ct) =>
+            Task.FromResult(new InAppNotificationPage([],null));
     }
 }

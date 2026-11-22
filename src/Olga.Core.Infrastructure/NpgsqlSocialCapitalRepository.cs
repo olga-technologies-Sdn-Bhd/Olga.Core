@@ -80,14 +80,36 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        var importedLinkIds = new List<string>(contacts.Count);
         foreach (var item in contacts)
         {
+            await using (var suppression = new NpgsqlCommand("""
+                SELECT EXISTS (
+                    SELECT 1 FROM social.contact_suppression
+                    WHERE hash_key_version='identity-v1'
+                      AND ((identifier_type='EMAIL' AND identifier_hash=@email_hash)
+                        OR (identifier_type='PHONE' AND identifier_hash=@phone_hash)))
+                """, connection, transaction))
+            {
+                suppression.Parameters.Add("email_hash", NpgsqlDbType.Char).Value = item.EmailHash is null ? DBNull.Value : item.EmailHash;
+                suppression.Parameters.Add("phone_hash", NpgsqlDbType.Char).Value = item.PhoneHash is null ? DBNull.Value : item.PhoneHash;
+                if (Convert.ToBoolean(await suppression.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture)) continue;
+            }
             long recordPk;
             await using (var command = new NpgsqlCommand("""
-                INSERT INTO social.contact_record (contact_record_id, owner_member_id, label_ciphertext, source_type, expires_at)
-                VALUES (@contact_record_id, @owner_member_id, @label_ciphertext, 'PHONE', CURRENT_TIMESTAMP + make_interval(days => @retention_days))
+                INSERT INTO social.contact_record (
+                    contact_record_id, owner_member_id, label_ciphertext, job_title_ciphertext,
+                    company_ciphertext, industry_ciphertext, city_ciphertext, source_type, expires_at)
+                VALUES (
+                    @contact_record_id, @owner_member_id, @label_ciphertext, @job_title_ciphertext,
+                    @company_ciphertext, @industry_ciphertext, @city_ciphertext, 'PHONE',
+                    CURRENT_TIMESTAMP + make_interval(days => @retention_days))
                 ON CONFLICT (contact_record_id) DO UPDATE SET
                     label_ciphertext = EXCLUDED.label_ciphertext,
+                    job_title_ciphertext = EXCLUDED.job_title_ciphertext,
+                    company_ciphertext = EXCLUDED.company_ciphertext,
+                    industry_ciphertext = EXCLUDED.industry_ciphertext,
+                    city_ciphertext = EXCLUDED.city_ciphertext,
                     last_refreshed_at = CURRENT_TIMESTAMP,
                     expires_at = EXCLUDED.expires_at
                 WHERE social.contact_record.owner_member_id = EXCLUDED.owner_member_id
@@ -96,6 +118,10 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
             {
                 Add(command, "contact_record_id", item.ContactRecordId); Add(command, "owner_member_id", ownerMemberId);
                 command.Parameters.Add("label_ciphertext", NpgsqlDbType.Bytea).Value = item.LabelCiphertext;
+                AddNullableBytea(command, "job_title_ciphertext", item.JobTitleCiphertext);
+                AddNullableBytea(command, "company_ciphertext", item.CompanyCiphertext);
+                AddNullableBytea(command, "industry_ciphertext", item.IndustryCiphertext);
+                AddNullableBytea(command, "city_ciphertext", item.CityCiphertext);
                 command.Parameters.AddWithValue("retention_days", retentionDays);
                 recordPk = Convert.ToInt64(await command.ExecuteScalarAsync(ct) ?? throw new DomainException("CONTACT_ID_CONFLICT", 409), CultureInfo.InvariantCulture);
             }
@@ -103,7 +129,7 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
             await UpsertIdentifierAsync(connection, transaction, recordPk, ownerMemberId, "PHONE", item.PhoneHash, ct);
             await using var link = new NpgsqlCommand("""
                 INSERT INTO social.contact_link (link_id, owner_member_id, contact_record_pk, origin_type, lifecycle_state)
-                VALUES (@link_id, @owner_member_id, @contact_record_pk, 'IMPORT', 'IMPORTED')
+                VALUES (@link_id, @owner_member_id, @contact_record_pk, 'IMPORT', 'ESTIMATED')
                 ON CONFLICT (link_id) DO NOTHING
                 """, connection, transaction);
             Add(link, "link_id", item.LinkId); Add(link, "owner_member_id", ownerMemberId); link.Parameters.AddWithValue("contact_record_pk", recordPk);
@@ -113,9 +139,10 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
                 Add(ownerCheck, "link_id", item.LinkId); Add(ownerCheck, "owner_member_id", ownerMemberId); ownerCheck.Parameters.AddWithValue("contact_record_pk", recordPk);
                 if (Convert.ToInt32(await ownerCheck.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) != 1) throw new DomainException("CONTACT_LINK_ID_CONFLICT", 409);
             }
+            importedLinkIds.Add(item.LinkId);
         }
         await transaction.CommitAsync(ct);
-        return new(contacts.Count, contacts.Select(x => x.LinkId).ToArray());
+        return new(importedLinkIds.Count, importedLinkIds);
     }
 
     public async Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct)
@@ -163,6 +190,16 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
                 Add(replay, "batch_id", request.BatchId); Add(replay, "owner_member_id", ownerMemberId); Add(replay, "link_id", request.LinkIds[index]); Add(replay, "token_hash", tokenHash);
                 if (Convert.ToInt32(await replay.ExecuteScalarAsync(ct), CultureInfo.InvariantCulture) != 1) throw new DomainException("INVITE_BATCH_LINK_INVALID", 409);
             }
+            await using (var markInvited = new NpgsqlCommand("""
+                UPDATE social.contact_link
+                SET lifecycle_state='INVITED', last_transition_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                WHERE link_id=@link_id AND owner_member_id=@owner_member_id AND lifecycle_state='ESTIMATED'
+                """, connection, transaction))
+            {
+                Add(markInvited, "link_id", request.LinkIds[index]);
+                Add(markInvited, "owner_member_id", ownerMemberId);
+                await markInvited.ExecuteNonQueryAsync(ct);
+            }
             invitations.Add(new(invitationId, request.LinkIds[index], token, expiresAt));
         }
         await transaction.CommitAsync(ct);
@@ -179,12 +216,12 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
 
     private async Task<InvitationAcceptResponse> AcceptAsync(string recipientMemberId, string lookupFilter, string lookup, string idempotencyKey, CancellationToken ct)
     {
+        _ = idempotencyKey; // Validated by the application service; the invitation-derived request ID makes retries stable.
         await using var connection = await dataSource.OpenConnectionAsync(ct);
         await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
         string invitationId, senderMemberId, linkId;
-        long? venturePk;
         await using (var read = new NpgsqlCommand($"""
-            SELECT i.invitation_id, i.owner_member_id, l.link_id, b.venture_pk
+            SELECT i.invitation_id, i.owner_member_id, l.link_id
             FROM social.invitation i
             JOIN social.invite_batch b ON b.invite_batch_pk=i.invite_batch_pk
             JOIN social.contact_link l ON l.contact_link_pk=i.contact_link_pk
@@ -197,116 +234,111 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
             Add(read, "lookup", lookup); Add(read, "recipient_member_id", recipientMemberId);
             await using var reader = await read.ExecuteReaderAsync(ct);
             if (!await reader.ReadAsync(ct)) throw new DomainException("INVITATION_NOT_FOUND", 404);
-            invitationId=reader.GetString(0); senderMemberId=reader.GetString(1); linkId=reader.GetString(2); venturePk=reader.IsDBNull(3)?null:reader.GetInt64(3);
+            invitationId=reader.GetString(0); senderMemberId=reader.GetString(1); linkId=reader.GetString(2);
         }
         if (senderMemberId == recipientMemberId) throw new DomainException("INVITATION_SELF_ACCEPT_INVALID", 409);
         var requestId = StableId("ireq", $"{invitationId}:{recipientMemberId}");
-        var connectionId = StableId("conn", $"{invitationId}:{recipientMemberId}");
-        var conversationId = StableId("chat", $"{invitationId}:{recipientMemberId}");
-        var requestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{invitationId}\n{recipientMemberId}"))).ToLowerInvariant();
         await using (var request = new NpgsqlCommand("""
             INSERT INTO social.connection_request (connection_request_id,sender_member_id,recipient_member_id,context_id,status,expires_at)
             VALUES (@request_id,@sender_member_id,@recipient_member_id,'SCI_INVITATION','PENDING',CURRENT_TIMESTAMP + interval '1 day')
             ON CONFLICT (connection_request_id) DO NOTHING
             """, connection, transaction))
-        { Add(request,"request_id",requestId); Add(request,"sender_member_id",senderMemberId); Add(request,"recipient_member_id",recipientMemberId); await request.ExecuteNonQueryAsync(ct); }
-        await using (var accept = new NpgsqlCommand("SELECT * FROM social.accept_connection_request(@request_id,@recipient_member_id,@connection_id,@conversation_id,@idempotency_key,@request_hash,CURRENT_TIMESTAMP + interval '1 day',CURRENT_TIMESTAMP + interval '30 days')", connection, transaction))
-        {
-            Add(accept,"request_id",requestId); Add(accept,"recipient_member_id",recipientMemberId); Add(accept,"connection_id",connectionId); Add(accept,"conversation_id",conversationId);
-            Add(accept,"idempotency_key",idempotencyKey); Add(accept,"request_hash",requestHash); await accept.ExecuteNonQueryAsync(ct);
-        }
+        { Add(request,"request_id",requestId); Add(request,"sender_member_id",recipientMemberId); Add(request,"recipient_member_id",senderMemberId); await request.ExecuteNonQueryAsync(ct); }
         await using (var update = new NpgsqlCommand("""
             UPDATE social.invitation i SET status='ACCEPTED', accepted_at=COALESCE(accepted_at,CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP
             FROM social.contact_link l
             WHERE i.invitation_id=@invitation_id AND l.contact_link_pk=i.contact_link_pk
               AND (l.contact_member_id IS NULL OR l.contact_member_id=@recipient_member_id);
-            UPDATE social.contact_link l SET contact_member_id=@recipient_member_id, connection_id=@connection_id,
-              lifecycle_state='CONNECTED', consent_at=COALESCE(consent_at,CURRENT_TIMESTAMP), joined_at=COALESCE(joined_at,CURRENT_TIMESTAMP),
+            UPDATE social.contact_link l SET contact_member_id=@recipient_member_id,
+              lifecycle_state='JOINED', joined_at=COALESCE(joined_at,CURRENT_TIMESTAMP),
               last_transition_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
             FROM social.invitation i WHERE i.invitation_id=@invitation_id AND i.contact_link_pk=l.contact_link_pk
-              AND (l.contact_member_id IS NULL OR l.contact_member_id=@recipient_member_id);
+              AND (l.contact_member_id IS NULL OR l.contact_member_id=@recipient_member_id)
+              AND l.lifecycle_state IN ('INVITED','JOINED','REQUEST_PENDING');
+            UPDATE social.contact_link l SET lifecycle_state='REQUEST_PENDING',
+              last_transition_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+            FROM social.invitation i WHERE i.invitation_id=@invitation_id AND i.contact_link_pk=l.contact_link_pk
+              AND l.contact_member_id=@recipient_member_id AND l.lifecycle_state='JOINED';
             """, connection, transaction))
-        { Add(update,"invitation_id",invitationId); Add(update,"recipient_member_id",recipientMemberId); Add(update,"connection_id",connectionId); await update.ExecuteNonQueryAsync(ct); }
-        if (venturePk is not null)
-        {
-            await using var enqueue = new NpgsqlCommand("""
-                SELECT nlp.enqueue_sci_scoring_job(@job_id, v.owner_member_id, v.venture_id, @recipient_member_id, 'INVITATION_ACCEPTED', @dedupe_key, CURRENT_TIMESTAMP)
-                FROM core.venture v WHERE v.venture_pk=@venture_pk
-                """, connection, transaction);
-            Add(enqueue,"job_id",StableId("sci",invitationId)); Add(enqueue,"recipient_member_id",recipientMemberId); Add(enqueue,"dedupe_key",$"invitation-accepted:{invitationId}"); enqueue.Parameters.AddWithValue("venture_pk",venturePk.Value);
-            await enqueue.ExecuteNonQueryAsync(ct);
-        }
+        { Add(update,"invitation_id",invitationId); Add(update,"recipient_member_id",recipientMemberId); await update.ExecuteNonQueryAsync(ct); }
         await transaction.CommitAsync(ct);
-        return new(invitationId,connectionId,conversationId,linkId);
+        return new(invitationId,requestId,"REQUEST_PENDING",linkId);
     }
 
-    public async Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct)
+    public async Task<SciContactPage> GetSciAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct)
     {
-        var (afterScore, afterPk) = DecodeCursor(cursor);
+        var (afterScore, afterProjectionId) = DecodeSciCursor(cursor);
         await using var command = dataSource.CreateCommand("""
-            SELECT contact_link_pk, link_id, contact_member_id, contact_record_id, label_ciphertext,
-                   calibrated_score, relationship_role, competitor_overlay, is_stale, origin_type, scored_at, score_row_version
-            FROM social.vw_sci_contact
-            WHERE owner_member_id=@owner_member_id AND venture_id=@venture_id
-              AND (@after_score IS NULL OR (calibrated_score, contact_link_pk) < (@after_score, @after_pk))
-            ORDER BY calibrated_score DESC, contact_link_pk DESC
+            SELECT projection_id, link_id, contact_member_id, contact_record_id, label_ciphertext,
+                   lifecycle_state, match_score, band, is_estimated, counts_in_sci, counts_in_potential,
+                   projection_state, frozen_at, freeze_reason, layer_code, layer_ordinal, outcome_points,
+                   tie_strength, reason_code, scorer_version, scoring_config_id, score_calculated_at,
+                   last_activity_at, projection_version, as_of, row_version
+            FROM social.vw_sci_contact_v2
+            WHERE owner_member_id=@owner_member_id
+              AND (@after_score IS NULL OR (COALESCE(match_score,-1), projection_id) < (@after_score, @after_projection_id))
+            ORDER BY COALESCE(match_score,-1) DESC, projection_id DESC
             LIMIT @take
             """);
-        Add(command, "owner_member_id", ownerMemberId); Add(command, "venture_id", ventureId);
-        command.Parameters.Add("after_score", NpgsqlDbType.Numeric).Value = afterScore is null ? DBNull.Value : afterScore.Value;
-        command.Parameters.AddWithValue("after_pk", afterPk); command.Parameters.AddWithValue("take", limit + 1);
-        var rows = new List<(long Pk, decimal Score, SciContactResponse Value)>();
+        Add(command, "owner_member_id", ownerMemberId);
+        command.Parameters.Add("after_score", NpgsqlDbType.Integer).Value = afterScore is null ? DBNull.Value : afterScore.Value;
+        Add(command, "after_projection_id", afterProjectionId);
+        command.Parameters.AddWithValue("take", limit + 1);
+        var rows = new List<(string ProjectionId, int ScoreKey, SciContactResponse Value)>();
         await using var reader = await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
         {
-            var recordId = reader.GetString(3); var ciphertext = reader.GetFieldValue<byte[]>(4); var score = reader.GetDecimal(5); var pk = reader.GetInt64(0);
-            rows.Add((pk, score, new(reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2),
-                identityProtector.UnprotectContactLabel(ownerMemberId, recordId, ciphertext), score, reader.GetString(6), reader.GetBoolean(7), reader.GetBoolean(8),
-                reader.GetString(9), reader.GetFieldValue<DateTimeOffset>(10), $"\"{reader.GetInt64(11):x}\"")));
+            var recordId = reader.GetString(3);
+            var score = reader.IsDBNull(6) ? (int?)null : reader.GetInt16(6);
+            rows.Add((reader.GetString(0), score ?? -1, new(
+                reader.GetString(1), NullableString(reader, 2),
+                identityProtector.UnprotectContactLabel(ownerMemberId, recordId, reader.GetFieldValue<byte[]>(4)),
+                reader.GetString(5), score, reader.GetString(7), reader.GetBoolean(8), reader.GetBoolean(9), reader.GetBoolean(10),
+                reader.GetString(11), reader.IsDBNull(12) ? null : reader.GetFieldValue<DateTimeOffset>(12), NullableString(reader, 13),
+                NullableString(reader, 14), reader.IsDBNull(15) ? null : reader.GetInt16(15), reader.GetDecimal(16), reader.GetDecimal(17),
+                NullableString(reader, 18), NullableString(reader, 19), NullableString(reader, 20),
+                reader.IsDBNull(21) ? null : reader.GetFieldValue<DateTimeOffset>(21), reader.IsDBNull(22) ? null : reader.GetFieldValue<DateTimeOffset>(22),
+                reader.GetInt64(23), reader.GetFieldValue<DateTimeOffset>(24), $"\"{reader.GetInt64(25):x}\"")));
         }
         var page = rows.Take(limit).ToArray();
-        return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodeCursor(page[^1].Score, page[^1].Pk) : null);
+        return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodeSciCursor(page[^1].ScoreKey, page[^1].ProjectionId) : null);
     }
 
     public async Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct)
     {
         await using var connection = await dataSource.OpenConnectionAsync(ct);
-        var ventures = new List<SciVentureSummary>();
-        await using (var perVenture = new NpgsqlCommand("""
-            SELECT v.venture_id, v.name, count(s.contact_link_pk)::int, max(s.calibrated_score), round(avg(s.calibrated_score), 2),
-                   (count(*) FILTER (WHERE s.is_stale))::int, max(s.scored_at)
-            FROM core.venture v
-            LEFT JOIN social.vw_sci_contact s ON s.owner_member_id=v.owner_member_id AND s.venture_id=v.venture_id
-            WHERE v.owner_member_id=@owner_member_id
-            GROUP BY v.venture_pk
-            ORDER BY v.updated_at DESC, v.venture_pk DESC
+        string? goalId = null; int sciCount = 0, goalValue = 0, goalSequence = 0; string? goalOwnerType = null;
+        DateTimeOffset? goalTargetAt = null;
+        SciSummaryResponse summary;
+        await using (var command = new NpgsqlCommand("SELECT * FROM social.vw_sci_summary_v2 WHERE owner_member_id=@owner_member_id", connection))
+        {
+            Add(command, "owner_member_id", ownerMemberId);
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return new(0, 0, 0, 0, 0, 0, 0, 0, "RECALCULATING", 0, null, null, DateTimeOffset.UtcNow, null, "\"0\"");
+            sciCount = reader.GetInt32(1); goalId = NullableString(reader, 9);
+            goalValue = reader.IsDBNull(10) ? 0 : reader.GetInt32(10);
+            goalSequence = reader.IsDBNull(11) ? 0 : reader.GetInt32(11);
+            goalOwnerType = NullableString(reader, 13);
+            goalTargetAt = reader.IsDBNull(14) ? null : reader.GetFieldValue<DateTimeOffset>(14);
+            summary = new(sciCount, reader.GetInt32(2), reader.GetInt32(3), reader.GetInt32(4), reader.GetInt32(5), reader.GetInt32(6),
+                reader.GetInt32(7), reader.GetInt32(8), reader.GetString(16), reader.GetInt64(17), NullableString(reader, 18),
+                NullableString(reader, 19), reader.GetFieldValue<DateTimeOffset>(20), null, $"\"{reader.GetInt64(21):x}\"");
+        }
+        if (goalId is null) return summary;
+        var milestones = new List<SciGoalMilestoneResponse>();
+        await using (var command = new NpgsqlCommand("""
+            SELECT m.milestone_percent, m.reached_at
+            FROM social.sci_goal_milestone m JOIN social.sci_goal g ON g.sci_goal_pk=m.sci_goal_pk
+            WHERE g.goal_id=@goal_id ORDER BY m.milestone_percent
             """, connection))
         {
-            Add(perVenture, "owner_member_id", ownerMemberId);
-            await using var reader = await perVenture.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                ventures.Add(new(reader.GetString(0), reader.GetString(1), reader.GetInt32(2), NullableDecimal(reader, 3), NullableDecimal(reader, 4),
-                    reader.GetInt32(5), reader.IsDBNull(6) ? null : reader.GetFieldValue<DateTimeOffset>(6)));
+            Add(command, "goal_id", goalId);
+            await using var reader = await command.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct)) milestones.Add(new(reader.GetInt16(0), reader.GetFieldValue<DateTimeOffset>(1)));
         }
-        // One contact can sit in several ventures' SCI; the totals count each contact once, at its best score.
-        await using var totals = new NpgsqlCommand("""
-            WITH best AS (
-                SELECT contact_link_pk, max(calibrated_score) AS score, max(scored_at) AS scored_at
-                FROM social.vw_sci_contact WHERE owner_member_id=@owner_member_id
-                GROUP BY contact_link_pk)
-            SELECT count(*)::int,
-                   (count(*) FILTER (WHERE score >= 10 AND score < 25))::int,
-                   (count(*) FILTER (WHERE score >= 25 AND score < 50))::int,
-                   (count(*) FILTER (WHERE score >= 50 AND score < 75))::int,
-                   (count(*) FILTER (WHERE score >= 75))::int,
-                   round(avg(score), 2), max(scored_at)
-            FROM best
-            """, connection);
-        Add(totals, "owner_member_id", ownerMemberId);
-        await using var total = await totals.ExecuteReaderAsync(ct);
-        await total.ReadAsync(ct);
-        return new(ventures.Count, total.GetInt32(0), new(total.GetInt32(1), total.GetInt32(2), total.GetInt32(3), total.GetInt32(4)),
-            NullableDecimal(total, 5), total.IsDBNull(6) ? null : total.GetFieldValue<DateTimeOffset>(6), ventures);
+        var progress = goalValue <= 0 ? 0 : Math.Min(100, (int)((long)sciCount * 100 / goalValue));
+        return summary with { Goal = new(goalId, goalValue, goalSequence, goalOwnerType!, progress, goalTargetAt, milestones) };
     }
 
     public async Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct)
@@ -345,6 +377,198 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         }
         var page = rows.Take(limit).ToArray();
         return new(page.Select(x => x.Value).ToArray(), rows.Count > limit ? EncodePkCursor(page[^1].Pk) : null);
+    }
+
+    public async Task<SciReachOutPage> GetReachOutAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct)
+    {
+        var afterRank = DecodePkCursor(cursor, "SCI_REACH_OUT_CURSOR_INVALID");
+        await using var command = dataSource.CreateCommand("""
+            SELECT recommendation.recommendation_id, link.link_id, link.contact_member_id,
+                   recommendation.reason_code, recommendation.match_score, recommendation.relevance_score,
+                   recommendation.rank, recommendation.projection_version, recommendation.generated_at,
+                   recommendation.expires_at
+            FROM social.sci_reach_out_projection recommendation
+            JOIN social.sci_member_state state ON state.owner_member_id=recommendation.owner_member_id
+              AND state.current_projection_version=recommendation.projection_version
+            JOIN social.contact_link link ON link.contact_link_pk=recommendation.contact_link_pk
+              AND link.owner_member_id=recommendation.owner_member_id
+            WHERE recommendation.owner_member_id=@owner_member_id
+              AND recommendation.status='ACTIVE' AND recommendation.expires_at>CURRENT_TIMESTAMP
+              AND (@after_rank=0 OR recommendation.rank>@after_rank)
+            ORDER BY recommendation.rank
+            LIMIT @take
+            """);
+        Add(command, "owner_member_id", ownerMemberId);
+        command.Parameters.AddWithValue("after_rank", afterRank);
+        command.Parameters.AddWithValue("take", limit + 1);
+        var rows = new List<SciReachOutResponse>();
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            rows.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
+                reader.GetInt16(4), reader.GetDecimal(5), reader.GetInt32(6), reader.GetInt64(7),
+                reader.GetFieldValue<DateTimeOffset>(8), reader.GetFieldValue<DateTimeOffset>(9)));
+        var page = rows.Take(limit).ToArray();
+        return new(page, rows.Count > limit ? EncodePkCursor(page[^1].Rank) : null);
+    }
+
+    public async Task<RelationshipOutcomeResponse> CreateOutcomeAsync(string memberId, RelationshipOutcomeCreateRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        _ = idempotencyKey; // The API idempotency middleware owns request replay; outcome_id is also unique.
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        await using (var command = new NpgsqlCommand("""
+            INSERT INTO social.relationship_outcome (
+                outcome_id, outcome_type, status, initiated_by_member_id,
+                occurred_at, confirmation_due_at, result_type)
+            SELECT @outcome_id, @outcome_type, 'PENDING', @member_id, @occurred_at,
+                   @occurred_at + CASE @outcome_type
+                       WHEN 'MEETING' THEN interval '7 days'
+                       WHEN 'INTRODUCTION' THEN interval '14 days'
+                       ELSE interval '30 days' END,
+                   @result_type
+            WHERE EXISTS (
+                SELECT 1 FROM social.contact_link link
+                JOIN social.connection connection ON connection.connection_id=link.connection_id AND connection.status='ACTIVE'
+                WHERE link.owner_member_id=@member_id AND link.contact_member_id=@contact_member_id
+                  AND link.lifecycle_state='CONNECTED')
+              AND NOT EXISTS (
+                SELECT 1 FROM social.member_block block WHERE block.removed_at IS NULL
+                  AND ((block.blocker_member_id=@member_id AND block.blocked_member_id=@contact_member_id)
+                    OR (block.blocker_member_id=@contact_member_id AND block.blocked_member_id=@member_id)))
+            ON CONFLICT (outcome_id) DO NOTHING
+            """, connection, transaction))
+        {
+            Add(command, "outcome_id", request.OutcomeId); Add(command, "outcome_type", request.OutcomeType);
+            Add(command, "member_id", memberId); Add(command, "contact_member_id", request.ContactMemberId);
+            Add(command, "result_type", request.ResultType);
+            command.Parameters.AddWithValue("occurred_at", request.OccurredAt);
+            await command.ExecuteNonQueryAsync(ct);
+        }
+        await using (var parties = new NpgsqlCommand("""
+            INSERT INTO social.relationship_outcome_party (relationship_outcome_pk, member_id, party_role)
+            SELECT outcome.relationship_outcome_pk, party.member_id, party.party_role
+            FROM social.relationship_outcome outcome
+            CROSS JOIN (VALUES (@member_id::varchar,'INITIATOR'::varchar),(@contact_member_id::varchar,'PARTICIPANT'::varchar)) party(member_id,party_role)
+            WHERE outcome.outcome_id=@outcome_id AND outcome.initiated_by_member_id=@member_id
+            ON CONFLICT (relationship_outcome_pk, member_id, party_role) DO NOTHING
+            """, connection, transaction))
+        {
+            Add(parties, "outcome_id", request.OutcomeId); Add(parties, "member_id", memberId); Add(parties, "contact_member_id", request.ContactMemberId);
+            await parties.ExecuteNonQueryAsync(ct);
+        }
+        if (request.OutcomeType == "INTRODUCTION")
+        {
+            await using var notify = new NpgsqlCommand("""
+                INSERT INTO ops.outbox_event (outbox_event_id,aggregate_type,aggregate_id,event_type,payload_json)
+                VALUES ('out_'||substr(md5(@outcome_id||':introduction'),1,32),'RELATIONSHIP_OUTCOME',@outcome_id,
+                        'RelationshipIntroductionRequested.v1',
+                        jsonb_build_object('outcome_id',@outcome_id,'sender_member_id',@member_id,'recipient_member_id',@contact_member_id))
+                ON CONFLICT (outbox_event_id) DO NOTHING
+                """, connection, transaction);
+            Add(notify,"outcome_id",request.OutcomeId); Add(notify,"member_id",memberId); Add(notify,"contact_member_id",request.ContactMemberId);
+            await notify.ExecuteNonQueryAsync(ct);
+        }
+        var response = await ReadOutcomeAsync(connection, transaction, request.OutcomeId, memberId, ct)
+            ?? throw new DomainException("RELATIONSHIP_OUTCOME_NOT_ALLOWED", 409);
+        if (response.ContactMemberId != request.ContactMemberId || response.OutcomeType != request.OutcomeType || response.OccurredAt != request.OccurredAt)
+            throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+        await transaction.CommitAsync(ct);
+        return response;
+    }
+
+    public async Task<RelationshipOutcomeResponse> DecideOutcomeAsync(string memberId, string outcomeId, RelationshipOutcomeDecisionRequest request, string idempotencyKey, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        string status; DateTimeOffset due; DateTimeOffset? withdrawalDue;
+        await using (var read = new NpgsqlCommand("""
+            SELECT outcome.status, outcome.confirmation_due_at, outcome.withdrawal_due_at
+            FROM social.relationship_outcome outcome
+            WHERE outcome.outcome_id=@outcome_id
+              AND EXISTS (SELECT 1 FROM social.relationship_outcome_party party
+                          WHERE party.relationship_outcome_pk=outcome.relationship_outcome_pk AND party.member_id=@member_id)
+            FOR UPDATE
+            """, connection, transaction))
+        {
+            Add(read, "outcome_id", outcomeId); Add(read, "member_id", memberId);
+            await using var reader = await read.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct)) throw new DomainException("RELATIONSHIP_OUTCOME_NOT_FOUND", 404);
+            status=reader.GetString(0); due=reader.GetFieldValue<DateTimeOffset>(1); withdrawalDue=reader.IsDBNull(2)?null:reader.GetFieldValue<DateTimeOffset>(2);
+        }
+        await using (var replay = new NpgsqlCommand("""
+            SELECT decision FROM social.relationship_outcome_confirmation
+            WHERE actor_type='MEMBER' AND actor_member_id=@member_id AND idempotency_key=@idempotency_key
+            """, connection, transaction))
+        {
+            Add(replay, "member_id", memberId); Add(replay, "idempotency_key", idempotencyKey);
+            var prior = (string?)await replay.ExecuteScalarAsync(ct);
+            if (prior is not null && prior != request.Decision) throw new DomainException("IDEMPOTENCY_KEY_REUSED", 409);
+            if (prior is null)
+            {
+                if (request.Decision is "CONFIRM" or "DENY" && (status != "PENDING" || due < DateTimeOffset.UtcNow))
+                    throw new DomainException("RELATIONSHIP_OUTCOME_NOT_PENDING", 409);
+                if (request.Decision == "WITHDRAW" && (status != "VERIFIED" || withdrawalDue is null || withdrawalDue < DateTimeOffset.UtcNow))
+                    throw new DomainException("RELATIONSHIP_OUTCOME_WITHDRAWAL_CLOSED", 409);
+                await using var insert = new NpgsqlCommand("""
+                    INSERT INTO social.relationship_outcome_confirmation (
+                        confirmation_id, relationship_outcome_pk, actor_member_id,
+                        actor_type, decision, idempotency_key)
+                    SELECT @confirmation_id, relationship_outcome_pk, @member_id, 'MEMBER', @decision, @idempotency_key
+                    FROM social.relationship_outcome WHERE outcome_id=@outcome_id
+                    """, connection, transaction);
+                Add(insert, "confirmation_id", StableId("confirm", $"{memberId}:{idempotencyKey}"));
+                Add(insert, "outcome_id", outcomeId); Add(insert, "member_id", memberId);
+                Add(insert, "decision", request.Decision); Add(insert, "idempotency_key", idempotencyKey);
+                await insert.ExecuteNonQueryAsync(ct);
+            }
+        }
+        await using (var decide = new NpgsqlCommand("""
+            UPDATE social.relationship_outcome outcome
+            SET status=CASE
+                    WHEN @decision='DENY' THEN 'DENIED'
+                    WHEN @decision='WITHDRAW' THEN 'WITHDRAWN'
+                    WHEN 2 <= (SELECT count(DISTINCT confirmation.actor_member_id)
+                               FROM social.relationship_outcome_confirmation confirmation
+                               WHERE confirmation.relationship_outcome_pk=outcome.relationship_outcome_pk
+                                 AND confirmation.actor_type='MEMBER' AND confirmation.decision='CONFIRM') THEN 'VERIFIED'
+                    ELSE status END,
+                verified_at=CASE WHEN @decision='CONFIRM' AND 2 <= (
+                    SELECT count(DISTINCT confirmation.actor_member_id)
+                    FROM social.relationship_outcome_confirmation confirmation
+                    WHERE confirmation.relationship_outcome_pk=outcome.relationship_outcome_pk
+                      AND confirmation.actor_type='MEMBER' AND confirmation.decision='CONFIRM')
+                    THEN COALESCE(verified_at,CURRENT_TIMESTAMP) ELSE verified_at END,
+                withdrawal_due_at=CASE WHEN @decision='CONFIRM' AND 2 <= (
+                    SELECT count(DISTINCT confirmation.actor_member_id)
+                    FROM social.relationship_outcome_confirmation confirmation
+                    WHERE confirmation.relationship_outcome_pk=outcome.relationship_outcome_pk
+                      AND confirmation.actor_type='MEMBER' AND confirmation.decision='CONFIRM')
+                    THEN COALESCE(withdrawal_due_at,CURRENT_TIMESTAMP + interval '30 days') ELSE withdrawal_due_at END,
+                valid_until=CASE WHEN @decision='CONFIRM' AND 2 <= (
+                    SELECT count(DISTINCT confirmation.actor_member_id)
+                    FROM social.relationship_outcome_confirmation confirmation
+                    WHERE confirmation.relationship_outcome_pk=outcome.relationship_outcome_pk
+                      AND confirmation.actor_type='MEMBER' AND confirmation.decision='CONFIRM')
+                    THEN COALESCE(valid_until,CURRENT_TIMESTAMP + interval '12 months') ELSE valid_until END,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE outcome.outcome_id=@outcome_id;
+
+            UPDATE social.relationship_outcome_party party
+            SET points_awarded=CASE WHEN outcome.status='VERIFIED' THEN
+                    CASE outcome.outcome_type WHEN 'MEETING' THEN 1 WHEN 'INTRODUCTION' THEN 2 ELSE 3 END
+                ELSE 0 END
+            FROM social.relationship_outcome outcome
+            WHERE outcome.relationship_outcome_pk=party.relationship_outcome_pk AND outcome.outcome_id=@outcome_id
+            """, connection, transaction))
+        {
+            Add(decide, "decision", request.Decision); Add(decide, "outcome_id", outcomeId);
+            await decide.ExecuteNonQueryAsync(ct);
+        }
+        await ReprojectRelationshipsAsync(connection, transaction, outcomeId, ct);
+        var response = await ReadOutcomeAsync(connection, transaction, outcomeId, memberId, ct)
+            ?? throw new DomainException("RELATIONSHIP_OUTCOME_NOT_FOUND", 404);
+        await transaction.CommitAsync(ct);
+        return response;
     }
 
     public async Task<InviteBatchDetailResponse?> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct)
@@ -558,6 +782,150 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         await transaction.CommitAsync(ct);
     }
 
+    public async Task RemoveConnectionAsync(string memberId, string connectionId, CancellationToken ct)
+    {
+        await using var connection = await dataSource.OpenConnectionAsync(ct);
+        await using var transaction = await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, ct);
+        string? otherMemberId;
+        await using (var disconnect = new NpgsqlCommand("""
+            UPDATE social.connection SET status='DISCONNECTED',disconnected_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            WHERE connection_id=@connection_id AND status='ACTIVE' AND @member_id IN (member_low_id,member_high_id)
+            RETURNING CASE WHEN member_low_id=@member_id THEN member_high_id ELSE member_low_id END
+            """, connection, transaction))
+        {
+            Add(disconnect, "connection_id", connectionId); Add(disconnect, "member_id", memberId);
+            otherMemberId = (string?)await disconnect.ExecuteScalarAsync(ct);
+        }
+        if (otherMemberId is null)
+        {
+            await using var existing = new NpgsqlCommand("""
+                SELECT CASE WHEN member_low_id=@member_id THEN member_high_id ELSE member_low_id END
+                FROM social.connection
+                WHERE connection_id=@connection_id AND status='DISCONNECTED' AND @member_id IN (member_low_id,member_high_id)
+                """, connection, transaction);
+            Add(existing, "connection_id", connectionId); Add(existing, "member_id", memberId);
+            otherMemberId = (string?)await existing.ExecuteScalarAsync(ct);
+            if (otherMemberId is null) throw new DomainException("CONNECTION_NOT_FOUND", 404);
+        }
+
+        await using (var freeze = new NpgsqlCommand("""
+            INSERT INTO social.sci_relationship_history (
+              relationship_history_id,owner_member_id,subject_reference_id,former_contact_link_id,display_state,freeze_reason,
+              last_match_score,last_band,last_layer_code,last_layer_ordinal,last_outcome_points,last_activity_at,frozen_at)
+            SELECT 'history_'||substr(md5(link.owner_member_id||':'||link.contact_member_id),1,32),
+              link.owner_member_id,link.contact_member_id,link.link_id,'FROZEN','REMOVED',contact.match_score,contact.band,
+              relationship.layer_code,relationship.layer_ordinal,COALESCE(relationship.rolling_points,0),relationship.last_activity_at,CURRENT_TIMESTAMP
+            FROM social.contact_link link
+            LEFT JOIN social.sci_contact_projection contact ON contact.owner_member_id=link.owner_member_id AND contact.contact_link_pk=link.contact_link_pk
+            LEFT JOIN social.sci_relationship_projection relationship ON relationship.owner_member_id=link.owner_member_id AND relationship.contact_link_pk=link.contact_link_pk
+            WHERE (link.owner_member_id=@member_id AND link.contact_member_id=@other_member_id)
+               OR (link.owner_member_id=@other_member_id AND link.contact_member_id=@member_id)
+            ON CONFLICT (owner_member_id,subject_reference_id) DO UPDATE SET
+              former_contact_link_id=EXCLUDED.former_contact_link_id,display_state='FROZEN',freeze_reason='REMOVED',
+              last_match_score=EXCLUDED.last_match_score,last_band=EXCLUDED.last_band,last_layer_code=EXCLUDED.last_layer_code,
+              last_layer_ordinal=EXCLUDED.last_layer_ordinal,last_outcome_points=EXCLUDED.last_outcome_points,
+              last_activity_at=EXCLUDED.last_activity_at,frozen_at=EXCLUDED.frozen_at;
+
+            UPDATE social.contact_link SET lifecycle_state='REMOVED',history_frozen_at=CURRENT_TIMESTAMP,
+              history_freeze_reason='REMOVED',display_state='FROZEN',last_transition_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            WHERE (owner_member_id=@member_id AND contact_member_id=@other_member_id)
+               OR (owner_member_id=@other_member_id AND contact_member_id=@member_id);
+
+            UPDATE social.sci_contact_projection projection SET lifecycle_state='REMOVED',counts_in_sci=false,counts_in_potential=false,
+              projection_state='FROZEN',frozen_at=CURRENT_TIMESTAMP,freeze_reason='REMOVED',as_of=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            FROM social.contact_link link WHERE link.contact_link_pk=projection.contact_link_pk AND link.owner_member_id=projection.owner_member_id
+              AND ((link.owner_member_id=@member_id AND link.contact_member_id=@other_member_id)
+                OR (link.owner_member_id=@other_member_id AND link.contact_member_id=@member_id));
+
+            UPDATE social.sci_relationship_projection projection SET projection_status='FROZEN',frozen_at=CURRENT_TIMESTAMP,
+              freeze_reason='REMOVED',updated_at=CURRENT_TIMESTAMP
+            FROM social.contact_link link WHERE link.contact_link_pk=projection.contact_link_pk AND link.owner_member_id=projection.owner_member_id
+              AND ((link.owner_member_id=@member_id AND link.contact_member_id=@other_member_id)
+                OR (link.owner_member_id=@other_member_id AND link.contact_member_id=@member_id));
+
+            UPDATE social.sci_summary_projection summary SET sci_count=totals.sci_count,potential_count=totals.potential_count,
+              waitlist_count=totals.waitlist_count,repository_count=totals.repository_count,total_contact_count=totals.total_contact_count,
+              core_count=totals.core_count,as_of=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+            FROM (SELECT owner.owner_member_id,
+              count(contact.contact_link_pk) FILTER(WHERE contact.counts_in_sci)::int sci_count,
+              count(contact.contact_link_pk) FILTER(WHERE contact.band='NETWORK' AND NOT contact.counts_in_sci)::int potential_count,
+              count(contact.contact_link_pk) FILTER(WHERE contact.band='WAITLIST')::int waitlist_count,
+              count(contact.contact_link_pk) FILTER(WHERE contact.band='REPOSITORY')::int repository_count,
+              count(contact.contact_link_pk)::int total_contact_count,
+              count(contact.contact_link_pk) FILTER(WHERE contact.layer_ordinal=1)::int core_count
+              FROM (VALUES(@member_id),(@other_member_id)) owner(owner_member_id)
+              LEFT JOIN social.sci_contact_projection contact ON contact.owner_member_id=owner.owner_member_id AND contact.projection_state='ACTIVE'
+              GROUP BY owner.owner_member_id) totals WHERE summary.owner_member_id=totals.owner_member_id;
+            """, connection, transaction))
+        {
+            Add(freeze, "member_id", memberId); Add(freeze, "other_member_id", otherMemberId);
+            await freeze.ExecuteNonQueryAsync(ct);
+        }
+        await transaction.CommitAsync(ct);
+    }
+
+    public async Task<MemberDiscoveryPreferenceResponse> GetDiscoveryPreferenceAsync(string memberId, CancellationToken ct)
+    {
+        await using var command = dataSource.CreateCommand("""
+            SELECT find_by_phone,find_by_email,row_version,updated_at
+            FROM core.member_discovery_preference WHERE member_id=@member_id
+            """);
+        Add(command,"member_id",memberId);
+        await using var reader=await command.ExecuteReaderAsync(ct);
+        return await reader.ReadAsync(ct)
+            ? new(reader.GetBoolean(0),reader.GetBoolean(1),$"\"{reader.GetInt64(2):x}\"",reader.GetFieldValue<DateTimeOffset>(3))
+            : new(false,false,"\"0\"",DateTimeOffset.UnixEpoch);
+    }
+
+    public async Task<MemberDiscoveryPreferenceResponse> SaveDiscoveryPreferenceAsync(string memberId, MemberDiscoveryPreferenceRequest request, string expectedETag, CancellationToken ct)
+    {
+        var token=expectedETag.Trim().Trim('"');
+        if (!long.TryParse(token,NumberStyles.AllowHexSpecifier,CultureInfo.InvariantCulture,out var expectedVersion) || expectedVersion<0)
+            throw new DomainException("ETAG_MISMATCH",412);
+        var sql=expectedVersion==0 ? """
+            INSERT INTO core.member_discovery_preference(discovery_preference_id,member_id,find_by_phone,find_by_email)
+            VALUES('discovery_'||substr(md5(@member_id),1,32),@member_id,@find_by_phone,@find_by_email)
+            ON CONFLICT(member_id) DO NOTHING
+            RETURNING find_by_phone,find_by_email,row_version,updated_at
+            """ : """
+            UPDATE core.member_discovery_preference SET
+              find_by_phone=@find_by_phone,find_by_email=@find_by_email,updated_at=CURRENT_TIMESTAMP
+            WHERE member_id=@member_id AND row_version=@expected_version
+            RETURNING find_by_phone,find_by_email,row_version,updated_at
+            """;
+        await using var command=dataSource.CreateCommand(sql);
+        Add(command,"member_id",memberId);command.Parameters.AddWithValue("find_by_phone",request.FindByPhone);
+        command.Parameters.AddWithValue("find_by_email",request.FindByEmail);command.Parameters.AddWithValue("expected_version",expectedVersion);
+        await using var reader=await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) throw new DomainException("ETAG_MISMATCH",412);
+        return new(reader.GetBoolean(0),reader.GetBoolean(1),$"\"{reader.GetInt64(2):x}\"",reader.GetFieldValue<DateTimeOffset>(3));
+    }
+
+    public async Task<InAppNotificationPage> GetInAppNotificationsAsync(string memberId,string? cursor,int limit,CancellationToken ct)
+    {
+        var (afterCreatedAt,afterId)=DecodeNotificationCursor(cursor);
+        await using var command=dataSource.CreateCommand("""
+            SELECT notification_id,purpose_code,resource_type,resource_id,template_code,status,
+                   scheduled_at,expires_at,created_at,row_version
+            FROM notification.notification
+            WHERE member_id=@member_id AND channel='IN_APP' AND status<>'SUPPRESSED'
+              AND expires_at>CURRENT_TIMESTAMP
+              AND (@after_created_at IS NULL OR (created_at,notification_id)<(@after_created_at,@after_id))
+            ORDER BY created_at DESC,notification_id DESC LIMIT @take
+            """);
+        Add(command,"member_id",memberId);
+        command.Parameters.Add("after_created_at",NpgsqlDbType.TimestampTz).Value=afterCreatedAt is null?DBNull.Value:afterCreatedAt.Value;
+        command.Parameters.Add("after_id",NpgsqlDbType.Varchar).Value=afterId is null?DBNull.Value:afterId;
+        command.Parameters.AddWithValue("take",limit+1);
+        var rows=new List<InAppNotificationResponse>();
+        await using var reader=await command.ExecuteReaderAsync(ct);
+        while(await reader.ReadAsync(ct)) rows.Add(new(reader.GetString(0),reader.GetString(1),NullableString(reader,2),NullableString(reader,3),
+            reader.GetString(4),reader.GetString(5),reader.GetFieldValue<DateTimeOffset>(6),reader.GetFieldValue<DateTimeOffset>(7),
+            reader.GetFieldValue<DateTimeOffset>(8),$"\"{reader.GetInt64(9):x}\""));
+        var page=rows.Take(limit).ToArray();
+        return new(page,rows.Count>limit?EncodeNotificationCursor(page[^1].CreatedAt,page[^1].NotificationId):null);
+    }
+
     // The imported contact's phone/email hash equals the recipient's verified identity hash
     // (both come from IIdentityProtector's keyed lookup hash). Expects alias l (contact_link) and @recipient_member_id.
     private const string MatchesRecipientIdentity = """
@@ -600,6 +968,142 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         reader.GetFieldValue<DateTimeOffset>(8),
         $"\"{reader.GetInt64(9):x}\"");
 
+    private static async Task<RelationshipOutcomeResponse?> ReadOutcomeAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string outcomeId, string memberId, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand("""
+            SELECT outcome.outcome_id, outcome.outcome_type, outcome.status, outcome.initiated_by_member_id,
+                   other_party.member_id, outcome.occurred_at, outcome.confirmation_due_at,
+                   outcome.verified_at, outcome.withdrawal_due_at, outcome.valid_until,
+                   (CASE WHEN outcome.status='VERIFIED' THEN
+                       CASE outcome.outcome_type WHEN 'MEETING' THEN 1 WHEN 'INTRODUCTION' THEN 2 ELSE 3 END
+                    ELSE 0 END)::numeric,
+                   (SELECT count(DISTINCT confirmation.actor_member_id)::int
+                    FROM social.relationship_outcome_confirmation confirmation
+                    WHERE confirmation.relationship_outcome_pk=outcome.relationship_outcome_pk
+                      AND confirmation.actor_type='MEMBER' AND confirmation.decision='CONFIRM'),
+                   outcome.row_version
+            FROM social.relationship_outcome outcome
+            JOIN social.relationship_outcome_party own_party
+              ON own_party.relationship_outcome_pk=outcome.relationship_outcome_pk AND own_party.member_id=@member_id
+            JOIN social.relationship_outcome_party other_party
+              ON other_party.relationship_outcome_pk=outcome.relationship_outcome_pk AND other_party.member_id<>@member_id
+             AND other_party.party_role IN ('INITIATOR','PARTICIPANT')
+            WHERE outcome.outcome_id=@outcome_id
+            LIMIT 1
+            """, connection, transaction);
+        Add(command, "outcome_id", outcomeId); Add(command, "member_id", memberId);
+        await using var reader = await command.ExecuteReaderAsync(ct);
+        if (!await reader.ReadAsync(ct)) return null;
+        return new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3), reader.GetString(4),
+            reader.GetFieldValue<DateTimeOffset>(5), reader.GetFieldValue<DateTimeOffset>(6),
+            reader.IsDBNull(7)?null:reader.GetFieldValue<DateTimeOffset>(7), reader.IsDBNull(8)?null:reader.GetFieldValue<DateTimeOffset>(8),
+            reader.IsDBNull(9)?null:reader.GetFieldValue<DateTimeOffset>(9), reader.GetDecimal(10), reader.GetInt32(11), $"\"{reader.GetInt64(12):x}\"");
+    }
+
+    private static async Task ReprojectRelationshipsAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, string outcomeId, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand("""
+            WITH affected_members AS (
+                SELECT party.member_id
+                FROM social.relationship_outcome outcome
+                JOIN social.relationship_outcome_party party ON party.relationship_outcome_pk=outcome.relationship_outcome_pk
+                WHERE outcome.outcome_id=@outcome_id AND party.party_role IN ('INITIATOR','PARTICIPANT')
+            ), affected_links AS (
+                SELECT link.owner_member_id, link.contact_link_pk, link.contact_member_id
+                FROM social.contact_link link
+                WHERE link.owner_member_id IN (SELECT member_id FROM affected_members)
+                  AND link.contact_member_id IN (SELECT member_id FROM affected_members)
+                  AND link.owner_member_id<>link.contact_member_id
+            ), statistics AS (
+                SELECT link.owner_member_id, link.contact_link_pk,
+                       COALESCE(sum(CASE outcome.outcome_type WHEN 'MEETING' THEN 1 WHEN 'INTRODUCTION' THEN 2 ELSE 3 END)
+                           FILTER (WHERE outcome.status='VERIFIED' AND outcome.valid_until>CURRENT_TIMESTAMP),0)::numeric(8,2) AS points,
+                       count(*) FILTER (WHERE outcome.status='VERIFIED' AND outcome.valid_until>CURRENT_TIMESTAMP)::int AS verified_count,
+                       bool_or(outcome.outcome_type='INTRODUCTION' AND outcome.status='VERIFIED' AND outcome.valid_until>CURRENT_TIMESTAMP) AS has_introduction,
+                       bool_or(outcome.outcome_type='RESULT' AND outcome.status='VERIFIED' AND outcome.valid_until>CURRENT_TIMESTAMP) AS has_result,
+                       max(outcome.verified_at) FILTER (WHERE outcome.status='VERIFIED' AND outcome.valid_until>CURRENT_TIMESTAMP) AS last_activity_at
+                FROM affected_links link
+                LEFT JOIN social.relationship_outcome outcome ON
+                    EXISTS (SELECT 1 FROM social.relationship_outcome_party p1
+                            WHERE p1.relationship_outcome_pk=outcome.relationship_outcome_pk AND p1.member_id=link.owner_member_id)
+                    AND EXISTS (SELECT 1 FROM social.relationship_outcome_party p2
+                                WHERE p2.relationship_outcome_pk=outcome.relationship_outcome_pk AND p2.member_id=link.contact_member_id)
+                GROUP BY link.owner_member_id, link.contact_link_pk
+            )
+            INSERT INTO social.sci_relationship_projection (
+                relationship_projection_id, owner_member_id, contact_link_pk, rolling_points,
+                verified_outcome_count, has_introduction, has_result, tie_strength,
+                layer_code, layer_ordinal, last_activity_at, quiet_since, calculated_at)
+            SELECT 'rel_' || substr(md5(owner_member_id || ':' || contact_link_pk::text),1,32),
+                   owner_member_id, contact_link_pk, points, verified_count,
+                   COALESCE(has_introduction,false), COALESCE(has_result,false), LEAST(100,points*10),
+                   CASE WHEN verified_count>0 THEN 'QUALIFIED_NETWORK' END,
+                   CASE WHEN verified_count>0 THEN 5::smallint END,
+                   last_activity_at,
+                   CASE WHEN last_activity_at IS NOT NULL AND last_activity_at<CURRENT_TIMESTAMP-interval '180 days'
+                        THEN last_activity_at + interval '180 days' END,
+                   CURRENT_TIMESTAMP
+            FROM statistics
+            ON CONFLICT (owner_member_id, contact_link_pk) DO UPDATE SET
+                rolling_points=EXCLUDED.rolling_points, verified_outcome_count=EXCLUDED.verified_outcome_count,
+                has_introduction=EXCLUDED.has_introduction, has_result=EXCLUDED.has_result,
+                tie_strength=EXCLUDED.tie_strength, layer_code=EXCLUDED.layer_code,
+                layer_ordinal=EXCLUDED.layer_ordinal, last_activity_at=EXCLUDED.last_activity_at,
+                quiet_since=EXCLUDED.quiet_since, calculated_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP;
+
+            WITH affected_members AS (
+                SELECT party.member_id
+                FROM social.relationship_outcome outcome
+                JOIN social.relationship_outcome_party party ON party.relationship_outcome_pk=outcome.relationship_outcome_pk
+                WHERE outcome.outcome_id=@outcome_id AND party.party_role IN ('INITIATOR','PARTICIPANT')
+            ), ranked AS (
+                SELECT projection.sci_relationship_projection_pk,
+                       CASE WHEN row_number() OVER (PARTITION BY projection.owner_member_id
+                                  ORDER BY projection.rolling_points DESC, projection.last_activity_at DESC,
+                                           projection.contact_link_pk) <= 5 THEN 1
+                            WHEN row_number() OVER (PARTITION BY projection.owner_member_id
+                                  ORDER BY projection.rolling_points DESC, projection.last_activity_at DESC,
+                                           projection.contact_link_pk) <= 15 THEN 2
+                            WHEN row_number() OVER (PARTITION BY projection.owner_member_id
+                                  ORDER BY projection.rolling_points DESC, projection.last_activity_at DESC,
+                                           projection.contact_link_pk) <= 50 THEN 3
+                            WHEN row_number() OVER (PARTITION BY projection.owner_member_id
+                                  ORDER BY projection.rolling_points DESC, projection.last_activity_at DESC,
+                                           projection.contact_link_pk) <= 150 THEN 4 ELSE 5 END AS base_ordinal,
+                       projection.last_activity_at
+                FROM social.sci_relationship_projection projection
+                WHERE projection.owner_member_id IN (SELECT member_id FROM affected_members)
+                  AND projection.projection_status='ACTIVE' AND projection.verified_outcome_count>0
+            ), final_rank AS (
+                SELECT sci_relationship_projection_pk,
+                       LEAST(5, base_ordinal + CASE WHEN last_activity_at<CURRENT_TIMESTAMP-interval '180 days' THEN 1 ELSE 0 END)::smallint AS ordinal
+                FROM ranked
+            )
+            UPDATE social.sci_relationship_projection projection
+            SET layer_ordinal=rank.ordinal,
+                layer_code=CASE rank.ordinal WHEN 1 THEN 'STRATEGIC_PARTNERS' WHEN 2 THEN 'DEAL_PARTNERS'
+                    WHEN 3 THEN 'VERIFIED_COLLABORATORS' WHEN 4 THEN 'ACTIVE_NETWORK' ELSE 'QUALIFIED_NETWORK' END,
+                updated_at=CURRENT_TIMESTAMP
+            FROM final_rank rank
+            WHERE projection.sci_relationship_projection_pk=rank.sci_relationship_projection_pk;
+
+            UPDATE social.sci_contact_projection contact
+            SET layer_code=CASE WHEN contact.counts_in_sci THEN relationship.layer_code END,
+                layer_ordinal=CASE WHEN contact.counts_in_sci THEN relationship.layer_ordinal END,
+                outcome_points=relationship.rolling_points, tie_strength=relationship.tie_strength,
+                last_activity_at=relationship.last_activity_at, as_of=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+            FROM social.sci_relationship_projection relationship
+            WHERE relationship.owner_member_id=contact.owner_member_id
+              AND relationship.contact_link_pk=contact.contact_link_pk
+              AND relationship.owner_member_id IN (
+                  SELECT party.member_id FROM social.relationship_outcome outcome
+                  JOIN social.relationship_outcome_party party ON party.relationship_outcome_pk=outcome.relationship_outcome_pk
+                  WHERE outcome.outcome_id=@outcome_id)
+            """, connection, transaction);
+        Add(command, "outcome_id", outcomeId);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
     private static async Task UpsertIdentifierAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, long recordPk, string ownerMemberId, string type, string? hash, CancellationToken ct)
     {
         if (hash is null) return;
@@ -612,11 +1116,28 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         await command.ExecuteNonQueryAsync(ct);
     }
 
+    private static void AddNullableBytea(NpgsqlCommand command, string name, byte[]? value) =>
+        command.Parameters.Add(name, NpgsqlDbType.Bytea).Value = value is null ? DBNull.Value : value;
+
     private static void Add(NpgsqlCommand command, string name, string? value) => command.Parameters.Add(name, NpgsqlDbType.Varchar).Value = value is null ? DBNull.Value : value;
     private static string TokenHash(string token) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
     private static string? NullableString(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
     private static decimal? NullableDecimal(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetDecimal(ordinal);
     private static string EncodePkCursor(long pk) => Convert.ToBase64String(Encoding.UTF8.GetBytes(pk.ToString(CultureInfo.InvariantCulture)));
+    private static string EncodeNotificationCursor(DateTimeOffset createdAt,string notificationId) =>
+        Convert.ToBase64String(Encoding.UTF8.GetBytes($"{createdAt.UtcTicks}\n{notificationId}"));
+    private static (DateTimeOffset? CreatedAt,string? NotificationId) DecodeNotificationCursor(string? cursor)
+    {
+        if(string.IsNullOrWhiteSpace(cursor)) return (null,null);
+        try
+        {
+            var parts=Encoding.UTF8.GetString(Convert.FromBase64String(cursor)).Split('\n');
+            if(parts.Length!=2||!long.TryParse(parts[0],NumberStyles.None,CultureInfo.InvariantCulture,out var ticks)||ticks<=0
+               ||string.IsNullOrWhiteSpace(parts[1])||parts[1].Length>64) throw new FormatException();
+            return (new DateTimeOffset(ticks,TimeSpan.Zero),parts[1]);
+        }
+        catch(FormatException){throw new DomainException("NOTIFICATION_CURSOR_INVALID");}
+    }
     private static long DecodePkCursor(string? cursor, string errorCode)
     {
         if (string.IsNullOrWhiteSpace(cursor)) return 0;
@@ -627,16 +1148,17 @@ public sealed class NpgsqlSocialCapitalRepository(NpgsqlDataSource dataSource, I
         }
         catch (FormatException) { throw new DomainException(errorCode); }
     }
-    private static string EncodeCursor(decimal score, long pk) => Convert.ToBase64String(Encoding.UTF8.GetBytes($"{score.ToString(CultureInfo.InvariantCulture)}:{pk}"));
+    private static string EncodeSciCursor(int score, string projectionId) => Convert.ToBase64String(Encoding.UTF8.GetBytes($"{score.ToString(CultureInfo.InvariantCulture)}\n{projectionId}"));
     private static string StableId(string prefix, string value) => $"{prefix}_{Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value))).ToLowerInvariant()[..32]}";
-    private static (decimal? Score, long Pk) DecodeCursor(string? cursor)
+    private static (int? Score, string? ProjectionId) DecodeSciCursor(string? cursor)
     {
-        if (string.IsNullOrWhiteSpace(cursor)) return (null, 0);
+        if (string.IsNullOrWhiteSpace(cursor)) return (null, null);
         try
         {
-            var parts = Encoding.UTF8.GetString(Convert.FromBase64String(cursor)).Split(':');
-            if (parts.Length != 2 || !decimal.TryParse(parts[0], NumberStyles.Number, CultureInfo.InvariantCulture, out var score) || !long.TryParse(parts[1], out var pk)) throw new FormatException();
-            return (score, pk);
+            var parts = Encoding.UTF8.GetString(Convert.FromBase64String(cursor)).Split('\n');
+            if (parts.Length != 2 || !int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var score)
+                || string.IsNullOrWhiteSpace(parts[1]) || parts[1].Length > 64) throw new FormatException();
+            return (score, parts[1]);
         }
         catch (FormatException) { throw new DomainException("SCI_CURSOR_INVALID"); }
     }

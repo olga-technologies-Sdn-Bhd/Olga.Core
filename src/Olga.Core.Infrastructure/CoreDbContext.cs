@@ -363,19 +363,102 @@ public sealed class CoreDbContext(DbContextOptions<CoreDbContext> options) : DbC
         finally { if (close) await Database.CloseConnectionAsync(); }
     }
 
-    async Task<(string ConnectionId, string ConversationId)> ICoreStore.AcceptConnectionRequestAsync(string requestId, string recipientId, string connectionId, string conversationId, string idempotencyKey, string requestHash, CancellationToken ct)
+    async Task<(string ConnectionId, string ConversationId)> ICoreStore.AcceptConnectionRequestAsync(
+        string requestId, string recipientId, string connectionId, string conversationId,
+        string idempotencyKey, string requestHash, IReadOnlyList<ConnectedContactSeed> contacts, CancellationToken ct)
     {
-        await using var command = CreateCommand("SELECT * FROM social.accept_connection_request(@request_id, @recipient_id, @connection_id, @conversation_id, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)");
-        AddVarchar(command, "request_id", requestId, 64); AddVarchar(command, "recipient_id", recipientId, 64);
-        AddVarchar(command, "connection_id", connectionId, 64); AddVarchar(command, "conversation_id", conversationId, 64);
-        AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
-        AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
         var close = await OpenIfNeededAsync(ct);
         try
         {
-            await using var reader = await command.ExecuteReaderAsync(ct);
-            if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("accept_connection_request returned no result.");
-            return (reader.GetString(0), reader.GetString(1));
+            await using var transaction = await ((NpgsqlConnection)Database.GetDbConnection()).BeginTransactionAsync(ct);
+            await using var command = CreateCommand("SELECT * FROM social.accept_connection_request(@request_id, @recipient_id, @connection_id, @conversation_id, @idempotency_key, @request_hash, @idempotency_expires_at, @sync_expires_at)", transaction);
+            AddVarchar(command, "request_id", requestId, 64); AddVarchar(command, "recipient_id", recipientId, 64);
+            AddVarchar(command, "connection_id", connectionId, 64); AddVarchar(command, "conversation_id", conversationId, 64);
+            AddVarchar(command, "idempotency_key", idempotencyKey, 128); AddChar(command, "request_hash", requestHash);
+            AddTimestamp(command, "idempotency_expires_at", DateTimeOffset.UtcNow.AddHours(24)); AddTimestamp(command, "sync_expires_at", DateTimeOffset.UtcNow.AddDays(30));
+            string savedConnectionId, savedConversationId;
+            await using (var reader = await command.ExecuteReaderAsync(ct))
+            {
+                if (!await reader.ReadAsync(ct)) throw new InvalidOperationException("accept_connection_request returned no result.");
+                savedConnectionId = reader.GetString(0);
+                savedConversationId = reader.GetString(1);
+            }
+            await using (var link = CreateCommand("""
+                UPDATE social.contact_link l
+                SET connection_id=@connection_id, lifecycle_state='CONNECTED',
+                    consent_at=COALESCE(consent_at,CURRENT_TIMESTAMP), last_transition_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                FROM social.connection_request r
+                WHERE r.connection_request_id=@request_id AND r.context_id='SCI_INVITATION'
+                  AND r.recipient_member_id=@recipient_id AND r.status='ACCEPTED'
+                  AND l.owner_member_id=r.recipient_member_id AND l.contact_member_id=r.sender_member_id
+                  AND l.lifecycle_state='REQUEST_PENDING'
+                """, transaction))
+            {
+                AddVarchar(link, "connection_id", savedConnectionId, 64);
+                AddVarchar(link, "request_id", requestId, 64);
+                AddVarchar(link, "recipient_id", recipientId, 64);
+                await link.ExecuteNonQueryAsync(ct);
+            }
+            foreach (var contact in contacts)
+            {
+                await using var ensureContact = CreateCommand("""
+                    WITH created_record AS (
+                        INSERT INTO social.contact_record (
+                            contact_record_id, owner_member_id, label_ciphertext, source_type, expires_at)
+                        SELECT @contact_record_id, @owner_member_id, @label_ciphertext, 'MANUAL', NULL
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM social.contact_link
+                            WHERE owner_member_id=@owner_member_id AND contact_member_id=@contact_member_id)
+                        ON CONFLICT (contact_record_id) DO NOTHING
+                        RETURNING contact_record_pk
+                    )
+                    INSERT INTO social.contact_link (
+                        link_id, owner_member_id, contact_record_pk, contact_member_id,
+                        connection_id, origin_type, lifecycle_state, consent_at, joined_at)
+                    SELECT @link_id, @owner_member_id, contact_record_pk, @contact_member_id,
+                           @connection_id, 'DISCOVERY', 'CONNECTED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM created_record
+                    ON CONFLICT (link_id) DO UPDATE SET
+                        connection_id=EXCLUDED.connection_id, lifecycle_state='CONNECTED',
+                        consent_at=COALESCE(social.contact_link.consent_at,CURRENT_TIMESTAMP),
+                        joined_at=COALESCE(social.contact_link.joined_at,CURRENT_TIMESTAMP),
+                        last_transition_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP;
+
+                    UPDATE social.contact_link
+                    SET connection_id=@connection_id, lifecycle_state='CONNECTED',
+                        consent_at=COALESCE(consent_at,CURRENT_TIMESTAMP),
+                        joined_at=COALESCE(joined_at,CURRENT_TIMESTAMP),
+                        last_transition_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                    WHERE owner_member_id=@owner_member_id AND contact_member_id=@contact_member_id
+                    """, transaction);
+                AddVarchar(ensureContact, "contact_record_id", contact.ContactRecordId, 64);
+                AddVarchar(ensureContact, "link_id", contact.LinkId, 64);
+                AddVarchar(ensureContact, "owner_member_id", contact.OwnerMemberId, 64);
+                AddVarchar(ensureContact, "contact_member_id", contact.ContactMemberId, 64);
+                AddVarchar(ensureContact, "connection_id", savedConnectionId, 64);
+                ensureContact.Parameters.Add(new NpgsqlParameter("label_ciphertext", NpgsqlDbType.Bytea) { Value = contact.LabelCiphertext });
+                await ensureContact.ExecuteNonQueryAsync(ct);
+            }
+            await using (var score = CreateCommand("""
+                SELECT nlp.enqueue_sci_scoring_job(
+                    'sci_' || substr(md5(@request_id || ':' || state.owner_member_id),1,32),
+                    state.owner_member_id, venture.venture_id, link.contact_member_id,
+                    'CONNECTION_ACCEPTED', 'connection-accepted:' || @request_id || ':' || state.owner_member_id,
+                    CURRENT_TIMESTAMP)
+                FROM social.sci_member_state state
+                JOIN core.venture venture ON venture.venture_pk=state.primary_venture_pk AND venture.status='ACTIVE'
+                JOIN social.contact_link link ON link.owner_member_id=state.owner_member_id
+                  AND link.connection_id=@connection_id AND link.lifecycle_state='CONNECTED'
+                WHERE state.primary_intent_set_pk IS NOT NULL
+                """, transaction))
+            {
+                AddVarchar(score, "request_id", requestId, 64);
+                AddVarchar(score, "connection_id", savedConnectionId, 64);
+                await score.ExecuteNonQueryAsync(ct);
+            }
+            await transaction.CommitAsync(ct);
+            return (savedConnectionId, savedConversationId);
         }
         finally { if (close) await Database.CloseConnectionAsync(); }
     }

@@ -36,6 +36,8 @@ public sealed class AesIdentityProtector(byte[] masterKey) : IIdentityProtector
         Protect("CONTACT_LABEL", $"{ownerMemberId}:{contactRecordId}", label.Trim(), "", false, false).SubjectCiphertext;
     public string UnprotectContactLabel(string ownerMemberId, string contactRecordId, byte[] ciphertext) =>
         Unprotect($"{ownerMemberId}:{contactRecordId}", "CONTACT_LABEL", ciphertext);
+    public byte[] ProtectContactField(string ownerMemberId, string contactRecordId, string fieldName, string value) =>
+        Protect($"CONTACT_{fieldName}", $"{ownerMemberId}:{contactRecordId}", value.Trim(), "", false, false).SubjectCiphertext;
     public string CreateInvitationToken(string ownerMemberId, string batchId, string linkId, string idempotencyKey) =>
         Convert.ToHexString(HMACSHA256.HashData(lookupKey, Encoding.UTF8.GetBytes($"INVITATION\n{ownerMemberId}\n{batchId}\n{linkId}\n{idempotencyKey}"))).ToLowerInvariant();
 

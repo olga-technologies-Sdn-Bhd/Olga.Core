@@ -1,5 +1,8 @@
 namespace Olga.Core.Contracts;
 
+public sealed record MemberDiscoveryPreferenceRequest(bool FindByPhone, bool FindByEmail);
+public sealed record MemberDiscoveryPreferenceResponse(bool FindByPhone, bool FindByEmail, string ETag, DateTimeOffset UpdatedAt);
+
 public sealed record VentureCreateRequest(
     string VentureId,
     string Name,
@@ -23,33 +26,125 @@ public sealed record VentureResponse(
     DateTimeOffset UpdatedAt,
     string ETag);
 
-public sealed record ContactImportItem(string ContactRecordId, string LinkId, string Label, string? Email = null, string? Phone = null);
+public sealed record ContactImportItem(
+    string ContactRecordId,
+    string LinkId,
+    string Label,
+    string? Email = null,
+    string? Phone = null,
+    string? JobTitle = null,
+    string? Company = null,
+    string? Industry = null,
+    string? City = null);
 public sealed record ContactImportRequest(IReadOnlyList<ContactImportItem> Contacts, int RetentionDays = 365);
 public sealed record ContactImportResponse(int ImportedCount, IReadOnlyList<string> LinkIds);
 
 public sealed record InviteBatchCreateRequest(string BatchId, string? VentureId, IReadOnlyList<string> LinkIds, int ExpiresInDays = 14);
 public sealed record InvitationDispatch(string InvitationId, string LinkId, string Token, DateTimeOffset ExpiresAt);
 public sealed record InviteBatchResponse(string BatchId, string Status, IReadOnlyList<InvitationDispatch> Invitations, string ETag);
-public sealed record InvitationAcceptResponse(string InvitationId, string ConnectionId, string ConversationId, string LinkId);
+public sealed record InvitationAcceptResponse(string InvitationId, string ConnectionRequestId, string LifecycleState, string LinkId);
 
 public sealed record SciContactResponse(
     string LinkId,
     string? ContactMemberId,
     string Label,
-    decimal Score,
-    string RelationshipRole,
-    bool CompetitorOverlay,
-    bool IsStale,
-    string OriginType,
-    DateTimeOffset ScoredAt,
+    string LifecycleState,
+    int? Score,
+    string Band,
+    bool IsEstimated,
+    bool CountsInSci,
+    bool CountsInPotential,
+    string ProjectionState,
+    DateTimeOffset? FrozenAt,
+    string? FreezeReason,
+    string? LayerCode,
+    short? LayerOrdinal,
+    decimal OutcomePoints,
+    decimal TieStrength,
+    string? ReasonCode,
+    string? ScorerVersion,
+    string? ScoringConfigId,
+    DateTimeOffset? ScoreCalculatedAt,
+    DateTimeOffset? LastActivityAt,
+    long ProjectionVersion,
+    DateTimeOffset AsOf,
     string ETag);
 
 public sealed record SciContactPage(IReadOnlyList<SciContactResponse> Items, string? NextCursor);
 
-// Score bands match the UI guide: Emerging 10-24, Relevant 25-49, Strong 50-74, Exact 75-100.
-public sealed record SciBandCounts(int Emerging, int Relevant, int Strong, int Exact);
-public sealed record SciVentureSummary(string VentureId, string Name, int ContactCount, decimal? TopScore, decimal? AverageScore, int StaleCount, DateTimeOffset? LastScoredAt);
-public sealed record SciSummaryResponse(int VentureCount, int ContactCount, SciBandCounts Bands, decimal? AverageScore, DateTimeOffset? LastScoredAt, IReadOnlyList<SciVentureSummary> Ventures);
+public sealed record SciGoalMilestoneResponse(short Percent, DateTimeOffset ReachedAt);
+public sealed record SciGoalResponse(
+    string GoalId,
+    int GoalValue,
+    int GoalSequence,
+    string OwnerType,
+    int ProgressPercent,
+    DateTimeOffset? TargetAt,
+    IReadOnlyList<SciGoalMilestoneResponse> Milestones);
+public sealed record SciSummaryResponse(
+    int SciCount,
+    int PotentialCount,
+    int WaitlistCount,
+    int RepositoryCount,
+    int TotalContactCount,
+    int CoreCount,
+    int MonthChange,
+    int IntentUpdateCount,
+    string ProjectionStatus,
+    long ProjectionVersion,
+    string? ScorerVersion,
+    string? ScoringConfigId,
+    DateTimeOffset AsOf,
+    SciGoalResponse? Goal,
+    string ETag);
+
+public sealed record SciReachOutResponse(
+    string RecommendationId,
+    string LinkId,
+    string ContactMemberId,
+    string ReasonCode,
+    short MatchScore,
+    decimal RelevanceScore,
+    int Rank,
+    long ProjectionVersion,
+    DateTimeOffset GeneratedAt,
+    DateTimeOffset ExpiresAt);
+public sealed record SciReachOutPage(IReadOnlyList<SciReachOutResponse> Items, string? NextCursor);
+
+public sealed record InAppNotificationResponse(
+    string NotificationId,
+    string PurposeCode,
+    string? ResourceType,
+    string? ResourceId,
+    string TemplateCode,
+    string Status,
+    DateTimeOffset ScheduledAt,
+    DateTimeOffset ExpiresAt,
+    DateTimeOffset CreatedAt,
+    string ETag);
+public sealed record InAppNotificationPage(IReadOnlyList<InAppNotificationResponse> Items,string? NextCursor);
+
+public sealed record RelationshipOutcomeCreateRequest(
+    string OutcomeId,
+    string ContactMemberId,
+    string OutcomeType,
+    DateTimeOffset OccurredAt,
+    string? ResultType = null);
+public sealed record RelationshipOutcomeDecisionRequest(string Decision);
+public sealed record RelationshipOutcomeResponse(
+    string OutcomeId,
+    string OutcomeType,
+    string Status,
+    string InitiatedByMemberId,
+    string ContactMemberId,
+    DateTimeOffset OccurredAt,
+    DateTimeOffset ConfirmationDueAt,
+    DateTimeOffset? VerifiedAt,
+    DateTimeOffset? WithdrawalDueAt,
+    DateTimeOffset? ValidUntil,
+    decimal Points,
+    int ConfirmationCount,
+    string ETag);
 
 public sealed record ImportedContactResponse(
     string LinkId,

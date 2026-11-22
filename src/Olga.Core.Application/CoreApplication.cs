@@ -53,7 +53,9 @@ public interface ICoreStore
     void Add<T>(T entity) where T : class;
     void Remove<T>(T entity) where T : class;
     Task SaveAsync(CancellationToken ct);
-    Task<(string ConnectionId, string ConversationId)> AcceptConnectionRequestAsync(string requestId, string recipientId, string connectionId, string conversationId, string idempotencyKey, string requestHash, CancellationToken ct);
+    Task<(string ConnectionId, string ConversationId)> AcceptConnectionRequestAsync(
+        string requestId, string recipientId, string connectionId, string conversationId,
+        string idempotencyKey, string requestHash, IReadOnlyList<ConnectedContactSeed> contacts, CancellationToken ct);
     Task<Message> SaveMessageAsync(string memberId, string conversationId, MessageCreateRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
     Task<MessageReceipt> SaveMessageReceiptAsync(string memberId, string messageId, MessageReceiptRequest request, string idempotencyKey, string requestHash, CancellationToken ct);
     // Reads nlp.nlp_match_result scores; empty when the store has no NLP data.
@@ -61,6 +63,13 @@ public interface ICoreStore
     // Reads the member's own nlp.nlp_intent rows; empty when the store has no NLP data.
     Task<IReadOnlyList<ExportIntent>> GetMemberIntentsAsync(string memberId, CancellationToken ct);
 }
+
+public sealed record ConnectedContactSeed(
+    string ContactRecordId,
+    string LinkId,
+    string OwnerMemberId,
+    string ContactMemberId,
+    byte[] LabelCiphertext);
 
 public sealed record MatchScore(long MatchResultId, string RequesterId, string CandidateId, decimal Score);
 public sealed record IdempotencyClaim(bool Acquired, string RequestHash, short? StatusCode, string? ResponseRef, DateTimeOffset ExpiresAt);
@@ -173,6 +182,7 @@ public interface IIdentityProtector
     string PhoneVerificationRequestHash(string phone, string code);
     byte[] ProtectContactLabel(string ownerMemberId, string contactRecordId, string label);
     string UnprotectContactLabel(string ownerMemberId, string contactRecordId, byte[] ciphertext);
+    byte[] ProtectContactField(string ownerMemberId, string contactRecordId, string fieldName, string value);
     string CreateInvitationToken(string ownerMemberId, string batchId, string linkId, string idempotencyKey);
     // SubjectHash is the token's keyed fingerprint; DisplayHint is empty.
     ProtectedIdentity ProtectPushToken(string deviceId, string provider, string token);
@@ -1168,7 +1178,17 @@ public sealed class CoreService(ICoreStore store, IIdentityProtector identityPro
         {
             var connectionId = Hash("connection", requestId, memberId, idempotencyKey)[..32];
             var conversationId = Hash("conversation", requestId, memberId, idempotencyKey)[..32];
-            var saved = await store.AcceptConnectionRequestAsync(requestId, memberId, connectionId, conversationId, idempotencyKey, Hash(requestId, memberId, request.Decision), ct);
+            var senderRecordId = $"cr_{Hash("sci-contact", row.SenderMemberId, row.RecipientMemberId)[..32]}";
+            var recipientRecordId = $"cr_{Hash("sci-contact", row.RecipientMemberId, row.SenderMemberId)[..32]}";
+            var contacts = new[]
+            {
+                new ConnectedContactSeed(senderRecordId, $"link_{Hash("sci-link", row.SenderMemberId, row.RecipientMemberId)[..32]}", row.SenderMemberId, row.RecipientMemberId,
+                    identityProtector.ProtectContactLabel(row.SenderMemberId, senderRecordId, "Member")),
+                new ConnectedContactSeed(recipientRecordId, $"link_{Hash("sci-link", row.RecipientMemberId, row.SenderMemberId)[..32]}", row.RecipientMemberId, row.SenderMemberId,
+                    identityProtector.ProtectContactLabel(row.RecipientMemberId, recipientRecordId, "Member"))
+            };
+            var saved = await store.AcceptConnectionRequestAsync(requestId, memberId, connectionId, conversationId, idempotencyKey,
+                Hash(requestId, memberId, request.Decision), contacts, ct);
             return new(saved.ConnectionId, row.SenderMemberId, "ACTIVE", saved.ConversationId);
         }
         row.Status = "ACCEPTED";

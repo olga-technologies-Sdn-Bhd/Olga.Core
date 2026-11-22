@@ -76,9 +76,13 @@ public sealed class SciIntentRescoreHandler(CoreDbContext db)
                   ON l.contact_member_id=vis.owner_member_id
                  AND l.lifecycle_state='CONNECTED'
                  AND l.consent_at IS NOT NULL
+                JOIN social.sci_member_state owner_state
+                  ON owner_state.owner_member_id=l.owner_member_id
+                 AND owner_state.primary_venture_pk IS NOT NULL
+                 AND owner_state.primary_intent_set_pk IS NOT NULL
                 JOIN core.venture v
-                  ON v.owner_member_id=l.owner_member_id
-                 AND v.status='ACTIVE'
+                  ON v.venture_pk=owner_state.primary_venture_pk
+                 AND v.owner_member_id=l.owner_member_id AND v.status='ACTIVE'
                 WHERE i.intent_id=@intent_id AND i.member_id=@contact_member_id
                 """, connection);
             Add(command, "intent_id", intent.IntentId);

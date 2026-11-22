@@ -81,10 +81,12 @@ if (pushEnabled)
     builder.Services.AddSingleton<PushNotificationQueue>();
     builder.Services.AddScoped<ChatPushDispatcher>();
     builder.Services.AddHostedService<PushNotificationWorker>();
+    builder.Services.AddHostedService<ProductNotificationDeliveryWorker>();
 }
 builder.Services.AddSingleton<IOutboxEventPublisher>(sp =>
 {
     IOutboxEventPublisher publisher = sp.GetRequiredService<ServiceBusOutboxEventPublisher>();
+    publisher = new ProductNotificationOutboxEventPublisher(publisher, sp.GetRequiredService<NpgsqlDataSource>());
     if (realtime) publisher = new SignalRChatEventPublisher(publisher, sp.GetRequiredService<IChatRealtimeSender>(), sp.GetRequiredService<ILogger<SignalRChatEventPublisher>>());
     if (pushEnabled) publisher = new PushOutboxEventPublisher(publisher, sp.GetRequiredService<PushNotificationQueue>(), sp.GetRequiredService<ILogger<PushOutboxEventPublisher>>());
     return publisher;
@@ -97,6 +99,7 @@ builder.Services.AddScoped<ChatAttachmentProcessor>();
 builder.Services.AddHostedService<OutboxPublisherWorker>();
 builder.Services.AddHostedService<NlpCompletionConsumerWorker>();
 builder.Services.AddHostedService<ContentScanConsumerWorker>();
+builder.Services.AddHostedService<SciMaintenanceWorker>();
 var host = builder.Build();
 if (!pushEnabled) host.Services.GetRequiredService<ILogger<Program>>().LogInformation("Push notifications are off: Push:NotificationHubConnectionString, Push:NotificationHubName and IdentityProtection:MasterKeyBase64 are all needed.");
 await host.RunAsync();

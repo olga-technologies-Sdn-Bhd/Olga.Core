@@ -146,6 +146,11 @@ builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
 builder.Services.AddScoped<ISocialCapitalRepository, NpgsqlSocialCapitalRepository>();
 builder.Services.AddScoped<ISocialCapitalService, SocialCapitalService>();
+if (!local)
+{
+    builder.Services.AddScoped<ISciAdminRepository, NpgsqlSciAdminRepository>();
+    builder.Services.AddScoped<ISciAdminService, SciAdminService>();
+}
 builder.Services.Configure<InviteLinkOptions>(builder.Configuration.GetSection(InviteLinkOptions.SectionName));
 
 var app = builder.Build();
@@ -233,12 +238,37 @@ memberV1.MapPost("/invite-batches", async (HttpContext c, InviteBatchCreateReque
 memberV1.MapPost("/invitations/{token}/accept", async (HttpContext c, string token, ISocialCapitalService s, CancellationToken ct) =>
     Results.Ok(await s.AcceptInvitationAsync(Member(c), token, Idempotency(c), ct)))
     .WithName("AcceptInvitation").WithTags("Social capital").Produces<InvitationAcceptResponse>(200);
-memberV1.MapGet("/ventures/{ventureId}/sci", async (HttpContext c, string ventureId, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
-    Results.Ok(await s.GetSciAsync(Member(c), ventureId, cursor, limit ?? 50, ct)))
+memberV1.MapGet("/sci/contacts", async (HttpContext c, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetSciAsync(Member(c), cursor, limit ?? 50, ct)))
     .WithName("GetSocialCapitalIndex").WithTags("Social capital").Produces<SciContactPage>(200);
 memberV1.MapGet("/sci/summary", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
-    Results.Ok(await s.GetSciSummaryAsync(Member(c), ct)))
+{
+    var value = await s.GetSciSummaryAsync(Member(c), ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+})
     .WithName("GetSocialCapitalSummary").WithTags("Social capital").Produces<SciSummaryResponse>(200);
+memberV1.MapGet("/sci/reach-out", async (HttpContext c, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
+    Results.Ok(await s.GetReachOutAsync(Member(c), cursor, limit ?? 3, ct)))
+    .WithName("GetSciReachOut").WithTags("Social capital").Produces<SciReachOutPage>(200);
+memberV1.MapGet("/me/discovery-preference", async (HttpContext c, ISocialCapitalService s, CancellationToken ct) =>
+    { var value=await s.GetDiscoveryPreferenceAsync(Member(c),ct); c.Response.Headers.ETag=value.ETag; return Results.Ok(value); })
+    .WithName("GetDiscoveryPreference").WithTags("Privacy").Produces<MemberDiscoveryPreferenceResponse>(200);
+memberV1.MapPut("/me/discovery-preference", async (HttpContext c, MemberDiscoveryPreferenceRequest body, ISocialCapitalService s, CancellationToken ct) =>
+    { var value=await s.SaveDiscoveryPreferenceAsync(Member(c),body,c.Request.Headers[ifMatchHeader].ToString(),ct); c.Response.Headers.ETag=value.ETag; return Results.Ok(value); })
+    .WithMetadata(new IfMatchMetadata()).WithName("SaveDiscoveryPreference").WithTags("Privacy").Produces<MemberDiscoveryPreferenceResponse>(200);
+memberV1.MapGet("/notifications",async(HttpContext c,string? cursor,int? limit,ISocialCapitalService s,CancellationToken ct)=>
+    Results.Ok(await s.GetInAppNotificationsAsync(Member(c),cursor,limit??20,ct)))
+    .WithName("GetInAppNotifications").WithTags("Notifications").Produces<InAppNotificationPage>(200);
+memberV1.MapPost("/relationship-outcomes", async (HttpContext c, RelationshipOutcomeCreateRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.CreateOutcomeAsync(Member(c), body, Idempotency(c), ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Created($"/v1/relationship-outcomes/{value.OutcomeId}", value);
+}).WithName("CreateRelationshipOutcome").WithTags("Social capital").Produces<RelationshipOutcomeResponse>(201);
+memberV1.MapPost("/relationship-outcomes/{outcomeId}/decisions", async (HttpContext c, string outcomeId, RelationshipOutcomeDecisionRequest body, ISocialCapitalService s, CancellationToken ct) =>
+{
+    var value = await s.DecideOutcomeAsync(Member(c), outcomeId, body, Idempotency(c), ct); c.Response.Headers.ETag = value.ETag;
+    return Results.Ok(value);
+}).WithName("DecideRelationshipOutcome").WithTags("Social capital").Produces<RelationshipOutcomeResponse>(200);
 memberV1.MapGet("/contacts", async (HttpContext c, string? cursor, int? limit, ISocialCapitalService s, CancellationToken ct) =>
     Results.Ok(await s.ListContactsAsync(Member(c), cursor, limit ?? 50, ct)))
     .WithName("ListImportedContacts").WithTags("Social capital").Produces<ImportedContactPage>(200);
@@ -392,6 +422,9 @@ memberV1.MapGet("/me/commits/outgoing", async (HttpContext c, [FromQuery(Name = 
     .WithName("ListOutgoingCommits").WithTags("Commits").Produces<IReadOnlyList<OutgoingCommitResponse>>(200);
 memberV1.MapGet("/connections", async (HttpContext c, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetConnectionsAsync(Member(c), ct)))
     .WithName("ListConnections").WithTags("Social").Produces<IReadOnlyList<ConnectionResponse>>(200);
+memberV1.MapDelete("/connections/{connectionId}", async (HttpContext c, string connectionId, ISocialCapitalService s, CancellationToken ct) =>
+    { await s.RemoveConnectionAsync(Member(c), connectionId, ct); return Results.NoContent(); })
+    .WithName("RemoveConnection").WithTags("Social capital").Produces(204).Produces<ApiError>(404);
 memberV1.MapPost("/members/block", async (HttpContext c, BlockRequest body, ICoreService s, CancellationToken ct) => { await s.BlockAsync(Member(c), body, ct); return Results.NoContent(); })
     .WithName("BlockMember").WithTags("Social").Produces(204);
 memberV1.MapDelete("/members/block/{memberId}", async (HttpContext c, string memberId, ICoreService s, CancellationToken ct) => { await s.UnblockAsync(Member(c), memberId, ct); return Results.NoContent(); })
@@ -463,7 +496,6 @@ memberV1.MapGet("/me/export", async (HttpContext c, ICoreService s, Cancellation
 memberV1.MapGet("/sync/changes", async (HttpContext c, string? cursor, int? limit, ICoreService s, CancellationToken ct) => Results.Ok(await s.GetChangesAsync(Member(c), DecodeCursor(cursor), limit ?? 100, ct)))
     .WithName("GetSyncChanges").WithTags("Offline sync").Produces<SyncResponse>(200);
 
-// Admin routes are intentionally open, like the rest of the MVP API, until authentication lands after launch.
 var adminV1 = app.MapGroup("/v1/admin");
 adminV1.MapGet("/events", async (string? status, IAdminEventService s, CancellationToken ct) => Results.Ok(await s.GetEventsAsync(status, ct)))
     .WithName("AdminListEvents").WithTags("Admin events").Produces<IReadOnlyList<AdminEventResponse>>(200);
@@ -511,6 +543,40 @@ adminV1.MapGet("/venues", async (IAdminEventService s, CancellationToken ct) => 
     .WithName("AdminListVenues").WithTags("Admin venues").Produces<IReadOnlyList<AdminVenueResponse>>(200);
 adminV1.MapPost("/venues", async (HttpContext c, AdminVenueCreateRequest body, IAdminEventService s, CancellationToken ct) => { var value = await s.CreateVenueAsync(body, Idempotency(c), ct); return Results.Created($"/v1/admin/venues/{value.VenueId}", value); })
     .WithName("AdminCreateVenue").WithTags("Admin venues").Produces<AdminVenueResponse>(201);
+adminV1.MapGet("/sci/overview", async (HttpContext c, ISciAdminService s, CancellationToken ct) =>
+        Results.Ok(await s.GetOverviewAsync(AdminActor(c), ct)))
+    .WithName("AdminGetSciOverview").WithTags("Admin SCI").Produces<SciAdminOverviewResponse>(200);
+adminV1.MapGet("/sci/configuration", async (HttpContext c, ISciAdminService s, CancellationToken ct) =>
+    {
+        var value=await s.GetConfigurationAsync(AdminActor(c),ct); c.Response.Headers.ETag=value.ETag; return Results.Ok(value);
+    })
+    .WithName("AdminGetSciConfiguration").WithTags("Admin SCI").Produces<SciAdminConfigurationResponse>(200);
+adminV1.MapGet("/sci/approvals", async (HttpContext c, string? status, string? cursor, int? limit, ISciAdminService s, CancellationToken ct) =>
+        Results.Ok(await s.ListApprovalsAsync(AdminActor(c),status,cursor,limit??50,ct)))
+    .WithName("AdminListSciApprovals").WithTags("Admin SCI").Produces<SciAdminChangeApprovalPage>(200);
+adminV1.MapGet("/sci/approvals/{approvalId}", async (HttpContext c, string approvalId, ISciAdminService s, CancellationToken ct) =>
+    {
+        var value=await s.GetApprovalAsync(AdminActor(c),approvalId,ct); c.Response.Headers.ETag=value.ETag; return Results.Ok(value);
+    })
+    .WithName("AdminGetSciApproval").WithTags("Admin SCI").Produces<SciAdminChangeApprovalResponse>(200);
+adminV1.MapPost("/sci/approvals", async (HttpContext c, SciAdminChangeProposalRequest body, ISciAdminService s, CancellationToken ct) =>
+    {
+        var value=await s.CreateApprovalAsync(AdminActor(c),body,ct); c.Response.Headers.ETag=value.ETag;
+        return Results.Created($"/v1/admin/sci/approvals/{value.ChangeApprovalId}",value);
+    })
+    .WithName("AdminCreateSciApproval").WithTags("Admin SCI").Produces<SciAdminChangeApprovalResponse>(201);
+adminV1.MapPost("/sci/approvals/{approvalId}/decision", async (HttpContext c, string approvalId, SciAdminChangeDecisionRequest body, ISciAdminService s, CancellationToken ct) =>
+    {
+        var value=await s.DecideApprovalAsync(AdminActor(c),approvalId,body.Approve,c.Request.Headers[ifMatchHeader].ToString(),ct);
+        c.Response.Headers.ETag=value.ETag; return Results.Ok(value);
+    })
+    .WithMetadata(new IfMatchMetadata()).WithName("AdminDecideSciApproval").WithTags("Admin SCI").Produces<SciAdminChangeApprovalResponse>(200);
+adminV1.MapPost("/sci/approvals/{approvalId}/apply", async (HttpContext c, string approvalId, ISciAdminService s, CancellationToken ct) =>
+    {
+        var value=await s.ApplyApprovalAsync(AdminActor(c),approvalId,c.Request.Headers[ifMatchHeader].ToString(),ct);
+        c.Response.Headers.ETag=value.ETag; return Results.Ok(value);
+    })
+    .WithMetadata(new IfMatchMetadata()).WithName("AdminApplySciApproval").WithTags("Admin SCI").Produces<SciAdminChangeApprovalResponse>(200);
 
 if (local) await LocalDevelopmentSeeder.SeedAsync(app.Services, CancellationToken.None);
 app.Run();
@@ -541,6 +607,13 @@ static bool IsTypingSignal(PathString path) =>
     path.StartsWithSegments("/v1/conversations", out var rest) && rest.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries) is [_, "typing"];
 
 string Idempotency(HttpContext context) => context.Request.Headers[idempotencyKeyHeader].ToString();
+
+static SciAdminActor AdminActor(HttpContext context)
+{
+    IReadOnlySet<string> roles=new HashSet<string>(StringComparer.Ordinal)
+        { "Olga.Admin","Olga.Founder","Olga.ProductOperations","Olga.CTO","Olga.Support" };
+    return new("olga-admin",roles);
+}
 
 static void AddHeaderParameter(OpenApiOperation operation, string name, bool required, string description, int? maxLength = null)
 {

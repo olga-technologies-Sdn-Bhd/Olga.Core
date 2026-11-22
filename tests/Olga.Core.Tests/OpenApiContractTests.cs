@@ -277,8 +277,11 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         public Task<ContactImportResponse> ImportContactsAsync(string ownerMemberId, ContactImportRequest request, CancellationToken ct) => throw new NotSupportedException();
         public Task<InviteBatchResponse> CreateInviteBatchAsync(string ownerMemberId, InviteBatchCreateRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task<InvitationAcceptResponse> AcceptInvitationAsync(string recipientMemberId, string token, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
-        public Task<SciContactPage> GetSciAsync(string ownerMemberId, string ventureId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciContactPage> GetSciAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
         public Task<SciSummaryResponse> GetSciSummaryAsync(string ownerMemberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<SciReachOutPage> GetReachOutAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
+        public Task<RelationshipOutcomeResponse> CreateOutcomeAsync(string memberId, RelationshipOutcomeCreateRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
+        public Task<RelationshipOutcomeResponse> DecideOutcomeAsync(string memberId, string outcomeId, RelationshipOutcomeDecisionRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task<ImportedContactPage> ListContactsAsync(string ownerMemberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
         public Task<InviteBatchDetailResponse> GetInviteBatchAsync(string ownerMemberId, string batchId, CancellationToken ct) => throw new NotSupportedException();
         public Task<InvitationDispatch> ResendInvitationAsync(string ownerMemberId, string invitationId, InvitationResendRequest request, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();

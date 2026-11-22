@@ -52,6 +52,9 @@ public sealed class NlpCompletionConsumerWorker(
             else if (SciLinkScoreChanged.TryParse(envelope, out var scoreChange))
                 await scope.ServiceProvider.GetRequiredService<SciScoreProjectionHandler>()
                     .HandleAsync(envelope.EventId, scoreChange!, args.CancellationToken);
+            else if (SciScoringCompleted.TryParse(envelope,out var scoringCompleted))
+                await scope.ServiceProvider.GetRequiredService<SciScoreProjectionHandler>()
+                    .HandleCompletionAsync(envelope.EventId,scoringCompleted!,args.CancellationToken);
             else if (NlpIntentMatchReady.TryParse(envelope, out var intentReady))
                 await scope.ServiceProvider.GetRequiredService<SciIntentRescoreHandler>()
                     .HandleAsync(intentReady!, args.CancellationToken);
