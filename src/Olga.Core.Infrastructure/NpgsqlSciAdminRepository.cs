@@ -66,7 +66,10 @@ public sealed class NpgsqlSciAdminRepository(NpgsqlDataSource dataSource) : ISci
             ORDER BY sci_change_approval_pk DESC
             LIMIT @take
             """);
-        Add(command, "status", status);
+        command.Parameters.Add(new NpgsqlParameter("status", NpgsqlDbType.Text)
+        {
+            Value = status is null ? DBNull.Value : status
+        });
         command.Parameters.AddWithValue("after_pk", afterPk);
         command.Parameters.AddWithValue("take", limit + 1);
         var rows = new List<(long Pk, SciAdminChangeApprovalResponse Value)>();
