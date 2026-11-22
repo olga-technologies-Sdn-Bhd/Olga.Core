@@ -289,5 +289,9 @@ public sealed class OpenApiContractTests : IClassFixture<WebApplicationFactory<P
         public Task<InvitationAcceptResponse> AcceptPendingInvitationAsync(string recipientMemberId, string invitationId, string idempotencyKey, CancellationToken ct) => throw new NotSupportedException();
         public Task RevokeInvitationAsync(string ownerMemberId, string invitationId, CancellationToken ct) => throw new NotSupportedException();
         public Task DeleteContactAsync(string ownerMemberId, string linkId, CancellationToken ct) => throw new NotSupportedException();
+        public Task RemoveConnectionAsync(string memberId, string connectionId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<MemberDiscoveryPreferenceResponse> GetDiscoveryPreferenceAsync(string memberId, CancellationToken ct) => throw new NotSupportedException();
+        public Task<MemberDiscoveryPreferenceResponse> SaveDiscoveryPreferenceAsync(string memberId, MemberDiscoveryPreferenceRequest request, string expectedETag, CancellationToken ct) => throw new NotSupportedException();
+        public Task<InAppNotificationPage> GetInAppNotificationsAsync(string memberId, string? cursor, int limit, CancellationToken ct) => throw new NotSupportedException();
     }
 }
