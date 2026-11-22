@@ -146,11 +146,8 @@ builder.Services.AddScoped<IAdminEventService, AdminEventService>();
 builder.Services.AddScoped<IAdminService, AdminService>();
 builder.Services.AddScoped<ISocialCapitalRepository, NpgsqlSocialCapitalRepository>();
 builder.Services.AddScoped<ISocialCapitalService, SocialCapitalService>();
-if (!local)
-{
-    builder.Services.AddScoped<ISciAdminRepository, NpgsqlSciAdminRepository>();
-    builder.Services.AddScoped<ISciAdminService, SciAdminService>();
-}
+builder.Services.AddScoped<ISciAdminRepository, NpgsqlSciAdminRepository>();
+builder.Services.AddScoped<ISciAdminService, SciAdminService>();
 builder.Services.Configure<InviteLinkOptions>(builder.Configuration.GetSection(InviteLinkOptions.SectionName));
 
 var app = builder.Build();
